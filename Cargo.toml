@@ -1,0 +1,43 @@
+[package]
+name = "horsie-actor"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+description = "Event-sourced actor runtime with durable journaling"
+repository = "https://github.com/blossomstack/horsie-actor"
+readme = "README.md"
+keywords = ["actor", "event-sourcing", "cqrs", "async", "persistence"]
+categories = ["asynchronous", "concurrency", "data-structures"]
+
+[features]
+# Exposes `testkit` (FaultyJournal) to other crates. This crate's own unit
+# tests get it via `cfg(test)` without the feature.
+test-util = []
+
+[dependencies]
+async-trait  = "0.1"
+thiserror    = "2.0"
+tokio        = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+serde        = { version = "1.0", features = ["derive"] }
+serde_json   = "1.0"
+futures-util = "0.3"
+parking_lot  = "0.12"
+tracing      = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+# Self-dependency so this crate's own integration tests (tests/) see the
+# optional feature. Unit tests get `testkit` via cfg(test); a test *binary* is
+# a separate crate and does not.
+horsie-actor = { path = ".", features = ["test-util"] }
+
+# Panicking in an actor takes down its mailbox and, with it, whatever the actor
+# was the single owner of — so the runtime is written to return errors rather
+# than unwrap. These are denials, not warnings: `#[expect(...)]` with a reason
+# at the call site is the escape hatch, and it shows up in the diff.
+[lints.clippy]
+unwrap_used             = "deny"
+expect_used             = "deny"
+panic                   = "deny"
+wildcard_enum_match_arm = "deny"
