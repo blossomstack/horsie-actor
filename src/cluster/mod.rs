@@ -4,7 +4,9 @@
 //! every journal write carries: deciding can be briefly wrong, the fence cannot.
 
 mod delivery;
+mod node;
 mod placement;
 
 pub use delivery::Dedup;
+pub use node::{ClusterConfig, ClusterNode};
 pub use placement::{Assignment, InstanceKey, PlacementCommand, PlacementEffect, PlacementTable};
