@@ -25,10 +25,11 @@ mod runtime;
 mod system;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testkit;
+mod transport;
 
 pub use actor::{CommandEffect, EventSourcedActor};
 pub use behaviour::{Actor, Flow, StartError};
-pub use envelope::Epoch;
+pub use envelope::{Envelope, Epoch, NodeId};
 pub use error::{JournalError, TellError};
 pub use journal::{InMemoryJournal, Journal, JournalResult};
 pub use persistence_id::PersistenceId;
@@ -36,3 +37,4 @@ pub use persistent::Persistent;
 pub use reply::{ReplyDropped, ReplyTo};
 pub use runtime::{ActorContext, ActorRef};
 pub use system::{ActorOfError, ActorSystem, ClusterActor};
+pub use transport::{InProcessNetwork, InProcessTransport, Transport, TransportError};
