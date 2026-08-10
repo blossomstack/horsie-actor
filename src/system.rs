@@ -1,6 +1,6 @@
 use crate::actor::EventSourcedActor;
 use crate::behaviour::Actor;
-use crate::cluster::ClusterNode;
+use crate::cluster::{ClusterNode, Dedup};
 use crate::envelope::{Envelope, Epoch};
 use crate::error::{JournalError, TellError};
 use crate::journal::{InMemoryJournal, Journal};
@@ -112,6 +112,11 @@ pub enum ActorOfError {
     Claim(String),
 }
 
+/// How many recent message ids a node remembers. Large enough that a retry
+/// storm cannot push a legitimate repeat out of the window, small enough to be
+/// free.
+const DEDUP_WINDOW: usize = 4096;
+
 /// A live instance's `ActorRef`, with its command type erased so refs of
 /// different kinds can share one registry.
 type ErasedRef = Arc<dyn Any + Send + Sync>;
@@ -139,6 +144,15 @@ pub(crate) struct SystemInner {
     factories: Mutex<HashMap<&'static str, Factory>>,
     deliverers: Mutex<HashMap<&'static str, Deliver>>,
     cluster: Option<Arc<ClusterNode>>,
+    /// Message ids this node has already handled.
+    ///
+    /// Retries make delivery at-least-once; this is what makes *processing*
+    /// once. Node-scoped rather than per-actor, which is the honest limit of it:
+    /// a repeat arriving after this host restarted is not recognised, so a
+    /// command must still be one whose second application is survivable. Moving
+    /// this into each actor's own event-sourced state is what would close that,
+    /// and it is not done yet.
+    seen: Mutex<Dedup>,
     /// Live instances, keyed by kind and id.
     live: Mutex<HashMap<(&'static str, String), ErasedRef>>,
 }
@@ -160,6 +174,7 @@ impl ActorSystem {
                 factories: Mutex::new(HashMap::new()),
                 deliverers: Mutex::new(HashMap::new()),
                 cluster: None,
+                seen: Mutex::new(Dedup::with_capacity(DEDUP_WINDOW)),
                 live: Mutex::new(HashMap::new()),
             }),
         }
@@ -178,6 +193,7 @@ impl ActorSystem {
                 factories: Mutex::new(HashMap::new()),
                 deliverers: Mutex::new(HashMap::new()),
                 cluster: Some(cluster),
+                seen: Mutex::new(Dedup::with_capacity(DEDUP_WINDOW)),
                 live: Mutex::new(HashMap::new()),
             }),
         }
@@ -306,6 +322,13 @@ impl ActorSystem {
 
     /// Feed one inbound envelope to the instance it addresses.
     pub async fn dispatch(&self, env: Envelope) -> Result<(), DispatchError> {
+        // A repeat is a success, not a failure: the sender retried because it
+        // could not tell "lost" from "slow", and the answer to both is that the
+        // command has already been applied.
+        if !self.inner.seen.lock().accept(&env) {
+            tracing::debug!(kind = %env.kind, id = %env.id, "dropped a duplicate delivery");
+            return Ok(());
+        }
         let deliver = self
             .inner
             .deliverers
