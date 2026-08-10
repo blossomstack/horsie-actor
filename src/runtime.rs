@@ -9,16 +9,42 @@ use tokio::sync::mpsc;
 /// Mailbox capacity for every spawned actor.
 pub(crate) const MAILBOX_CAPACITY: usize = 64;
 
+/// How a reference actually reaches its actor.
+enum Reach<C> {
+    /// The actor's mailbox, in this process.
+    Local(mpsc::Sender<C>),
+    /// A closure that encodes the command and ships it to whichever node hosts
+    /// the actor. Built where `C: Serialize` is known, which is what keeps that
+    /// bound off `ActorRef` itself — and off every caller that merely holds one.
+    Remote(RemoteSend<C>),
+}
+
+type RemoteSend<C> =
+    Arc<dyn Fn(C) -> futures_util::future::BoxFuture<'static, Result<(), TellError>> + Send + Sync>;
+
+impl<C> Clone for Reach<C> {
+    fn clone(&self) -> Self {
+        match self {
+            Reach::Local(tx) => Reach::Local(tx.clone()),
+            Reach::Remote(f) => Reach::Remote(f.clone()),
+        }
+    }
+}
+
 /// A cheap, cloneable handle for sending commands to an actor.
+///
+/// Says nothing about where the actor is. The same type, `tell` and `ask` work
+/// whether it is in this process or on another node, which is what lets business
+/// logic be written once and hosted either way.
 pub struct ActorRef<C> {
-    tx: mpsc::Sender<C>,
+    reach: Reach<C>,
 }
 
 // Manual `Clone` — a `Sender<C>` clones regardless of whether `C: Clone`.
 impl<C> Clone for ActorRef<C> {
     fn clone(&self) -> Self {
         Self {
-            tx: self.tx.clone(),
+            reach: self.reach.clone(),
         }
     }
 }
@@ -28,24 +54,40 @@ impl<C> Clone for ActorRef<C> {
 // mailbox contents belong to the actor.
 impl<C> std::fmt::Debug for ActorRef<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ActorRef")
-            .field("alive", &!self.tx.is_closed())
-            .finish()
+        match &self.reach {
+            Reach::Local(tx) => f
+                .debug_struct("ActorRef")
+                .field("reach", &"local")
+                .field("alive", &!tx.is_closed())
+                .finish(),
+            Reach::Remote(_) => f
+                .debug_struct("ActorRef")
+                .field("reach", &"remote")
+                .finish(),
+        }
     }
 }
 
 impl<C: Send + 'static> ActorRef<C> {
     pub(crate) fn new(tx: mpsc::Sender<C>) -> Self {
-        Self { tx }
+        Self {
+            reach: Reach::Local(tx),
+        }
+    }
+
+    pub(crate) fn remote(send: RemoteSend<C>) -> Self {
+        Self {
+            reach: Reach::Remote(send),
+        }
     }
 
     /// Deliver `cmd` to the actor's mailbox, waiting if the mailbox is full.
     /// Fails only if the actor has stopped.
     pub async fn tell(&self, cmd: C) -> Result<(), TellError> {
-        self.tx
-            .send(cmd)
-            .await
-            .map_err(|_| TellError::MailboxClosed)
+        match &self.reach {
+            Reach::Local(tx) => tx.send(cmd).await.map_err(|_| TellError::MailboxClosed),
+            Reach::Remote(send) => send(cmd).await,
+        }
     }
 
     /// Send a request and await the actor's reply — the request/response pattern.

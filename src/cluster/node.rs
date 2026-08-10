@@ -3,6 +3,7 @@ use crate::envelope::{Envelope, Epoch, NodeId};
 use crate::transport::{Transport, TransportError};
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How this node participates in a cluster.
 #[derive(Debug, Clone)]
@@ -31,6 +32,10 @@ pub struct ClusterNode {
     local: NodeId,
     transport: Arc<dyn Transport>,
     table: Mutex<PlacementTable>,
+    /// Local half of the message id. Paired with the node id it is unique
+    /// cluster-wide without coordination, which is what lets the receiver dedup
+    /// retries without a shared counter.
+    counter: AtomicU64,
 }
 
 impl ClusterNode {
@@ -46,7 +51,17 @@ impl ClusterNode {
             local: config.local,
             transport,
             table: Mutex::new(table),
+            counter: AtomicU64::new(0),
         }
+    }
+
+    /// A message id unique across the cluster.
+    ///
+    /// The node id occupies the high bits and a local counter the low ones, so
+    /// two nodes cannot mint the same id and neither has to ask anyone.
+    pub fn next_message_id(&self) -> u128 {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        (u128::from(self.local.0) << 64) | u128::from(n)
     }
 
     /// This node's identity.
