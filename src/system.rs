@@ -185,7 +185,14 @@ impl ActorSystem {
     pub fn clustered(journal: Arc<dyn Journal>, cluster: Arc<ClusterNode>) -> Self {
         // Inverted: actors want to know when to stop, and the node reports when
         // it may serve.
-        let (tx, rx) = tokio::sync::watch::channel(!cluster.serving());
+        //
+        // Starts false even though a node that has not yet elected anybody is
+        // not serving. The signal means "stop what you are doing", and at
+        // construction there is nothing doing it — seeding it true would make
+        // every actor spawned before the first election exit on its first poll,
+        // silently. Refusing to *start* an instance is `require_serving`'s job,
+        // and it is a separate question with a separate answer.
+        let (tx, rx) = tokio::sync::watch::channel(false);
         let mut serving = cluster.serving_watch();
         let relay = tx.clone();
         tokio::spawn(async move {

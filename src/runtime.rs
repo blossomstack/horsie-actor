@@ -186,9 +186,7 @@ pub(crate) async fn run_actor<A: Actor>(
     mut ctx: ActorContext<A::Command>,
 ) {
     let mut stand_down = ctx.inner.stand_down.clone();
-    if *stand_down.borrow_and_update() {
-        return;
-    }
+    stand_down.mark_unchanged();
 
     if let Err(e) = actor.on_start(&mut ctx).await {
         tracing::error!(error = %e, "actor failed to start; shutting down");

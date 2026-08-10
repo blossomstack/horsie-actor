@@ -690,12 +690,18 @@ async fn a_node_recovers_when_quorum_returns() {
 
     cluster.net.restore(local);
 
+    // Two separate things, and in this order: the node sees a leader again
+    // before the leader has re-published a live set containing it. In between
+    // it is serving and hosts nothing, which is correct — placement is not its
+    // to decide — but a test that waited only for `serving` would find no
+    // instance assigned to it and look like a product bug.
     for _ in 0..400 {
-        if cluster.nodes[odd_one_out].serving() {
+        let node = &cluster.nodes[odd_one_out];
+        if node.serving() && node.live_members().contains(&local) {
             // Lazily, on the next message — nothing is respawned at recovery.
             let id = (0..64)
                 .map(|i| format!("c{i}"))
-                .find(|id| cluster.nodes[odd_one_out].owns("counter", id))
+                .find(|id| node.owns("counter", id))
                 .expect("some id must land back on this node");
             cluster
                 .system(odd_one_out)
@@ -763,6 +769,42 @@ async fn a_partitioned_leader_stands_down() {
 
     cluster.net.remove(cluster.nodes[leader].local());
     await_not_serving(&cluster, leader).await;
+}
+
+/// An actor spawned before the cluster has elected anybody survives.
+///
+/// The stand-down signal means "stop what you are doing", and at startup there
+/// is nothing to stop. Seeding it from "not serving yet" instead would make
+/// every actor spawned during an election exit on its first poll, silently and
+/// with no error anywhere.
+#[tokio::test]
+async fn an_actor_spawned_before_the_first_election_survives() {
+    let net = horsie_actor::InProcessNetwork::new();
+    let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+    let members: Vec<NodeId> = (1..=3).map(NodeId).collect();
+
+    let node = ClusterNode::start(
+        ClusterConfig {
+            local: NodeId(1),
+            bootstrap: members,
+            liveness_window: Duration::from_millis(600),
+        },
+        Arc::new(net.node(NodeId(1))),
+        RaftStore::in_memory_unsafe(),
+    )
+    .await
+    .unwrap();
+
+    // No peers exist, so this node never reaches a quorum and never serves.
+    assert!(!node.serving());
+
+    let system = ActorSystem::clustered(journal, node);
+    let actor = system.spawn_persistent(Counter { id: "early".into() });
+    settle().await;
+    assert!(
+        actor.is_alive(),
+        "an actor spawned before the first election was killed on sight"
+    );
 }
 
 async fn await_not_serving(cluster: &TestCluster, index: usize) {
