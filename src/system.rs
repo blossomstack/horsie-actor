@@ -46,10 +46,13 @@ pub trait ClusterActor: Send + 'static {
     /// serving, which mints an epoch and locks out whoever held it before.
     /// `None` is a stateless type — nothing to fence, because nothing is
     /// written.
-    fn persistence_id(id: &str) -> Option<PersistenceId> {
-        let _ = id;
-        None
-    }
+    ///
+    /// Deliberately has no default. A default of `None` would mean an
+    /// event-sourced actor that forgot to override it silently ran unfenced,
+    /// and the symptom of that is two hosts merging into one history — the one
+    /// failure this whole mechanism exists to prevent. Writing `None` by hand
+    /// is a claim that the type is stateless.
+    fn persistence_id(id: &str) -> Option<PersistenceId>;
 
     /// Build and spawn the instance for `id`.
     ///
@@ -481,6 +484,10 @@ mod tests {
         type Command = CounterCmd;
         type Deps = ();
 
+        fn persistence_id(id: &str) -> Option<PersistenceId> {
+            Some(PersistenceId::new("counter", id))
+        }
+
         // An event-sourced registered type spawns itself persistently. A
         // stateless one would call `system.spawn` here instead — being
         // registered and being event-sourced are independent.
@@ -567,6 +574,11 @@ mod tests {
             const KIND: &'static str = "counter";
             type Command = OtherCmd;
             type Deps = ();
+
+            // Stateless: nothing written, so nothing to fence.
+            fn persistence_id(_id: &str) -> Option<PersistenceId> {
+                None
+            }
             fn spawn(
                 _id: &str,
                 _deps: (),
