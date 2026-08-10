@@ -15,6 +15,7 @@
 
 mod actor;
 mod behaviour;
+mod envelope;
 mod error;
 mod journal;
 mod persistence_id;
@@ -27,6 +28,7 @@ pub mod testkit;
 
 pub use actor::{CommandEffect, EventSourcedActor};
 pub use behaviour::{Actor, Flow, StartError};
+pub use envelope::Epoch;
 pub use error::{JournalError, TellError};
 pub use journal::{InMemoryJournal, Journal, JournalResult};
 pub use persistence_id::PersistenceId;

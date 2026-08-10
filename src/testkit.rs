@@ -4,6 +4,7 @@
 //! crate's own tests unconditionally, and to `server` / `workflow` when they
 //! enable `horsie-actor/test-util`.
 
+use crate::envelope::Epoch;
 use crate::error::JournalError;
 use crate::journal::{Journal, JournalResult};
 use crate::persistence_id::PersistenceId;
@@ -58,13 +59,18 @@ impl<J> FaultyJournal<J> {
 
 #[async_trait]
 impl<J: Journal> Journal for FaultyJournal<J> {
-    async fn persist(&self, pid: &PersistenceId, events: &[Vec<u8>]) -> JournalResult<()> {
+    async fn persist(
+        &self,
+        pid: &PersistenceId,
+        events: &[Vec<u8>],
+        fence: Option<Epoch>,
+    ) -> JournalResult<()> {
         if let Some(budget) = self.persist_budget
             && self.persists.fetch_add(1, Ordering::Relaxed) >= budget
         {
             return Err(JournalError::Backend("injected persist failure".into()));
         }
-        self.inner.persist(pid, events).await
+        self.inner.persist(pid, events, fence).await
     }
 
     async fn replay(
@@ -94,11 +100,12 @@ impl<J: Journal> Journal for FaultyJournal<J> {
         pid: &PersistenceId,
         state: Vec<u8>,
         seq_nr: u64,
+        fence: Option<Epoch>,
     ) -> JournalResult<()> {
         if self.fail_snapshot {
             return Err(JournalError::Backend("injected snapshot failure".into()));
         }
-        self.inner.save_snapshot(pid, state, seq_nr).await
+        self.inner.save_snapshot(pid, state, seq_nr, fence).await
     }
 
     async fn latest_snapshot(&self, pid: &PersistenceId) -> JournalResult<Option<(Vec<u8>, u64)>> {
@@ -157,7 +164,7 @@ pub mod conformance {
     // ── the contract ─────────────────────────────────────────────────────────────
 
     pub async fn persist_then_replay_returns_events_in_order(j: &dyn Journal) {
-        j.persist(&pid("order"), &[vec![1], vec![2], vec![3]])
+        j.persist(&pid("order"), &[vec![1], vec![2], vec![3]], None)
             .await
             .unwrap();
         assert_eq!(
@@ -168,7 +175,7 @@ pub mod conformance {
     }
 
     pub async fn replay_skips_events_at_or_before_after_seq(j: &dyn Journal) {
-        j.persist(&pid("skip"), &[vec![1], vec![2], vec![3]])
+        j.persist(&pid("skip"), &[vec![1], vec![2], vec![3]], None)
             .await
             .unwrap();
         assert_eq!(
@@ -179,10 +186,10 @@ pub mod conformance {
     }
 
     pub async fn logs_are_namespaced_by_kind(j: &dyn Journal) {
-        j.persist(&PersistenceId::new("workflow", "shared"), &[vec![1]])
+        j.persist(&PersistenceId::new("workflow", "shared"), &[vec![1]], None)
             .await
             .unwrap();
-        j.persist(&PersistenceId::new("agent", "shared"), &[vec![2]])
+        j.persist(&PersistenceId::new("agent", "shared"), &[vec![2]], None)
             .await
             .unwrap();
         let mut wf = j.replay(&PersistenceId::new("workflow", "shared"), 0).await;
@@ -192,17 +199,19 @@ pub mod conformance {
     }
 
     pub async fn clear_removes_all_state(j: &dyn Journal) {
-        j.persist(&pid("cleared"), &[vec![1]]).await.unwrap();
+        j.persist(&pid("cleared"), &[vec![1]], None).await.unwrap();
         j.clear(&pid("cleared")).await.unwrap();
         assert!(drain(j, "cleared", 0).await.is_empty());
     }
 
     pub async fn persist_continues_numbering_after_compaction(j: &dyn Journal) {
-        j.persist(&pid("numbering"), &[vec![1], vec![2]])
+        j.persist(&pid("numbering"), &[vec![1], vec![2]], None)
             .await
             .unwrap();
         j.delete_events_before(&pid("numbering"), 2).await.unwrap();
-        j.persist(&pid("numbering"), &[vec![3]]).await.unwrap();
+        j.persist(&pid("numbering"), &[vec![3]], None)
+            .await
+            .unwrap();
         assert_eq!(
             drain(j, "numbering", 2).await,
             vec![vec![3]],
@@ -211,7 +220,9 @@ pub mod conformance {
     }
 
     pub async fn snapshot_roundtrips_with_seq(j: &dyn Journal) {
-        j.save_snapshot(&pid("snap"), vec![9, 9], 5).await.unwrap();
+        j.save_snapshot(&pid("snap"), vec![9, 9], 5, None)
+            .await
+            .unwrap();
         assert_eq!(
             j.latest_snapshot(&pid("snap")).await.unwrap(),
             Some((vec![9, 9], 5)),
@@ -220,7 +231,7 @@ pub mod conformance {
     }
 
     pub async fn delete_events_before_compacts(j: &dyn Journal) {
-        j.persist(&pid("compact"), &[vec![1], vec![2], vec![3]])
+        j.persist(&pid("compact"), &[vec![1], vec![2], vec![3]], None)
             .await
             .unwrap();
         j.delete_events_before(&pid("compact"), 2).await.unwrap();
@@ -232,8 +243,12 @@ pub mod conformance {
     }
 
     pub async fn copy_snapshot_seeds_new_id(j: &dyn Journal) {
-        j.persist(&pid("src"), &[vec![1], vec![2]]).await.unwrap();
-        j.save_snapshot(&pid("src"), vec![7], 2).await.unwrap();
+        j.persist(&pid("src"), &[vec![1], vec![2]], None)
+            .await
+            .unwrap();
+        j.save_snapshot(&pid("src"), vec![7], 2, None)
+            .await
+            .unwrap();
         j.copy_snapshot(&pid("src"), &pid("dst")).await.unwrap();
         assert_eq!(
             j.latest_snapshot(&pid("dst")).await.unwrap(),
@@ -260,10 +275,14 @@ pub mod conformance {
     /// that never compacts recovers the correct *value* by replaying from event
     /// 0, so the state assertion passes while the bug stands.
     pub async fn snapshot_then_compact_leaves_only_later_events(j: &dyn Journal) {
-        j.persist(&pid("e2e"), &[vec![1], vec![2]]).await.unwrap();
-        j.save_snapshot(&pid("e2e"), vec![42], 2).await.unwrap();
+        j.persist(&pid("e2e"), &[vec![1], vec![2]], None)
+            .await
+            .unwrap();
+        j.save_snapshot(&pid("e2e"), vec![42], 2, None)
+            .await
+            .unwrap();
         j.delete_events_before(&pid("e2e"), 2).await.unwrap();
-        j.persist(&pid("e2e"), &[vec![3]]).await.unwrap();
+        j.persist(&pid("e2e"), &[vec![3]], None).await.unwrap();
 
         assert_eq!(
             j.latest_snapshot(&pid("e2e")).await.unwrap(),
@@ -296,21 +315,21 @@ mod tests {
     #[tokio::test]
     async fn fail_persist_after_lets_the_first_n_through() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new()).fail_persist_after(1);
-        assert!(j.persist(&pid(), &[vec![1]]).await.is_ok());
-        assert!(j.persist(&pid(), &[vec![2]]).await.is_err());
-        assert!(j.persist(&pid(), &[vec![3]]).await.is_err());
+        assert!(j.persist(&pid(), &[vec![1]], None).await.is_ok());
+        assert!(j.persist(&pid(), &[vec![2]], None).await.is_err());
+        assert!(j.persist(&pid(), &[vec![3]], None).await.is_err());
     }
 
     #[tokio::test]
     async fn fail_persist_after_zero_fails_immediately() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new()).fail_persist_after(0);
-        assert!(j.persist(&pid(), &[vec![1]]).await.is_err());
+        assert!(j.persist(&pid(), &[vec![1]], None).await.is_err());
     }
 
     #[tokio::test]
     async fn healthy_by_default_delegates_to_inner() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new());
-        j.persist(&pid(), &[vec![7]]).await.unwrap();
+        j.persist(&pid(), &[vec![7]], None).await.unwrap();
         let mut s = j.replay(&pid(), 0).await;
         assert_eq!(s.next().await.unwrap().unwrap(), (1, vec![7]));
     }
@@ -318,14 +337,14 @@ mod tests {
     #[tokio::test]
     async fn fail_snapshot_rejects_saves_but_not_persists() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new()).fail_snapshot();
-        assert!(j.persist(&pid(), &[vec![1]]).await.is_ok());
-        assert!(j.save_snapshot(&pid(), vec![9], 1).await.is_err());
+        assert!(j.persist(&pid(), &[vec![1]], None).await.is_ok());
+        assert!(j.save_snapshot(&pid(), vec![9], 1, None).await.is_err());
     }
 
     #[tokio::test]
     async fn fail_replay_at_truncates_the_stream_with_an_error() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new()).fail_replay_at(2);
-        j.persist(&pid(), &[vec![1], vec![2], vec![3]])
+        j.persist(&pid(), &[vec![1], vec![2], vec![3]], None)
             .await
             .unwrap();
         let mut s = j.replay(&pid(), 0).await;

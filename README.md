@@ -9,7 +9,7 @@ same identity recovers exactly where the previous one left off.
 
 ```toml
 [dependencies]
-horsie-actor = "0.3"
+horsie-actor = "0.4"
 ```
 
 ## Two traits
@@ -153,6 +153,15 @@ and a later `replay(after: n)` line up exactly.
 `PersistenceId` (an actor kind and an instance id). Serialization is the
 runtime's concern, so the trait carries no domain types and no serde bounds —
 implement it over Postgres, SQLite, S3, or anything else that can append.
+
+`persist` and `save_snapshot` also take a `fence: Option<Epoch>`. `None` — a
+single-process deployment — always writes. `Some(epoch)` asks the backend to
+remember the highest epoch it has seen for that id and reject anything lower,
+**in the same transaction as the write**. That is a parameter rather than a
+wrapper on purpose: a decorator cannot join a transaction it does not open, so
+it would check ownership and append in two steps, which is the race the fence
+exists to close. A backend that cannot enforce one must return an error rather
+than ignore it.
 
 `InMemoryJournal` ships for tests and single-process runs. With the `test-util`
 feature, `testkit::FaultyJournal` wraps any journal and fails writes or truncates
