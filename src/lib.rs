@@ -9,7 +9,13 @@
 //! addressed and hosted identically.
 //!
 //! [`ActorSystem`] owns the journal, the registry of actor types that can be
-//! reached by id, and the instances currently running.
+//! reached by id, and the instances currently running. Registered types can be
+//! hosted across several nodes: membership is agreed by Raft, placement hashes
+//! over the members the leader reports as live, and a node that cannot see a
+//! quorum stops what it hosts. None of that is what keeps a log consistent —
+//! [`Journal::persist`] is conditional on the sequence number the writer
+//! believes the log ends at, and that is the only part which holds for a
+//! process frozen through a failover.
 //!
 //! Neither agent nor workflow concepts appear here.
 
@@ -37,9 +43,9 @@ pub use cluster::{
 };
 pub use envelope::{Envelope, NodeId};
 pub use error::{JournalError, TellError};
-// Re-exported so a caller can read `ClusterNode::raft().metrics()` without
-// depending on openraft directly.
 pub use journal::{InMemoryJournal, Journal, JournalResult};
+// Re-exported so a caller can read `ClusterNode::raft().metrics()` without
+// taking its own dependency on openraft.
 pub use openraft::type_config::async_runtime::watch::WatchReceiver;
 pub use persistence_id::PersistenceId;
 pub use persistent::Persistent;
