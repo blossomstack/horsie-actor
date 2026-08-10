@@ -103,6 +103,13 @@ impl<C: Send + 'static> ActorRef<C> {
         F: FnOnce(ReplyTo<R>) -> C,
         R: Send + 'static,
     {
+        // Refuse rather than hang. The reply handle is a channel into this
+        // process; shipping the command to another host leaves it behind, so
+        // nobody would ever answer and the caller would wait forever. Failing
+        // here is the difference between a bug you can see and one you cannot.
+        if matches!(self.reach, Reach::Remote(_)) {
+            return Err(TellError::AskNotRoutable);
+        }
         let (reply, rx) = ReplyTo::channel();
         self.tell(make(reply)).await?;
         rx.await.map_err(|_| TellError::MailboxClosed)
