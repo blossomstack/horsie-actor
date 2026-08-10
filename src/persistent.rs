@@ -105,13 +105,31 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
             .await;
         }
 
+        // A fence rejection is terminal, not a retryable hiccup: this host no
+        // longer owns the log, and nothing will tell it otherwise. Carrying on
+        // would leave a zombie that accepts commands and fails or silently drops
+        // every write until an operator noticed — so stop, which closes the
+        // mailbox and makes every caller fail fast and re-resolve to whoever
+        // owns it now.
+        let fenced = matches!(result, Err(JournalError::Fenced { .. }));
+        if fenced {
+            tracing::warn!(
+                pid = %self.pid,
+                "this host no longer owns the log; stopping rather than serving stale"
+            );
+        }
+
         // Reply only now, so an `ask` caller returns the journaled guarantee
         // (`Ok`) or the failure (`Err`) and can decide whether to proceed.
         if let Some(ack) = ack {
             let _ = ack.send(result);
         }
 
-        if stop { Flow::Stop } else { Flow::Continue }
+        if stop || fenced {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
     }
 }
 

@@ -389,3 +389,37 @@ async fn a_displaced_host_stops_writing() {
         "the displaced host's write landed; the fence is not being applied"
     );
 }
+
+/// A host that loses its log stops, rather than staying up and failing every
+/// write.
+///
+/// Without this it becomes a zombie: it keeps accepting commands, `ask` callers
+/// get errors and plain `tell` callers get silence, and it stays that way until
+/// somebody notices. Stopping closes the mailbox, so callers fail immediately
+/// and re-resolve to whoever owns the log now.
+#[tokio::test]
+async fn a_fenced_host_stops_instead_of_serving_stale() {
+    let cluster = TestCluster::of_size(3);
+    let id = "zombie";
+    let pid = PersistenceId::new("counter", id);
+
+    let host = cluster.host_of(id);
+    let actor = cluster.system(host).actor_of::<Counter>(id).await.unwrap();
+    actor.tell(CounterCmd::Inc(1)).await.unwrap();
+    settle().await;
+
+    // Somebody else takes the log out from under it.
+    cluster.journal.claim_ownership(&pid).await.unwrap();
+
+    // The next write is where it finds out — and it must be the last thing it
+    // does.
+    actor.tell(CounterCmd::Inc(1)).await.unwrap();
+
+    for _ in 0..100 {
+        if actor.tell(CounterCmd::Inc(1)).await.is_err() {
+            return; // mailbox closed: the host stood down
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("a displaced host kept accepting commands");
+}
