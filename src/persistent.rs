@@ -150,7 +150,7 @@ async fn persist_events<A: EventSourcedActor>(
             }
         }
     }
-    if let Err(e) = journal.persist(pid, &encoded).await {
+    if let Err(e) = journal.persist(pid, &encoded, None).await {
         tracing::error!(%pid, error = %e, "failed to persist events; state left unchanged");
         return (events, Err(e));
     }
@@ -178,7 +178,7 @@ async fn snapshot_state<A: EventSourcedActor>(
             return;
         }
     };
-    if let Err(e) = journal.save_snapshot(pid, bytes, seq_nr).await {
+    if let Err(e) = journal.save_snapshot(pid, bytes, seq_nr, None).await {
         tracing::error!(%pid, error = %e, "failed to save snapshot");
         return;
     }
