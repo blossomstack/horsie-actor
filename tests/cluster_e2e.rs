@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, ActorRef, ActorSystem, ClusterActor, ClusterConfig, ClusterNode, CommandEffect,
-    Epoch, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, ReplyTo,
+    Envelope, Epoch, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, ReplyTo,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -455,4 +455,63 @@ async fn ask_to_a_remote_host_is_refused_not_hung() {
         outcome,
         Err(horsie_actor::TellError::AskNotRoutable)
     ));
+}
+
+/// A redelivered command is applied once.
+///
+/// Retries make delivery at-least-once; this is what keeps *processing* to
+/// once. Without it, every retry after a slow ack would double-count.
+#[tokio::test]
+async fn a_redelivered_command_is_applied_once() {
+    let cluster = TestCluster::of_size(3);
+    let id = "dedup";
+    let host = cluster.host_of(id);
+
+    // Same message id twice, as a retry of an envelope the sender could not
+    // confirm.
+    let payload = serde_json::to_vec(&CounterCmd::Inc(5)).unwrap();
+    let env = Envelope {
+        kind: "counter".into(),
+        id: id.into(),
+        correlation: None,
+        message_id: 42,
+        epoch: Epoch(0),
+        payload,
+    };
+    cluster.system(host).dispatch(env.clone()).await.unwrap();
+    cluster.system(host).dispatch(env).await.unwrap();
+    settle().await;
+
+    assert_eq!(
+        value_at_host(&cluster, id).await,
+        5,
+        "the retry was applied a second time"
+    );
+}
+
+/// A send to a host that has gone away lands somewhere alive instead of
+/// failing, because each attempt resolves the owner afresh.
+#[tokio::test]
+async fn a_send_retries_onto_a_live_host() {
+    let cluster = TestCluster::of_size(3);
+    let id = "retry";
+    let host = cluster.host_of(id);
+    let elsewhere = (host + 1) % 3;
+
+    // Take the host off the network without telling anyone — the sender only
+    // finds out by trying.
+    cluster.net.remove(cluster.nodes[host].local());
+
+    let remote = cluster
+        .system(elsewhere)
+        .actor_of::<Counter>(id)
+        .await
+        .unwrap();
+    remote
+        .tell(CounterCmd::Inc(7))
+        .await
+        .expect("the send should have re-resolved onto a live host");
+    settle().await;
+
+    assert_eq!(value_at_host(&cluster, id).await, 7);
 }

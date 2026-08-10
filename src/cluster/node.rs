@@ -5,6 +5,14 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// How many hosts to try before giving up. Each attempt re-resolves, so this is
+/// a bound on "how many dead hosts will I walk past", not a bound on patience
+/// with one host.
+const SEND_ATTEMPTS: u32 = 3;
+
+/// Pause between attempts that failed for a reason that might pass.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// How this node participates in a cluster.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
@@ -112,9 +120,16 @@ impl ClusterNode {
 
     /// Send an already-encoded command to whichever node hosts `(kind, id)`.
     ///
-    /// A send to a node that has gone away marks it down and reports the
-    /// failure, so the caller's retry re-resolves rather than aiming at the same
+    /// Retries, because a caller cannot usefully do it: a failure here usually
+    /// means the host went away, and the right response is to re-resolve and
+    /// aim somewhere alive — which needs the placement table, not the caller.
+    /// Each attempt resolves the owner afresh, and an unreachable host is marked
+    /// down first, so the next attempt goes elsewhere rather than at the same
     /// corpse.
+    ///
+    /// This is what makes delivery at-least-once. The `message_id` is what stops
+    /// that becoming at-least-twice: the receiving node remembers ids it has
+    /// already handled and drops repeats.
     pub async fn send(
         &self,
         kind: &str,
@@ -123,27 +138,39 @@ impl ClusterNode {
         payload: Vec<u8>,
         message_id: u128,
     ) -> Result<(), TransportError> {
-        let Some(owner) = self.owner_of(kind, id) else {
-            return Err(TransportError::Io(format!(
-                "no live member can host {kind}/{id}"
-            )));
-        };
-        let env = Envelope {
-            kind: kind.to_owned(),
-            id: id.to_owned(),
-            correlation: None,
-            message_id,
-            epoch,
-            payload,
-        };
-        match self.transport.send(owner, env).await {
-            Ok(()) => Ok(()),
-            Err(TransportError::Unreachable(node)) => {
-                self.mark_down(node);
-                Err(TransportError::Unreachable(node))
+        let mut last = None;
+        for attempt in 0..SEND_ATTEMPTS {
+            let Some(owner) = self.owner_of(kind, id) else {
+                return Err(TransportError::Io(format!(
+                    "no live member can host {kind}/{id}"
+                )));
+            };
+            let env = Envelope {
+                kind: kind.to_owned(),
+                id: id.to_owned(),
+                correlation: None,
+                message_id,
+                epoch,
+                payload: payload.clone(),
+            };
+            match self.transport.send(owner, env).await {
+                Ok(()) => return Ok(()),
+                Err(TransportError::Unreachable(node)) => {
+                    // Take it out of the table before retrying, or every attempt
+                    // resolves to the same dead host.
+                    self.mark_down(node);
+                    last = Some(TransportError::Unreachable(node));
+                }
+                Err(other) => {
+                    // A connection-level failure may be transient, so back off
+                    // rather than giving up on a host that is merely busy.
+                    last = Some(other);
+                    tokio::time::sleep(RETRY_BACKOFF * (attempt + 1)).await;
+                }
             }
-            Err(other) => Err(other),
         }
+        Err(last
+            .unwrap_or_else(|| TransportError::Io(format!("gave up delivering to {kind}/{id}"))))
     }
 
     /// The stream of envelopes arriving here, taken once.
@@ -246,10 +273,11 @@ mod tests {
         }
     }
 
-    /// A send to a departed node reports the failure and marks it down, so the
-    /// caller's retry re-resolves instead of aiming at the same corpse.
+    /// A send to a departed node re-resolves onto a live one rather than
+    /// failing. The dead host is taken out of the table first, or every attempt
+    /// would aim at the same corpse.
     #[tokio::test]
-    async fn an_unreachable_target_is_marked_down() {
+    async fn a_send_re_resolves_past_a_departed_node() {
         let net = InProcessNetwork::new();
         let a = cluster(&net, 1, &[1, 2]);
         let b = cluster(&net, 2, &[1, 2]);
@@ -260,17 +288,39 @@ mod tests {
             .expect("some id must land on node 2");
 
         net.remove(NodeId(2));
-        let err = a
-            .send("counter", id, Epoch(1), b"x".to_vec(), 1)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, TransportError::Unreachable(NodeId(2))));
+        let mut own_inbox = a.incoming().unwrap();
 
-        // Node 1 is the only member left, so it now hosts the instance itself.
+        a.send("counter", id, Epoch(1), b"x".to_vec(), 1)
+            .await
+            .expect("the send should have re-resolved onto a live host");
+
+        // Node 1 is the only member left, so it now hosts the instance itself —
+        // and the envelope arrived at its own inbox.
         assert!(
             a.owns("counter", id),
             "the instance did not move off the dead node"
         );
+        assert_eq!(own_inbox.recv().await.unwrap().payload, b"x");
+    }
+
+    /// With nowhere alive to send, the failure is reported rather than retried
+    /// forever.
+    #[tokio::test]
+    async fn a_send_with_no_live_host_fails() {
+        let net = InProcessNetwork::new();
+        let a = cluster(&net, 1, &[1, 2]);
+        net.remove(NodeId(1));
+        net.remove(NodeId(2));
+        a.mark_down(NodeId(1));
+
+        let err = a
+            .send("counter", "c1", Epoch(1), b"x".to_vec(), 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Unreachable(_) | TransportError::Io(_)
+        ));
     }
 
     /// A standing assignment wins over the rendezvous candidate, so an instance
