@@ -1,7 +1,7 @@
 use crate::actor::EventSourcedActor;
 use crate::behaviour::Actor;
 use crate::cluster::{ClusterNode, Dedup};
-use crate::envelope::Envelope;
+use crate::envelope::Message;
 use crate::error::TellError;
 use crate::journal::{InMemoryJournal, Journal};
 use crate::persistent::Persistent;
@@ -253,8 +253,19 @@ impl ActorSystem {
 
         let deliver: Deliver = Arc::new(|id, payload, system| {
             Box::pin(async move {
-                let cmd: A::Command = serde_json::from_slice(&payload)
-                    .map_err(|e| DispatchError::Decode(e.to_string()))?;
+                // Decoded inside the router context so a `ReplyTo` in the
+                // command comes back knowing how to answer whoever asked. Out
+                // of context it decodes to an error instead, which is the
+                // difference between a failed request and a caller that waits
+                // forever.
+                let cmd: A::Command = match system.cluster() {
+                    Some(cluster) => {
+                        let router: Arc<dyn crate::reply::ReplyRouter> = cluster.clone();
+                        crate::reply::with_router(router, || serde_json::from_slice(&payload))
+                    }
+                    None => serde_json::from_slice(&payload),
+                }
+                .map_err(|e| DispatchError::Decode(e.to_string()))?;
                 let target = system.local_instance::<A>(&id)?;
                 target
                     .tell(cmd)
@@ -316,9 +327,20 @@ impl ActorSystem {
         }
     }
 
-    /// Feed one inbound envelope to the instance it addresses.
-    pub async fn dispatch(&self, env: Envelope) -> Result<(), DispatchError> {
+    /// Feed one inbound message to whoever it is for.
+    pub async fn dispatch(&self, message: Message) -> Result<(), DispatchError> {
         self.require_serving()?;
+        let env = match message {
+            Message::Command(env) => env,
+            Message::Reply(reply) => {
+                // An answer is for a caller, not an actor, so it never goes
+                // near the registry, the dedup window or placement.
+                if let Some(cluster) = &self.inner.cluster {
+                    cluster.deliver_reply(reply);
+                }
+                return Ok(());
+            }
+        };
         // A repeat is a success, not a failure: the sender retried because it
         // could not tell "lost" from "slow", and the answer to both is that the
         // command has already been applied.
@@ -387,7 +409,13 @@ impl ActorSystem {
             let cluster = cluster.clone();
             let id = id.clone();
             Box::pin(async move {
-                let payload = serde_json::to_vec(&cmd).map_err(|_| TellError::Undeliverable)?;
+                // Encoded inside the router context, which is what registers any
+                // reply handle in the command against this node before it
+                // leaves. Encoding it outside is a loud error rather than a
+                // handle addressed to nobody.
+                let router: Arc<dyn crate::reply::ReplyRouter> = cluster.clone();
+                let payload = crate::reply::with_router(router, || serde_json::to_vec(&cmd))
+                    .map_err(|_| TellError::Undeliverable)?;
                 cluster
                     .send(kind, &id, payload, cluster.next_message_id())
                     .await
@@ -444,8 +472,7 @@ mod tests {
     #[derive(Serialize, Deserialize)]
     enum CounterCmd {
         Inc(i64),
-        #[serde(skip)]
-        Get(Option<ReplyTo<i64>>),
+        Get(ReplyTo<i64>),
     }
 
     struct Counter {
@@ -485,9 +512,7 @@ mod tests {
             match cmd {
                 CounterCmd::Inc(n) => CommandEffect::persist(vec![Incremented(n)]),
                 CounterCmd::Get(reply) => {
-                    if let Some(reply) = reply {
-                        let _ = reply.send(state.value);
-                    }
+                    let _ = reply.send(state.value);
                     CommandEffect::none()
                 }
             }
@@ -508,10 +533,7 @@ mod tests {
     }
 
     async fn current_value(actor: &ActorRef<CounterCmd>) -> i64 {
-        actor
-            .ask(|reply| CounterCmd::Get(Some(reply)))
-            .await
-            .unwrap()
+        actor.ask(CounterCmd::Get).await.unwrap()
     }
 
     /// Two callers asking for the same (kind, id) get one actor, not two.

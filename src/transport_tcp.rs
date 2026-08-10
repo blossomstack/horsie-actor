@@ -1,4 +1,4 @@
-use crate::envelope::{Envelope, NodeId};
+use crate::envelope::{Message, NodeId};
 use crate::transport::{RpcRequest, Transport, TransportError};
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -33,8 +33,8 @@ const VERSION: u8 = 1;
 /// whose fields happened to overlap.
 #[derive(Debug, Serialize, Deserialize)]
 enum Frame {
-    /// Fire-and-forget delivery to an actor.
-    Envelope(Envelope),
+    /// Fire-and-forget: a command for an actor, or an answer for a caller.
+    Message(Message),
     /// A request expecting exactly one [`Frame::Response`] carrying the same id.
     Request { id: u64, payload: Vec<u8> },
     /// The answer to a request. `payload` is `None` when the responder was
@@ -96,7 +96,7 @@ pub struct TcpTransport {
     peers: HashMap<NodeId, SocketAddr>,
     secret: Vec<u8>,
     outbound: tokio::sync::Mutex<HashMap<NodeId, Arc<Peer>>>,
-    inbox: Mutex<Option<mpsc::Receiver<Envelope>>>,
+    inbox: Mutex<Option<mpsc::Receiver<Message>>>,
     rpc_inbox: Mutex<Option<mpsc::Receiver<RpcRequest>>>,
 }
 
@@ -201,7 +201,7 @@ async fn read_replies(mut reader: OwnedReadHalf, pending: Pending) {
                 }
             }
             Ok(_) => {
-                // The dialling side never receives envelopes or requests: each
+                // The dialling side never receives messages or requests: each
                 // node dials its peers, so inbound traffic arrives on the
                 // listener instead. Anything else here is a peer running a
                 // protocol we do not.
@@ -289,7 +289,7 @@ async fn handshake_out(
 async fn serve(
     mut stream: TcpStream,
     secret: &[u8],
-    tx: mpsc::Sender<Envelope>,
+    tx: mpsc::Sender<Message>,
     rpc_tx: mpsc::Sender<RpcRequest>,
 ) -> std::io::Result<()> {
     let hello = read_frame_from(&mut stream).await?;
@@ -332,8 +332,8 @@ async fn serve(
         let frame: Frame = serde_json::from_slice(&frame)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         match frame {
-            Frame::Envelope(env) => {
-                if tx.send(env).await.is_err() {
+            Frame::Message(message) => {
+                if tx.send(message).await.is_err() {
                     return Ok(()); // the node has shut down
                 }
             }
@@ -370,9 +370,9 @@ async fn serve(
 
 #[async_trait]
 impl Transport for TcpTransport {
-    async fn send(&self, to: NodeId, env: Envelope) -> Result<(), TransportError> {
+    async fn send(&self, to: NodeId, message: Message) -> Result<(), TransportError> {
         let peer = self.peer(to).await?;
-        match peer.write(&Frame::Envelope(env)).await {
+        match peer.write(&Frame::Message(message)).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Drop the connection so the next send redials rather than
@@ -403,7 +403,7 @@ impl Transport for TcpTransport {
             .map_err(|_| TransportError::Io(format!("{to} did not answer")))
     }
 
-    fn incoming(&self) -> Option<mpsc::Receiver<Envelope>> {
+    fn incoming(&self) -> Option<mpsc::Receiver<Message>> {
         self.inbox.lock().take()
     }
 
@@ -424,14 +424,22 @@ impl Transport for TcpTransport {
 )]
 mod tests {
     use super::*;
+    use crate::envelope::Envelope;
 
-    fn env(payload: &[u8]) -> Envelope {
-        Envelope {
+    fn env(payload: &[u8]) -> Message {
+        Message::Command(Envelope {
             kind: "counter".into(),
             id: "c1".into(),
-            correlation: None,
             message_id: 1,
             payload: payload.to_vec(),
+        })
+    }
+
+    /// The envelope inside a delivered message, for tests that assert on it.
+    fn delivered(message: Message) -> Envelope {
+        match message {
+            Message::Command(env) => env,
+            Message::Reply(_) => panic!("expected a command, got a reply"),
         }
     }
 
@@ -469,7 +477,7 @@ mod tests {
 
         a.send(NodeId(2), env(b"hello")).await.unwrap();
 
-        let got = inbox.recv().await.unwrap();
+        let got = delivered(inbox.recv().await.unwrap());
         assert_eq!(got.payload, b"hello");
         assert_eq!(got.kind, "counter");
     }
@@ -485,7 +493,7 @@ mod tests {
             a.send(NodeId(2), env(&[i])).await.unwrap();
         }
         for i in 0..10u8 {
-            assert_eq!(inbox.recv().await.unwrap().payload, vec![i]);
+            assert_eq!(delivered(inbox.recv().await.unwrap()).payload, vec![i]);
         }
     }
 
@@ -580,8 +588,11 @@ mod tests {
         a.send(NodeId(2), env(b"second")).await.unwrap();
 
         assert_eq!(answer, vec![8, 9]);
-        assert_eq!(envelopes.recv().await.unwrap().payload, b"first");
-        assert_eq!(envelopes.recv().await.unwrap().payload, b"second");
+        assert_eq!(delivered(envelopes.recv().await.unwrap()).payload, b"first");
+        assert_eq!(
+            delivered(envelopes.recv().await.unwrap()).payload,
+            b"second"
+        );
     }
 
     /// A handler that declines fails the call. Silence would be worse than an

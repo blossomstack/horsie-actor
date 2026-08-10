@@ -11,8 +11,8 @@
 //! [`ActorSystem`] owns the journal, the registry of actor types that can be
 //! reached by id, and the instances currently running. Registered types can be
 //! hosted across several nodes: membership is agreed by Raft, placement hashes
-//! over the members the leader reports as live, and a node that cannot see a
-//! quorum stops what it hosts. None of that is what keeps a log consistent —
+//! over the members the leader reports as live, replies route back to whoever
+//! asked, and a node that cannot see a quorum stops what it hosts. None of that is what keeps a log consistent —
 //! [`Journal::persist`] is conditional on the sequence number the writer
 //! believes the log ends at, and that is the only part which holds for a
 //! process frozen through a failover.
@@ -41,7 +41,7 @@ pub use cluster::{
     Assignment, ClusterConfig, ClusterNode, Dedup, InstanceKey, LiveSet, Membership, NodeIdx,
     PlacementCommand, PlacementEffect, PlacementTable, RaftStore, serve_consensus,
 };
-pub use envelope::{Envelope, NodeId};
+pub use envelope::{Envelope, Message, NodeId, Reply};
 pub use error::{JournalError, TellError};
 pub use journal::{InMemoryJournal, Journal, JournalResult};
 // Re-exported so a caller can read `ClusterNode::raft().metrics()` without
@@ -49,7 +49,7 @@ pub use journal::{InMemoryJournal, Journal, JournalResult};
 pub use openraft::type_config::async_runtime::watch::WatchReceiver;
 pub use persistence_id::PersistenceId;
 pub use persistent::Persistent;
-pub use reply::{ReplyDropped, ReplyTo};
+pub use reply::{ReplyDropped, ReplyRouter, ReplyTo};
 pub use runtime::{ActorContext, ActorRef};
 pub use system::{ActorOfError, ActorSystem, ClusterActor, DispatchError};
 pub use transport::{InProcessNetwork, InProcessTransport, RpcRequest, Transport, TransportError};

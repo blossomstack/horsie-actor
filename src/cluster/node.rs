@@ -2,7 +2,8 @@ use crate::cluster::network::ConsensusNetwork;
 use crate::cluster::placement::{PlacementCommand, PlacementTable};
 use crate::cluster::store::RaftStore;
 use crate::cluster::types::{LiveSet, Membership, NodeIdx};
-use crate::envelope::{Envelope, NodeId};
+use crate::envelope::{Envelope, Message, NodeId, Reply};
+use crate::reply::ReplyRouter;
 use crate::transport::{Transport, TransportError};
 use openraft::type_config::async_runtime::watch::WatchReceiver;
 use openraft::{Instant, Raft, ServerState};
@@ -22,6 +23,16 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 /// How often the leader re-examines who it can reach.
 const LIVENESS_TICK: Duration = Duration::from_millis(200);
+
+/// How many callers may be waiting on an answer at once.
+///
+/// A bound rather than a timeout, because there is no right timeout: an actor
+/// may legitimately take a long time to answer. A caller that gives up leaves
+/// its entry behind — nothing tells the table the far end stopped caring — so
+/// without this the table grows for the life of the process. Overflowing evicts
+/// the oldest, whose caller has almost certainly gone; it fails rather than
+/// hangs, which is the failure worth having.
+const WAITING_CAPACITY: usize = 8192;
 
 /// How this node participates in a cluster.
 #[derive(Debug, Clone)]
@@ -86,6 +97,18 @@ pub struct ClusterNode {
     /// cluster-wide without coordination, which is what lets the receiver dedup
     /// retries without a shared counter.
     counter: AtomicU64,
+    /// Callers on this node waiting for an answer from somewhere else.
+    ///
+    /// Deliberately not durable, and deliberately not recovered. A reply is a
+    /// caller sitting on an `await`, and a process that restarts has no caller
+    /// left to answer — persisting this would only produce answers nobody is
+    /// listening for.
+    ///
+    /// Ordered, so overflow evicts the oldest: correlation ids are minted
+    /// monotonically per node, which makes the lowest key the longest wait.
+    waiting: Mutex<BTreeMap<u128, crate::reply::Deliver>>,
+    /// Local half of the correlation id, minted the same way as message ids.
+    correlations: AtomicU64,
 }
 
 impl ClusterNode {
@@ -158,6 +181,8 @@ impl ClusterNode {
             serving: AtomicBool::new(false),
             serving_tx,
             counter: AtomicU64::new(0),
+            waiting: Mutex::new(BTreeMap::new()),
+            correlations: AtomicU64::new(0),
         });
 
         tokio::spawn(watch_cluster(node.clone(), config.liveness_window));
@@ -290,11 +315,10 @@ impl ClusterNode {
             let env = Envelope {
                 kind: kind.to_owned(),
                 id: id.to_owned(),
-                correlation: None,
                 message_id,
                 payload: payload.clone(),
             };
-            match self.transport.send(owner, env).await {
+            match self.transport.send(owner, Message::Command(env)).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     // Back off and re-resolve. The placement table is not
@@ -309,9 +333,73 @@ impl ClusterNode {
             .unwrap_or_else(|| TransportError::Io(format!("gave up delivering to {kind}/{id}"))))
     }
 
-    /// The stream of envelopes arriving here, taken once.
-    pub fn incoming(&self) -> Option<tokio::sync::mpsc::Receiver<Envelope>> {
+    /// The stream of messages arriving here, taken once.
+    pub fn incoming(&self) -> Option<tokio::sync::mpsc::Receiver<Message>> {
         self.transport.incoming()
+    }
+
+    /// Hand an inbound answer to whoever is waiting for it.
+    ///
+    /// An answer with nobody waiting is dropped and logged, not an error: the
+    /// caller may have timed out, been cancelled, or gone away with the actor
+    /// that asked. It is the ordinary end of a request nobody needed any more.
+    pub fn deliver_reply(&self, reply: Reply) {
+        let Some(deliver) = self.waiting.lock().remove(&reply.correlation) else {
+            tracing::debug!(
+                correlation = reply.correlation,
+                "an answer arrived for a caller that had gone"
+            );
+            return;
+        };
+        deliver(reply.payload);
+    }
+}
+
+impl ReplyRouter for ClusterNode {
+    fn local(&self) -> NodeId {
+        self.local
+    }
+
+    fn register(&self, deliver: crate::reply::Deliver) -> u128 {
+        let n = self.correlations.fetch_add(1, Ordering::Relaxed);
+        let correlation = (u128::from(self.local.0) << 64) | u128::from(n);
+        let mut waiting = self.waiting.lock();
+        waiting.insert(correlation, deliver);
+        while waiting.len() > WAITING_CAPACITY {
+            // Dropping the entry drops the sender behind it, so the caller's
+            // `ask` fails now rather than waiting on an answer this node has
+            // just forgotten how to deliver.
+            if let Some((evicted, _)) = waiting.pop_first() {
+                tracing::warn!(
+                    correlation = evicted,
+                    "the waiting-caller table is full; failing the longest-waiting request"
+                );
+            }
+        }
+        correlation
+    }
+
+    fn answer(&self, origin: NodeId, correlation: u128, payload: Vec<u8>) {
+        let reply = Reply {
+            correlation,
+            payload,
+        };
+        // The caller is on this node: hand it over directly rather than
+        // sending a message to ourselves. This is the common case once an
+        // instance has been reached locally after all.
+        if origin == self.local {
+            self.deliver_reply(reply);
+            return;
+        }
+        let transport = self.transport.clone();
+        // `send` is async and answering is not, because an actor replies from
+        // inside a handler. Spawning is what keeps a slow or unreachable origin
+        // from blocking the actor that answered it.
+        tokio::spawn(async move {
+            if let Err(e) = transport.send(origin, Message::Reply(reply)).await {
+                tracing::debug!(error = %e, %origin, "could not return an answer");
+            }
+        });
     }
 }
 

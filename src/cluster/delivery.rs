@@ -79,7 +79,6 @@ mod tests {
         Envelope {
             kind: "counter".into(),
             id: "c1".into(),
-            correlation: None,
             message_id,
             payload: Vec::new(),
         }

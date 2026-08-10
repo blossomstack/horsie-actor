@@ -1,4 +1,4 @@
-use crate::envelope::{Envelope, NodeId};
+use crate::envelope::{Message, NodeId};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -46,19 +46,22 @@ pub struct RpcRequest {
 /// real consensus and a real write fence, rather than asserting against a
 /// stand-in.
 ///
-/// Two shapes travel over it, and the difference is deliberate. Envelopes are
-/// fire-and-forget: an actor command has no reply path across a host boundary.
-/// Requests are call-and-answer, and exist for consensus, which cannot work
-/// without one — a vote nobody answers is indistinguishable from a vote nobody
-/// received.
+/// Two shapes travel over it, and the difference is deliberate. [`Message`]s are
+/// fire-and-forget: a command for an actor, or an answer for a caller. Requests
+/// are call-and-answer, and exist for consensus, which cannot work without one —
+/// a vote nobody answers is indistinguishable from a vote nobody received.
+///
+/// A reply is *not* a request/response. The actor answering may take as long as
+/// it likes and the connection the command arrived on need not still be open,
+/// so an answer travels back as an ordinary message addressed by correlation
+/// id.
 #[async_trait]
 pub trait Transport: Send + Sync + 'static {
-    /// Hand `env` to `to`.
+    /// Hand `message` to `to`.
     ///
-    /// Returns once the envelope is accepted for delivery, not once it is
-    /// processed — an `Ok` here is not an acknowledgement that anything acted
-    /// on it.
-    async fn send(&self, to: NodeId, env: Envelope) -> Result<(), TransportError>;
+    /// Returns once it is accepted for delivery, not once it is processed — an
+    /// `Ok` here is not an acknowledgement that anything acted on it.
+    async fn send(&self, to: NodeId, message: Message) -> Result<(), TransportError>;
 
     /// Send `payload` to `to` and wait for its answer.
     ///
@@ -69,12 +72,12 @@ pub trait Transport: Send + Sync + 'static {
     /// pretending otherwise would leave callers hanging on the difference.
     async fn rpc(&self, to: NodeId, payload: Vec<u8>) -> Result<Vec<u8>, TransportError>;
 
-    /// Take the stream of envelopes arriving at this node.
+    /// Take the stream of messages arriving at this node.
     ///
     /// Returns `None` if it has already been taken; there is exactly one
     /// consumer, because two would silently split the inbound stream between
     /// them.
-    fn incoming(&self) -> Option<mpsc::Receiver<Envelope>>;
+    fn incoming(&self) -> Option<mpsc::Receiver<Message>>;
 
     /// Take the stream of requests arriving at this node. Taken once, as
     /// [`incoming`](Transport::incoming) is.
@@ -87,7 +90,7 @@ pub trait Transport: Send + Sync + 'static {
 /// Both inbound queues for one attached node.
 #[derive(Clone)]
 struct Mailboxes {
-    envelopes: mpsc::Sender<Envelope>,
+    messages: mpsc::Sender<Message>,
     requests: mpsc::Sender<RpcRequest>,
 }
 
@@ -117,7 +120,7 @@ impl InProcessNetwork {
         self.nodes.lock().insert(
             id,
             Mailboxes {
-                envelopes: tx,
+                messages: tx,
                 requests: rpc_tx,
             },
         );
@@ -169,7 +172,7 @@ impl InProcessNetwork {
 pub struct InProcessTransport {
     id: NodeId,
     network: InProcessNetwork,
-    inbox: Mutex<Option<mpsc::Receiver<Envelope>>>,
+    inbox: Mutex<Option<mpsc::Receiver<Message>>>,
     rpc_inbox: Mutex<Option<mpsc::Receiver<RpcRequest>>>,
 }
 
@@ -196,10 +199,10 @@ impl InProcessTransport {
 
 #[async_trait]
 impl Transport for InProcessTransport {
-    async fn send(&self, to: NodeId, env: Envelope) -> Result<(), TransportError> {
+    async fn send(&self, to: NodeId, message: Message) -> Result<(), TransportError> {
         self.mailboxes(to)?
-            .envelopes
-            .send(env)
+            .messages
+            .send(message)
             .await
             .map_err(|_| TransportError::Unreachable(to))
     }
@@ -219,7 +222,7 @@ impl Transport for InProcessTransport {
             .map_err(|_| TransportError::Io(format!("{to} did not answer")))
     }
 
-    fn incoming(&self) -> Option<mpsc::Receiver<Envelope>> {
+    fn incoming(&self) -> Option<mpsc::Receiver<Message>> {
         self.inbox.lock().take()
     }
 
@@ -241,14 +244,22 @@ impl Transport for InProcessTransport {
 )]
 mod tests {
     use super::*;
+    use crate::envelope::Envelope;
 
-    fn env(kind: &str, id: &str, payload: &[u8]) -> Envelope {
-        Envelope {
+    fn env(kind: &str, id: &str, payload: &[u8]) -> Message {
+        Message::Command(Envelope {
             kind: kind.into(),
             id: id.into(),
-            correlation: None,
             message_id: 1,
             payload: payload.to_vec(),
+        })
+    }
+
+    /// The envelope inside a delivered message, for tests that assert on it.
+    fn delivered(message: Message) -> Envelope {
+        match message {
+            Message::Command(env) => env,
+            Message::Reply(_) => panic!("expected a command, got a reply"),
         }
     }
 
@@ -263,7 +274,7 @@ mod tests {
             .await
             .unwrap();
 
-        let got = inbox.recv().await.unwrap();
+        let got = delivered(inbox.recv().await.unwrap());
         assert_eq!(got.kind, "counter");
         assert_eq!(got.payload, b"hello");
     }
@@ -318,10 +329,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_envelope_round_trips_through_serde() {
+    async fn a_message_round_trips_through_serde() {
         let original = env("counter", "c1", b"payload");
         let bytes = serde_json::to_vec(&original).unwrap();
-        let back: Envelope = serde_json::from_slice(&bytes).unwrap();
+        let back: Message = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(original, back);
     }
 

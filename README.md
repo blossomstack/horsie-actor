@@ -178,7 +178,15 @@ fence — so a new backend can be held to it.
 
 Several nodes can host one actor tree, addressed the same way from any of them:
 `system.actor_of::<A>(&id)` returns an `ActorRef` whether the instance runs here
-or on another node.
+or on another node, and `tell` and `ask` both work across the boundary. A reply
+handle carries the node that asked and a correlation id, so the answer finds its
+way back to a caller still awaiting it.
+
+The requirement that a reply must be encodable sits on `ReplyTo`'s own
+`Serialize` rather than on `ask`. So it applies exactly to handles that really do
+cross a host — `ClusterActor` already requires its command type to round-trip,
+and a command holding a `ReplyTo<R>` only does if `R` does — and never to the
+local-only reply types that make up most of an application.
 
 Three things, kept separate:
 
