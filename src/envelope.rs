@@ -44,13 +44,29 @@ pub struct Envelope {
     pub id: String,
     /// Set when the sender wants an answer; echoed on the reply so the sender
     /// can match it to the caller still waiting.
+    ///
+    /// **Always `None` today.** Routing a reply back across a host boundary is
+    /// not built — [`ActorRef::ask`] refuses a remote target rather than
+    /// hanging — so nothing populates or reads this yet. It is here because the
+    /// wire format is the thing most expensive to change later, not because it
+    /// is in use.
+    ///
+    /// [`ActorRef::ask`]: crate::ActorRef::ask
     pub correlation: Option<u128>,
     /// Deduplication key. The receiver remembers these, so a redelivery after a
     /// retry is dropped rather than applied a second time — which is what turns
     /// at-least-once delivery into effectively-once processing.
     pub message_id: u128,
-    /// The sender's belief about the owner's generation. A receiver that has
-    /// moved past it rejects rather than processes.
+    /// The sender's belief about the owner's generation.
+    ///
+    /// **Written but not yet read.** A sender does not know which generation the
+    /// host claimed, so this is currently `Epoch(0)` — "no assertion" — and the
+    /// receiver does not check it. Staleness is caught one layer down instead:
+    /// the host's own claim fences its writes, so a command delivered to a host
+    /// that has lost the log fails at the journal rather than at the door.
+    ///
+    /// Checking here would reject sooner and more cheaply, and needs the sender
+    /// to learn the host's generation first.
     pub epoch: Epoch,
     /// The encoded command.
     pub payload: Vec<u8>,
