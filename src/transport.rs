@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Inbound queue depth per node. Bounded so a node that stops draining exerts
 /// backpressure on its senders rather than growing without limit.
@@ -23,13 +23,34 @@ pub enum TransportError {
     Io(String),
 }
 
-/// Moves envelopes between nodes.
+/// One request awaiting an answer, handed to whoever drains
+/// [`Transport::incoming_rpc`].
+///
+/// Dropping `reply` without sending is a valid outcome — the caller sees a
+/// failed request rather than hanging, which is the right shape for a node
+/// that is shutting down or standing down.
+#[derive(Debug)]
+pub struct RpcRequest {
+    /// The encoded request.
+    pub payload: Vec<u8>,
+    /// Where the answer goes.
+    pub reply: oneshot::Sender<Vec<u8>>,
+}
+
+/// Moves messages between nodes.
 ///
 /// The whole seam between "which node owns this actor" and "how bytes get
 /// there". Two implementations ship: [`InProcessTransport`] for tests, and a
 /// TCP one for real deployments. Keeping it a trait is what lets the cluster
-/// tests run several genuine nodes inside one process, with real placement and
-/// real fencing, rather than asserting against a stand-in.
+/// tests run several genuine nodes inside one process, with real placement,
+/// real consensus and a real write fence, rather than asserting against a
+/// stand-in.
+///
+/// Two shapes travel over it, and the difference is deliberate. Envelopes are
+/// fire-and-forget: an actor command has no reply path across a host boundary.
+/// Requests are call-and-answer, and exist for consensus, which cannot work
+/// without one — a vote nobody answers is indistinguishable from a vote nobody
+/// received.
 #[async_trait]
 pub trait Transport: Send + Sync + 'static {
     /// Hand `env` to `to`.
@@ -39,6 +60,15 @@ pub trait Transport: Send + Sync + 'static {
     /// on it.
     async fn send(&self, to: NodeId, env: Envelope) -> Result<(), TransportError>;
 
+    /// Send `payload` to `to` and wait for its answer.
+    ///
+    /// Opaque bytes on purpose: this carries consensus messages, and the
+    /// transport has no reason to know their shape. It is deliberately *not* a
+    /// general reply path for actor commands — routing an actor's reply needs a
+    /// correlation table and an encode context that this does not have, and
+    /// pretending otherwise would leave callers hanging on the difference.
+    async fn rpc(&self, to: NodeId, payload: Vec<u8>) -> Result<Vec<u8>, TransportError>;
+
     /// Take the stream of envelopes arriving at this node.
     ///
     /// Returns `None` if it has already been taken; there is exactly one
@@ -46,14 +76,31 @@ pub trait Transport: Send + Sync + 'static {
     /// them.
     fn incoming(&self) -> Option<mpsc::Receiver<Envelope>>;
 
+    /// Take the stream of requests arriving at this node. Taken once, as
+    /// [`incoming`](Transport::incoming) is.
+    fn incoming_rpc(&self) -> Option<mpsc::Receiver<RpcRequest>>;
+
     /// This node's own identity.
     fn local_id(&self) -> NodeId;
+}
+
+/// Both inbound queues for one attached node.
+#[derive(Clone)]
+struct Mailboxes {
+    envelopes: mpsc::Sender<Envelope>,
+    requests: mpsc::Sender<RpcRequest>,
 }
 
 /// The shared switchboard several [`InProcessTransport`]s route through.
 #[derive(Clone, Default)]
 pub struct InProcessNetwork {
-    nodes: Arc<Mutex<HashMap<NodeId, mpsc::Sender<Envelope>>>>,
+    nodes: Arc<Mutex<HashMap<NodeId, Mailboxes>>>,
+    /// Nodes cut off from the network, with their mailboxes kept aside.
+    ///
+    /// Kept rather than dropped so a partition can heal: the node comes back
+    /// with the queues it had, which is what a network recovering looks like —
+    /// as opposed to a node restarting, which is a different test.
+    detached: Arc<Mutex<HashMap<NodeId, Mailboxes>>>,
 }
 
 impl InProcessNetwork {
@@ -66,22 +113,48 @@ impl InProcessNetwork {
     #[must_use]
     pub fn node(&self, id: NodeId) -> InProcessTransport {
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
-        self.nodes.lock().insert(id, tx);
+        let (rpc_tx, rpc_rx) = mpsc::channel(INBOX_CAPACITY);
+        self.nodes.lock().insert(
+            id,
+            Mailboxes {
+                envelopes: tx,
+                requests: rpc_tx,
+            },
+        );
         InProcessTransport {
             id,
             network: self.clone(),
             inbox: Mutex::new(Some(rx)),
+            rpc_inbox: Mutex::new(Some(rpc_rx)),
         }
     }
 
-    /// Detach a node: sends to it now fail as unreachable.
+    /// Detach a node: nothing reaches it, and nothing it sends arrives.
     ///
-    /// This is how a test kills a host. Note it leaves the node's own transport
-    /// alive and still believing it is a member, which is exactly the state a
-    /// partitioned host is in — and the state the journal fence exists to make
-    /// survivable.
+    /// This is how a test kills a host, and the cut goes both ways on purpose.
+    /// A node that could still be *heard* would keep its leadership while
+    /// everyone else concluded it was gone — not a partition, just a node with
+    /// a broken inbox, and a state no real network produces.
+    ///
+    /// Its own transport stays up and it goes on believing it is a member,
+    /// which is exactly what being on the wrong side of a partition feels like
+    /// from inside.
     pub fn remove(&self, id: NodeId) {
-        self.nodes.lock().remove(&id);
+        if let Some(mailboxes) = self.nodes.lock().remove(&id) {
+            self.detached.lock().insert(id, mailboxes);
+        }
+    }
+
+    /// Reattach a node detached by [`remove`](Self::remove) — a healed
+    /// partition.
+    ///
+    /// Its mailboxes are the ones it was created with, so whatever it was doing
+    /// resumes rather than restarting, which is what a network coming back
+    /// looks like.
+    pub fn restore(&self, id: NodeId) {
+        if let Some(mailboxes) = self.detached.lock().remove(&id) {
+            self.nodes.lock().insert(id, mailboxes);
+        }
     }
 
     /// Whether `id` is currently reachable.
@@ -97,26 +170,61 @@ pub struct InProcessTransport {
     id: NodeId,
     network: InProcessNetwork,
     inbox: Mutex<Option<mpsc::Receiver<Envelope>>>,
+    rpc_inbox: Mutex<Option<mpsc::Receiver<RpcRequest>>>,
+}
+
+impl InProcessTransport {
+    /// The target's mailboxes, cloned out from under the lock.
+    ///
+    /// Cloned rather than borrowed because the sends below await when a mailbox
+    /// is full, and holding a synchronous lock across that await would deadlock
+    /// every other sender in the process.
+    fn mailboxes(&self, to: NodeId) -> Result<Mailboxes, TransportError> {
+        let nodes = self.network.nodes.lock();
+        // A detached node cannot send either. Checking the sender's own
+        // presence is what makes `remove` a partition rather than a broken
+        // inbox.
+        if !nodes.contains_key(&self.id) {
+            return Err(TransportError::Unreachable(to));
+        }
+        nodes
+            .get(&to)
+            .cloned()
+            .ok_or(TransportError::Unreachable(to))
+    }
 }
 
 #[async_trait]
 impl Transport for InProcessTransport {
     async fn send(&self, to: NodeId, env: Envelope) -> Result<(), TransportError> {
-        // Clone the sender out from under the lock: `send` awaits when the
-        // target's inbox is full, and holding a synchronous lock across that
-        // await would deadlock every other sender in the process.
-        let tx = {
-            let nodes = self.network.nodes.lock();
-            nodes.get(&to).cloned()
-        };
-        let tx = tx.ok_or(TransportError::Unreachable(to))?;
-        tx.send(env)
+        self.mailboxes(to)?
+            .envelopes
+            .send(env)
             .await
             .map_err(|_| TransportError::Unreachable(to))
     }
 
+    async fn rpc(&self, to: NodeId, payload: Vec<u8>) -> Result<Vec<u8>, TransportError> {
+        let (reply, answer) = oneshot::channel();
+        self.mailboxes(to)?
+            .requests
+            .send(RpcRequest { payload, reply })
+            .await
+            .map_err(|_| TransportError::Unreachable(to))?;
+        // A dropped responder is a failed request, never a hang. A node that is
+        // shutting down drops its inbox mid-flight, and the caller has to learn
+        // that promptly or consensus stalls on a peer that will never answer.
+        answer
+            .await
+            .map_err(|_| TransportError::Io(format!("{to} did not answer")))
+    }
+
     fn incoming(&self) -> Option<mpsc::Receiver<Envelope>> {
         self.inbox.lock().take()
+    }
+
+    fn incoming_rpc(&self) -> Option<mpsc::Receiver<RpcRequest>> {
+        self.rpc_inbox.lock().take()
     }
 
     fn local_id(&self) -> NodeId {
@@ -133,7 +241,6 @@ impl Transport for InProcessTransport {
 )]
 mod tests {
     use super::*;
-    use crate::envelope::Epoch;
 
     fn env(kind: &str, id: &str, payload: &[u8]) -> Envelope {
         Envelope {
@@ -141,7 +248,6 @@ mod tests {
             id: id.into(),
             correlation: None,
             message_id: 1,
-            epoch: Epoch(1),
             payload: payload.to_vec(),
         }
     }
@@ -217,5 +323,56 @@ mod tests {
         let bytes = serde_json::to_vec(&original).unwrap();
         let back: Envelope = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(original, back);
+    }
+
+    /// The request path, end to end over the in-process switchboard.
+    #[tokio::test]
+    async fn a_request_gets_its_answer_back() {
+        let net = InProcessNetwork::new();
+        let a = net.node(NodeId(1));
+        let b = net.node(NodeId(2));
+
+        let mut inbox = b.incoming_rpc().unwrap();
+        tokio::spawn(async move {
+            while let Some(req) = inbox.recv().await {
+                let mut answer = req.payload.clone();
+                answer.reverse();
+                let _ = req.reply.send(answer);
+            }
+        });
+
+        assert_eq!(
+            a.rpc(NodeId(2), vec![1, 2, 3]).await.unwrap(),
+            vec![3, 2, 1]
+        );
+    }
+
+    /// A request to a node that has left fails immediately, the same way a send
+    /// to it does.
+    #[tokio::test]
+    async fn a_request_to_a_departed_node_fails() {
+        let net = InProcessNetwork::new();
+        let a = net.node(NodeId(1));
+        let _b = net.node(NodeId(2));
+        net.remove(NodeId(2));
+
+        let err = a.rpc(NodeId(2), vec![1]).await.unwrap_err();
+        assert!(matches!(err, TransportError::Unreachable(NodeId(2))));
+    }
+
+    /// A node that stops draining its request inbox fails its callers rather
+    /// than parking them — the shape a node standing down needs.
+    #[tokio::test]
+    async fn a_request_nobody_answers_fails() {
+        let net = InProcessNetwork::new();
+        let a = net.node(NodeId(1));
+        let b = net.node(NodeId(2));
+        drop(b.incoming_rpc().unwrap());
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(2), a.rpc(NodeId(2), vec![1]))
+                .await
+                .expect("an unanswered request must return rather than hang");
+        assert!(outcome.is_err());
     }
 }

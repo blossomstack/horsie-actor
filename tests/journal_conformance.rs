@@ -67,4 +67,27 @@ mod in_memory {
     async fn snapshot_then_compact_leaves_only_later_events() {
         conformance::snapshot_then_compact_leaves_only_later_events(&journal()).await;
     }
+    #[tokio::test]
+    async fn last_seq_reports_where_the_log_ends() {
+        conformance::last_seq_reports_where_the_log_ends(&journal()).await;
+    }
+
+    // ── the write fence ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn persist_rejects_a_stale_writer() {
+        conformance::persist_rejects_a_stale_writer(&journal()).await;
+    }
+    #[tokio::test]
+    async fn persist_rejects_a_writer_ahead_of_the_log() {
+        conformance::persist_rejects_a_writer_ahead_of_the_log(&journal()).await;
+    }
+    #[tokio::test]
+    async fn save_snapshot_rejects_a_stale_writer() {
+        conformance::save_snapshot_rejects_a_stale_writer(&journal()).await;
+    }
+    #[tokio::test]
+    async fn only_one_writer_can_start_a_log() {
+        conformance::only_one_writer_can_start_a_log(&journal()).await;
+    }
 }

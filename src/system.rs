@@ -1,10 +1,9 @@
 use crate::actor::EventSourcedActor;
 use crate::behaviour::Actor;
 use crate::cluster::{ClusterNode, Dedup};
-use crate::envelope::{Envelope, Epoch};
-use crate::error::{JournalError, TellError};
+use crate::envelope::Envelope;
+use crate::error::TellError;
 use crate::journal::{InMemoryJournal, Journal};
-use crate::persistence_id::PersistenceId;
 use crate::persistent::Persistent;
 use crate::runtime::{ActorContext, ActorRef, MAILBOX_CAPACITY, run_actor};
 use parking_lot::Mutex;
@@ -24,6 +23,13 @@ use thiserror::Error;
 /// for an event-sourced one, so being cluster-hostable and being event-sourced
 /// stay independent.
 ///
+/// Nothing here mentions persistence, and that is deliberate. A singleton with
+/// no event log is an ordinary member of this trait; an earlier version required
+/// every registered type to declare a `persistence_id` so the system could claim
+/// a log before hosting, which forced a journal on types that had no state to
+/// keep. The write fence now lives entirely inside the event-sourcing layer, so
+/// the cluster layer no longer has to know that journals exist.
+///
 /// The `Command` bounds are the compile-time guarantee: a type whose commands
 /// cannot round-trip through serde cannot be registered at all, so a command
 /// that could not survive a hop between hosts is a type error rather than a
@@ -40,35 +46,11 @@ pub trait ClusterActor: Send + 'static {
     /// never sent anywhere; each host supplies its own.
     type Deps: Clone + Send + Sync + 'static;
 
-    /// The log this instance's state lives in, when it has one.
-    ///
-    /// `Some` makes the instance fenceable: the host claims this log before
-    /// serving, which mints an epoch and locks out whoever held it before.
-    /// `None` is a stateless type — nothing to fence, because nothing is
-    /// written.
-    ///
-    /// Deliberately has no default. A default of `None` would mean an
-    /// event-sourced actor that forgot to override it silently ran unfenced,
-    /// and the symptom of that is two hosts merging into one history — the one
-    /// failure this whole mechanism exists to prevent. Writing `None` by hand
-    /// is a claim that the type is stateless.
-    fn persistence_id(id: &str) -> Option<PersistenceId>;
-
     /// Build and spawn the instance for `id`.
     ///
     /// This is what a host that never executed the original request calls, which
     /// is why it takes an id and deps rather than a constructed actor.
-    ///
-    /// `fence` is the generation this host claimed the log at. An event-sourced
-    /// type must pass it to [`ActorSystem::spawn_fenced`], or its writes carry
-    /// no claim and a host that lost the instance keeps writing to it. `None`
-    /// means nothing is arbitrating ownership.
-    fn spawn(
-        id: &str,
-        deps: Self::Deps,
-        system: &ActorSystem,
-        fence: Option<Epoch>,
-    ) -> ActorRef<Self::Command>;
+    fn spawn(id: &str, deps: Self::Deps, system: &ActorSystem) -> ActorRef<Self::Command>;
 }
 
 /// Why an inbound envelope could not be delivered.
@@ -86,7 +68,7 @@ pub enum DispatchError {
 
     /// The instance could not be started here.
     #[error(transparent)]
-    Resolve(ActorOfError),
+    Resolve(#[from] ActorOfError),
 
     /// The instance stopped between being resolved and being told.
     #[error("the instance stopped before the message was delivered")]
@@ -106,10 +88,14 @@ pub enum ActorOfError {
     #[error("two actor types are registered under the kind '{0}'")]
     KindCollision(&'static str),
 
-    /// The log could not be claimed, so hosting would mean writing without a
-    /// generation — which is how two hosts end up merged into one history.
-    #[error("could not claim ownership: {0}")]
-    Claim(String),
+    /// This node cannot see a quorum, so it is not hosting anything.
+    ///
+    /// Refused rather than served. A node in a minority cannot know whether its
+    /// instances have already been given to somebody else, and answering from
+    /// state that may be history is the one failure the write fence cannot
+    /// catch — because a read never writes.
+    #[error("this node has no quorum and is not serving")]
+    NotServing,
 }
 
 /// How many recent message ids a node remembers. Large enough that a retry
@@ -122,7 +108,7 @@ const DEDUP_WINDOW: usize = 4096;
 type ErasedRef = Arc<dyn Any + Send + Sync>;
 
 /// Builds an instance of some registered kind and returns a type-erased ref.
-type Factory = Arc<dyn Fn(&str, &ActorSystem, Option<Epoch>) -> ErasedRef + Send + Sync>;
+type Factory = Arc<dyn Fn(&str, &ActorSystem) -> ErasedRef + Send + Sync>;
 
 /// Decodes an inbound payload and hands it to the local instance.
 ///
@@ -155,6 +141,13 @@ pub(crate) struct SystemInner {
     seen: Mutex<Dedup>,
     /// Live instances, keyed by kind and id.
     live: Mutex<HashMap<(&'static str, String), ErasedRef>>,
+    /// Raised when this node stops serving. Every actor watches it and stops.
+    ///
+    /// A single-node system holds a sender that is never used, so the signal
+    /// never fires and nothing pays for it.
+    pub(crate) stand_down: tokio::sync::watch::Receiver<bool>,
+    /// Kept alive so the receiver above never reports its sender dropped.
+    _stand_down_tx: tokio::sync::watch::Sender<bool>,
 }
 
 /// The runtime an actor tree lives in: its journal, its registered actor types,
@@ -168,6 +161,7 @@ impl ActorSystem {
     /// A system backed by `journal`.
     #[must_use]
     pub fn new(journal: Arc<dyn Journal>) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(false);
         Self {
             inner: Arc::new(SystemInner {
                 journal,
@@ -176,6 +170,8 @@ impl ActorSystem {
                 cluster: None,
                 seen: Mutex::new(Dedup::with_capacity(DEDUP_WINDOW)),
                 live: Mutex::new(HashMap::new()),
+                stand_down: rx,
+                _stand_down_tx: tx,
             }),
         }
     }
@@ -187,6 +183,27 @@ impl ActorSystem {
     /// difference — `actor_of` returns an `ActorRef` either way.
     #[must_use]
     pub fn clustered(journal: Arc<dyn Journal>, cluster: Arc<ClusterNode>) -> Self {
+        // Inverted: actors want to know when to stop, and the node reports when
+        // it may serve.
+        //
+        // Starts false even though a node that has not yet elected anybody is
+        // not serving. The signal means "stop what you are doing", and at
+        // construction there is nothing doing it — seeding it true would make
+        // every actor spawned before the first election exit on its first poll,
+        // silently. Refusing to *start* an instance is `require_serving`'s job,
+        // and it is a separate question with a separate answer.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut serving = cluster.serving_watch();
+        let relay = tx.clone();
+        tokio::spawn(async move {
+            while serving.changed().await.is_ok() {
+                let stop = !*serving.borrow_and_update();
+                if relay.send(stop).is_err() {
+                    return; // the system is gone
+                }
+            }
+        });
+
         Self {
             inner: Arc::new(SystemInner {
                 journal,
@@ -195,6 +212,8 @@ impl ActorSystem {
                 cluster: Some(cluster),
                 seen: Mutex::new(Dedup::with_capacity(DEDUP_WINDOW)),
                 live: Mutex::new(HashMap::new()),
+                stand_down: rx,
+                _stand_down_tx: tx,
             }),
         }
     }
@@ -227,8 +246,8 @@ impl ActorSystem {
     ///
     /// Called once per type at startup. `deps` is cloned into every instance.
     pub fn register<A: ClusterActor>(&self, deps: A::Deps) {
-        let factory: Factory = Arc::new(move |id: &str, system: &ActorSystem, fence| {
-            Arc::new(A::spawn(id, deps.clone(), system, fence)) as ErasedRef
+        let factory: Factory = Arc::new(move |id: &str, system: &ActorSystem| {
+            Arc::new(A::spawn(id, deps.clone(), system)) as ErasedRef
         });
         self.inner.factories.lock().insert(A::KIND, factory);
 
@@ -236,10 +255,7 @@ impl ActorSystem {
             Box::pin(async move {
                 let cmd: A::Command = serde_json::from_slice(&payload)
                     .map_err(|e| DispatchError::Decode(e.to_string()))?;
-                let target = system
-                    .local_instance::<A>(&id)
-                    .await
-                    .map_err(DispatchError::Resolve)?;
+                let target = system.local_instance::<A>(&id)?;
                 target
                     .tell(cmd)
                     .await
@@ -251,29 +267,17 @@ impl ActorSystem {
 
     /// Start, or return, the instance hosted *here* — no cluster resolution.
     ///
-    /// Claims the log first when the type has one, so this host's writes carry a
-    /// generation above whatever held it before. Used by the dispatch loop,
-    /// which has already been told this node is the right place.
-    pub async fn local_instance<A: ClusterActor>(
+    /// Used by the dispatch loop, which has already been told this node is the
+    /// right place. Starting an instance takes no lock on anything shared: an
+    /// event-sourced one recovers, and its first write is conditional on the log
+    /// still ending where recovery left it, so a second host starting the same
+    /// instance is caught by that write rather than by a claim taken here.
+    pub fn local_instance<A: ClusterActor>(
         &self,
         id: &str,
     ) -> Result<ActorRef<A::Command>, ActorOfError> {
+        self.require_serving()?;
         let key = (A::KIND, id.to_owned());
-        {
-            let live = self.inner.live.lock();
-            if let Some(existing) = live.get(&key) {
-                return downcast::<A>(existing);
-            }
-        }
-
-        // Claim before spawning, so the instance's very first write already
-        // outranks whatever held the log before. Claiming after would leave a
-        // window where two hosts write under the same generation.
-        let fence = self
-            .claim::<A>(id)
-            .await
-            .map_err(|e| ActorOfError::Claim(e.to_string()))?;
-
         let factory = self
             .inner
             .factories
@@ -283,12 +287,19 @@ impl ActorSystem {
             .ok_or(ActorOfError::NotRegistered(A::KIND))?;
 
         let mut live = self.inner.live.lock();
-        // Somebody else won the race while we were claiming. Theirs has the
-        // higher epoch, so ours would be fenced anyway — use theirs.
         if let Some(existing) = live.get(&key) {
-            return downcast::<A>(existing);
+            let typed = downcast::<A>(existing)?;
+            // A stopped instance stays in the map until somebody asks for it
+            // again — there is no lifecycle callback to evict it, and polling
+            // for corpses would cost more than checking here. Handing this one
+            // back would be worse than a miss: every `tell` to it fails, and the
+            // instance it stood down for never gets started.
+            if typed.is_alive() {
+                return Ok(typed);
+            }
+            live.remove(&key);
         }
-        let erased = factory(id, self, fence);
+        let erased = factory(id, self);
         let typed = downcast::<A>(&erased)?;
         live.insert(key, erased);
         if let Some(cluster) = &self.inner.cluster {
@@ -297,31 +308,17 @@ impl ActorSystem {
         Ok(typed)
     }
 
-    /// Claim the log for `(A::KIND, id)`, returning the epoch to write under.
-    ///
-    /// `None` when the type is stateless or there is no cluster — nothing is
-    /// arbitrating ownership, so nothing needs fencing.
-    pub async fn claim<A: ClusterActor>(&self, id: &str) -> Result<Option<Epoch>, JournalError> {
-        if self.inner.cluster.is_none() {
-            return Ok(None);
+    /// Refuse everything while this node has no quorum.
+    fn require_serving(&self) -> Result<(), ActorOfError> {
+        match &self.inner.cluster {
+            Some(cluster) if !cluster.serving() => Err(ActorOfError::NotServing),
+            _ => Ok(()),
         }
-        let Some(pid) = A::persistence_id(id) else {
-            return Ok(None);
-        };
-        self.inner.journal.claim_ownership(&pid).await.map(Some)
-    }
-
-    /// Spawn an event-sourced actor whose writes carry `fence`.
-    pub fn spawn_fenced<A: EventSourcedActor>(
-        &self,
-        actor: A,
-        fence: Option<Epoch>,
-    ) -> ActorRef<A::Command> {
-        spawn_fenced_in(actor, self.inner.clone(), fence)
     }
 
     /// Feed one inbound envelope to the instance it addresses.
     pub async fn dispatch(&self, env: Envelope) -> Result<(), DispatchError> {
+        self.require_serving()?;
         // A repeat is a success, not a failure: the sender retried because it
         // could not tell "lost" from "slow", and the answer to both is that the
         // command has already been applied.
@@ -348,14 +345,19 @@ impl ActorSystem {
         &self,
         id: &str,
     ) -> Result<ActorRef<A::Command>, ActorOfError> {
+        self.require_serving()?;
+
         // Already running here: hand back the same reference regardless of what
         // placement now says. Migrating a live instance mid-conversation would
-        // strand whatever it was doing, and the fence makes a brief overlap
-        // survivable anyway.
+        // strand whatever it was doing, and the conditional append makes a brief
+        // overlap survivable anyway.
         {
             let live = self.inner.live.lock();
             if let Some(existing) = live.get(&(A::KIND, id.to_owned())) {
-                return downcast::<A>(existing);
+                let typed = downcast::<A>(existing)?;
+                if typed.is_alive() {
+                    return Ok(typed);
+                }
             }
         }
 
@@ -365,7 +367,7 @@ impl ActorSystem {
             return Ok(self.remote_ref::<A>(id, cluster.clone()));
         }
 
-        self.local_instance::<A>(id).await
+        self.local_instance::<A>(id)
     }
 
     /// A reference that encodes commands and ships them to the hosting node.
@@ -386,10 +388,8 @@ impl ActorSystem {
             let id = id.clone();
             Box::pin(async move {
                 let payload = serde_json::to_vec(&cmd).map_err(|_| TellError::Undeliverable)?;
-                // The sender does not know the host's generation, so it asserts
-                // nothing; the host's own claim is what fences its writes.
                 cluster
-                    .send(kind, &id, Epoch(0), payload, cluster.next_message_id())
+                    .send(kind, &id, payload, cluster.next_message_id())
                     .await
                     .map_err(|_| TellError::Undeliverable)
             })
@@ -422,16 +422,8 @@ pub(crate) fn spawn_persistent_in<A: EventSourcedActor>(
     actor: A,
     inner: Arc<SystemInner>,
 ) -> ActorRef<A::Command> {
-    spawn_fenced_in(actor, inner, None)
-}
-
-pub(crate) fn spawn_fenced_in<A: EventSourcedActor>(
-    actor: A,
-    inner: Arc<SystemInner>,
-    fence: Option<Epoch>,
-) -> ActorRef<A::Command> {
     let journal = inner.journal.clone();
-    spawn_in(Persistent::fenced(actor, journal, fence), inner)
+    spawn_in(Persistent::new(actor, journal), inner)
 }
 
 #[cfg(test)]
@@ -507,20 +499,11 @@ mod tests {
         type Command = CounterCmd;
         type Deps = ();
 
-        fn persistence_id(id: &str) -> Option<PersistenceId> {
-            Some(PersistenceId::new("counter", id))
-        }
-
         // An event-sourced registered type spawns itself persistently. A
         // stateless one would call `system.spawn` here instead — being
         // registered and being event-sourced are independent.
-        fn spawn(
-            id: &str,
-            _deps: (),
-            system: &ActorSystem,
-            fence: Option<Epoch>,
-        ) -> ActorRef<CounterCmd> {
-            system.spawn_fenced(Counter { id: id.to_owned() }, fence)
+        fn spawn(id: &str, _deps: (), system: &ActorSystem) -> ActorRef<CounterCmd> {
+            system.spawn_persistent(Counter { id: id.to_owned() })
         }
     }
 
@@ -598,16 +581,10 @@ mod tests {
             type Command = OtherCmd;
             type Deps = ();
 
-            // Stateless: nothing written, so nothing to fence.
-            fn persistence_id(_id: &str) -> Option<PersistenceId> {
-                None
-            }
-            fn spawn(
-                _id: &str,
-                _deps: (),
-                system: &ActorSystem,
-                _fence: Option<Epoch>,
-            ) -> ActorRef<OtherCmd> {
+            // Stateless: no journal anywhere in sight, which is the point —
+            // being registered for cluster hosting says nothing about
+            // persistence.
+            fn spawn(_id: &str, _deps: (), system: &ActorSystem) -> ActorRef<OtherCmd> {
                 system.spawn(Impostor)
             }
         }

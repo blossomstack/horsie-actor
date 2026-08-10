@@ -1,5 +1,5 @@
 //! Several real nodes in one process: real placement, real transport, real
-//! fencing. Nothing here is a stand-in for the thing under test.
+//! write fence. Nothing here is a stand-in for the thing under test.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -10,7 +10,8 @@
 use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, ActorRef, ActorSystem, ClusterActor, ClusterConfig, ClusterNode, CommandEffect,
-    Envelope, Epoch, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, ReplyTo,
+    Envelope, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, RaftStore,
+    ReplyTo,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -78,19 +79,8 @@ impl ClusterActor for Counter {
     type Command = CounterCmd;
     type Deps = ();
 
-    fn persistence_id(id: &str) -> Option<PersistenceId> {
-        Some(PersistenceId::new("counter", id))
-    }
-
-    fn spawn(
-        id: &str,
-        _deps: (),
-        system: &ActorSystem,
-        fence: Option<Epoch>,
-    ) -> ActorRef<CounterCmd> {
-        // The fence must reach the journal, or a host that lost this instance
-        // keeps writing to it.
-        system.spawn_fenced(Counter { id: id.to_owned() }, fence)
+    fn spawn(id: &str, _deps: (), system: &ActorSystem) -> ActorRef<CounterCmd> {
+        system.spawn_persistent(Counter { id: id.to_owned() })
     }
 }
 
@@ -106,7 +96,12 @@ struct TestCluster {
 }
 
 impl TestCluster {
-    fn of_size(n: u64) -> Self {
+    /// Bring up `n` nodes and wait for them to agree on a leader and a live set.
+    ///
+    /// The wait is not a convenience. Until consensus has settled no node is
+    /// serving, which is the correct behaviour and would otherwise make every
+    /// test here a race against an election.
+    async fn of_size(n: u64) -> Self {
         let net = horsie_actor::InProcessNetwork::new();
         let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
         let members: Vec<NodeId> = (1..=n).map(NodeId).collect();
@@ -114,25 +109,55 @@ impl TestCluster {
         let mut systems = Vec::new();
         let mut nodes = Vec::new();
         for id in &members {
-            let node = Arc::new(ClusterNode::new(
+            let node = ClusterNode::start(
                 ClusterConfig {
                     local: *id,
-                    members: members.clone(),
+                    bootstrap: members.clone(),
+                    liveness_window: Duration::from_millis(600),
                 },
                 Arc::new(net.node(*id)),
-            ));
+                // Every node forgets its raft state when the test ends, which
+                // is exactly what `in_memory_unsafe` warns about and exactly
+                // what a test wants.
+                RaftStore::in_memory_unsafe(),
+            )
+            .await
+            .expect("raft should start");
             let system = ActorSystem::clustered(journal.clone(), node.clone());
             system.register::<Counter>(());
             spawn_dispatch_loop(&system, &node);
             systems.push(system);
             nodes.push(node);
         }
-        Self {
+        let cluster = Self {
             net,
             systems,
             nodes,
             journal,
+        };
+        cluster.await_settled(n as usize).await;
+        cluster
+    }
+
+    /// Wait until `expected` nodes are serving and every one of them has
+    /// applied the same live set.
+    ///
+    /// Comparing the live sets rather than one instance's owner is the stronger
+    /// check: agreement on every id follows from agreement on the input, and a
+    /// node that is merely a tick behind would otherwise slip through.
+    async fn await_settled(&self, expected: usize) {
+        for _ in 0..200 {
+            let serving: Vec<_> = self.nodes.iter().filter(|n| n.serving()).collect();
+            let sets: Vec<Vec<NodeId>> = serving.iter().map(|n| n.live_members()).collect();
+            let agreed = sets
+                .first()
+                .is_some_and(|first| first.len() == expected && sets.iter().all(|s| s == first));
+            if serving.len() == expected && agreed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        panic!("the cluster never settled on a leader and a live set");
     }
 
     fn system(&self, index: usize) -> &ActorSystem {
@@ -147,13 +172,32 @@ impl TestCluster {
             .expect("some node must host it")
     }
 
-    /// Take a node off the network and tell the survivors it is gone.
-    fn kill(&self, index: usize) {
+    /// Take a node off the network and wait for the survivors to agree it is
+    /// gone.
+    ///
+    /// Nothing tells them: the leader notices its heartbeats stop being
+    /// acknowledged and publishes a smaller live set, which every node applies.
+    /// That is the whole point — a node cannot be marked down by whoever
+    /// happened to fail a send to it.
+    async fn kill(&self, index: usize) {
         let dead = self.nodes[index].local();
         self.net.remove(dead);
-        for node in &self.nodes {
-            node.mark_down(dead);
+        for _ in 0..400 {
+            let survivors: Vec<_> = self
+                .nodes
+                .iter()
+                .filter(|n| n.local() != dead && n.serving())
+                .collect();
+            let sets: Vec<Vec<NodeId>> = survivors.iter().map(|n| n.live_members()).collect();
+            let agreed = sets
+                .first()
+                .is_some_and(|first| !first.contains(&dead) && sets.iter().all(|s| s == first));
+            if agreed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        panic!("the survivors never agreed that {dead} was gone");
     }
 }
 
@@ -196,7 +240,7 @@ async fn settle() {
 /// instance reaches it through the same `actor_of` it would use locally.
 #[tokio::test]
 async fn a_caller_reaches_an_instance_hosted_on_another_node() {
-    let cluster = TestCluster::of_size(3);
+    let cluster = TestCluster::of_size(3).await;
     let id = "c1";
     let host = cluster.host_of(id);
     let elsewhere = (host + 1) % 3;
@@ -216,7 +260,7 @@ async fn a_caller_reaches_an_instance_hosted_on_another_node() {
 /// would read 3 or 4 rather than 7.
 #[tokio::test]
 async fn all_nodes_address_one_instance() {
-    let cluster = TestCluster::of_size(3);
+    let cluster = TestCluster::of_size(3).await;
     let id = "shared";
 
     for i in 0..3 {
@@ -239,7 +283,7 @@ async fn all_nodes_address_one_instance() {
 /// nothing loads at boot and nothing auto-resumes.
 #[tokio::test]
 async fn an_instance_survives_the_death_of_its_host() {
-    let cluster = TestCluster::of_size(3);
+    let cluster = TestCluster::of_size(3).await;
     let id = "survivor";
     let host = cluster.host_of(id);
 
@@ -254,7 +298,7 @@ async fn an_instance_survives_the_death_of_its_host() {
     settle().await;
     assert_eq!(value_at_host(&cluster, id).await, 5);
 
-    cluster.kill(host);
+    cluster.kill(host).await;
 
     // Somewhere else picks it up, recovers from the shared journal, and carries
     // on from 5 rather than starting over.
@@ -270,50 +314,43 @@ async fn an_instance_survives_the_death_of_its_host() {
     assert_eq!(value_at_host(&cluster, id).await, 8);
 }
 
-/// A host that claimed a log and then lost it cannot write to it any more.
+/// A writer that has fallen behind cannot append, even though nothing told it.
 ///
-/// This is the fence doing its job end to end: the second host's claim mints a
-/// higher epoch, and the first host's writes stop landing even though nothing
-/// told it so.
+/// The fence, at the journal level: two writers recovered at the same point,
+/// one of them wrote, and the other's next append is where it finds out. Note
+/// there is no claim, no ownership record and no coordination anywhere in this
+/// test — being behind is the whole detection mechanism.
 #[tokio::test]
-async fn a_former_host_cannot_write_after_someone_else_claims() {
-    let cluster = TestCluster::of_size(3);
-    let pid = PersistenceId::new("counter", "fenced");
+async fn a_stale_writer_cannot_append() {
+    let cluster = TestCluster::of_size(3).await;
+    let pid = PersistenceId::new("counter", "stale");
 
-    let first = cluster.journal.claim_ownership(&pid).await.unwrap();
-    cluster
-        .journal
-        .persist(&pid, &[vec![1]], Some(first))
-        .await
-        .unwrap();
+    // Both writers recovered here.
+    cluster.journal.persist(&pid, &[vec![1]], 0).await.unwrap();
 
-    // A different host takes over.
-    let second = cluster.journal.claim_ownership(&pid).await.unwrap();
-    assert!(second > first);
+    // One of them writes.
+    cluster.journal.persist(&pid, &[vec![2]], 1).await.unwrap();
 
-    // The old one has not been told, and its next write is where it finds out.
+    // The other still believes the log ends at 1.
     let err = cluster
         .journal
-        .persist(&pid, &[vec![2]], Some(first))
+        .persist(&pid, &[vec![3]], 1)
         .await
         .unwrap_err();
     assert!(
-        matches!(err, horsie_actor::JournalError::Fenced { .. }),
-        "a stale host's write was accepted: {err:?}"
+        matches!(err, horsie_actor::JournalError::Conflict { .. }),
+        "a stale writer's append was accepted: {err:?}"
     );
 
-    cluster
-        .journal
-        .persist(&pid, &[vec![3]], Some(second))
-        .await
-        .unwrap();
+    // And the winner carries on from where it actually is.
+    cluster.journal.persist(&pid, &[vec![4]], 2).await.unwrap();
 }
 
 /// Every node resolves an instance to the same host, so no two of them race to
 /// claim the same log in the first place.
 #[tokio::test]
 async fn placement_agrees_across_every_node() {
-    let cluster = TestCluster::of_size(5);
+    let cluster = TestCluster::of_size(5).await;
     for i in 0..40 {
         let id = format!("c{i}");
         let hosts: Vec<_> = cluster
@@ -328,33 +365,37 @@ async fn placement_agrees_across_every_node() {
     }
 }
 
-/// Hosting an instance claims its log. Without this the fence exists but is
-/// never applied, and two hosts write under no generation at all.
+/// Starting an instance writes nothing.
+///
+/// Hosting used to claim the log first, which meant a round trip before serving
+/// and an ownership record to keep. The conditional append made both
+/// unnecessary: an instance that never writes leaves no trace, and one that does
+/// is checked by the write itself. This also pins the decoupling — a registered
+/// actor type with no journal at all is now an ordinary case, not a special one.
 #[tokio::test]
-async fn hosting_an_instance_claims_its_log() {
-    let cluster = TestCluster::of_size(3);
-    let id = "claimed";
+async fn starting_an_instance_writes_nothing() {
+    let cluster = TestCluster::of_size(3).await;
+    let id = "quiet";
     let pid = PersistenceId::new("counter", id);
-
-    assert_eq!(cluster.journal.current_epoch(&pid).await.unwrap(), None);
 
     let host = cluster.host_of(id);
     let _actor = cluster.system(host).actor_of::<Counter>(id).await.unwrap();
 
-    assert!(
-        cluster.journal.current_epoch(&pid).await.unwrap().is_some(),
-        "hosting did not claim the log, so its writes carry no generation"
+    assert_eq!(
+        cluster.journal.last_seq(&pid).await.unwrap(),
+        0,
+        "hosting an instance touched the log"
     );
 }
 
-/// The end-to-end fence: once a second host claims, the first host's actor
-/// stops being able to write, even though nothing told it so.
+/// The end-to-end fence: a host whose log has moved on stops landing writes.
 ///
-/// This is the failure the whole epoch mechanism exists to prevent — two hosts
-/// appending to one history and each believing it succeeded.
+/// This is the failure the whole mechanism exists to prevent — two hosts
+/// appending to one history, each believing it succeeded, leaving a log that is
+/// neither host's state.
 #[tokio::test]
 async fn a_displaced_host_stops_writing() {
-    let cluster = TestCluster::of_size(3);
+    let cluster = TestCluster::of_size(3).await;
     let id = "displaced";
     let pid = PersistenceId::new("counter", id);
 
@@ -367,10 +408,11 @@ async fn a_displaced_host_stops_writing() {
     stale.tell(CounterCmd::Inc(5)).await.unwrap();
     settle().await;
 
-    // Somebody else takes the log — what a partitioned peer taking over does.
-    let usurper = cluster.journal.claim_ownership(&pid).await.unwrap();
+    // Somebody else appends — what a peer that took the instance over does. The
+    // stale actor is not told, and has no way to be.
+    let seven = serde_json::to_vec(&Incremented(7)).unwrap();
+    cluster.journal.persist(&pid, &[seven], 1).await.unwrap();
 
-    // The old host has not been told. Its next write is where it finds out.
     stale.tell(CounterCmd::Inc(100)).await.unwrap();
     settle().await;
 
@@ -379,13 +421,13 @@ async fn a_displaced_host_stops_writing() {
     let elsewhere = (first_host + 1) % 3;
     let fresh = cluster
         .system(elsewhere)
-        .spawn_fenced(Counter { id: id.to_owned() }, Some(usurper));
+        .spawn_persistent(Counter { id: id.to_owned() });
     let value = fresh
         .ask(|reply| CounterCmd::Get(Some(reply)))
         .await
         .unwrap();
     assert_eq!(
-        value, 5,
+        value, 12,
         "the displaced host's write landed; the fence is not being applied"
     );
 }
@@ -398,8 +440,8 @@ async fn a_displaced_host_stops_writing() {
 /// somebody notices. Stopping closes the mailbox, so callers fail immediately
 /// and re-resolve to whoever owns the log now.
 #[tokio::test]
-async fn a_fenced_host_stops_instead_of_serving_stale() {
-    let cluster = TestCluster::of_size(3);
+async fn a_displaced_host_stops_instead_of_serving_stale() {
+    let cluster = TestCluster::of_size(3).await;
     let id = "zombie";
     let pid = PersistenceId::new("counter", id);
 
@@ -408,8 +450,10 @@ async fn a_fenced_host_stops_instead_of_serving_stale() {
     actor.tell(CounterCmd::Inc(1)).await.unwrap();
     settle().await;
 
-    // Somebody else takes the log out from under it.
-    cluster.journal.claim_ownership(&pid).await.unwrap();
+    // Somebody else appends, so this host's next write is from a state that no
+    // longer exists.
+    let one = serde_json::to_vec(&Incremented(1)).unwrap();
+    cluster.journal.persist(&pid, &[one], 1).await.unwrap();
 
     // The next write is where it finds out — and it must be the last thing it
     // does.
@@ -432,7 +476,7 @@ async fn a_fenced_host_stops_instead_of_serving_stale() {
 /// see an error, and cannot see a request that never returns.
 #[tokio::test]
 async fn ask_to_a_remote_host_is_refused_not_hung() {
-    let cluster = TestCluster::of_size(3);
+    let cluster = TestCluster::of_size(3).await;
     let id = "remote-ask";
     let host = cluster.host_of(id);
     let elsewhere = (host + 1) % 3;
@@ -463,7 +507,7 @@ async fn ask_to_a_remote_host_is_refused_not_hung() {
 /// once. Without it, every retry after a slow ack would double-count.
 #[tokio::test]
 async fn a_redelivered_command_is_applied_once() {
-    let cluster = TestCluster::of_size(3);
+    let cluster = TestCluster::of_size(3).await;
     let id = "dedup";
     let host = cluster.host_of(id);
 
@@ -475,7 +519,6 @@ async fn a_redelivered_command_is_applied_once() {
         id: id.into(),
         correlation: None,
         message_id: 42,
-        epoch: Epoch(0),
         payload,
     };
     cluster.system(host).dispatch(env.clone()).await.unwrap();
@@ -489,17 +532,23 @@ async fn a_redelivered_command_is_applied_once() {
     );
 }
 
-/// A send to a host that has gone away lands somewhere alive instead of
-/// failing, because each attempt resolves the owner afresh.
+/// A send to a host that has gone away fails, rather than being re-aimed by
+/// the sender.
+///
+/// This is the behaviour that replaced the split-brain generator. The previous
+/// version dropped the target from *its own* member list on a failed send and
+/// retried elsewhere, which meant one failed delivery let a node rewrite
+/// placement — and a node cut off from its peers rewrote it all the way down to
+/// hosting everything itself. Whether a host is really gone is now the leader's
+/// observation, and a caller that cannot reach one is told so.
 #[tokio::test]
-async fn a_send_retries_onto_a_live_host() {
-    let cluster = TestCluster::of_size(3);
+async fn a_send_to_a_departed_host_fails_rather_than_re_aiming() {
+    let cluster = TestCluster::of_size(3).await;
     let id = "retry";
     let host = cluster.host_of(id);
     let elsewhere = (host + 1) % 3;
 
-    // Take the host off the network without telling anyone — the sender only
-    // finds out by trying.
+    // Off the network, with nobody told.
     cluster.net.remove(cluster.nodes[host].local());
 
     let remote = cluster
@@ -507,11 +556,263 @@ async fn a_send_retries_onto_a_live_host() {
         .actor_of::<Counter>(id)
         .await
         .unwrap();
-    remote
-        .tell(CounterCmd::Inc(7))
+    assert!(
+        remote.tell(CounterCmd::Inc(7)).await.is_err(),
+        "the sender re-aimed a send instead of reporting the failure"
+    );
+}
+
+/// Once the cluster agrees the host is gone, the same send lands.
+///
+/// The two halves together are the contract: failure while it is merely
+/// unreachable, success once it is agreed to be gone.
+#[tokio::test]
+async fn a_send_lands_elsewhere_once_the_cluster_agrees_the_host_is_gone() {
+    let cluster = TestCluster::of_size(3).await;
+    let id = "reaimed";
+    let host = cluster.host_of(id);
+    let elsewhere = (host + 1) % 3;
+
+    cluster.kill(host).await;
+
+    let remote = cluster
+        .system(elsewhere)
+        .actor_of::<Counter>(id)
         .await
-        .expect("the send should have re-resolved onto a live host");
+        .unwrap();
+    remote.tell(CounterCmd::Inc(7)).await.unwrap();
     settle().await;
 
     assert_eq!(value_at_host(&cluster, id).await, 7);
+}
+
+// ------------------------------------------------------- membership & quorum
+
+/// A node cut off from the cluster stops serving.
+///
+/// This is the whole answer to the split-brain the previous design generated: a
+/// node can no longer conclude it is the only member and take ownership of
+/// everything, because membership is not its to decide. Cut off, it sees no
+/// leader and stands down.
+#[tokio::test]
+async fn a_partitioned_node_stops_serving() {
+    let cluster = TestCluster::of_size(3).await;
+    let odd_one_out = 0;
+
+    cluster.net.remove(cluster.nodes[odd_one_out].local());
+
+    for _ in 0..400 {
+        if !cluster.nodes[odd_one_out].serving() {
+            // And the majority carries on, which is the other half of the
+            // point: standing down is not the same as everyone stopping.
+            let survivors = cluster
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != odd_one_out)
+                .filter(|(_, n)| n.serving())
+                .count();
+            assert_eq!(survivors, 2, "the majority stopped serving too");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("a node in the minority kept serving");
+}
+
+/// A minority node refuses to start instances, rather than starting them and
+/// answering from state that may already be history.
+///
+/// The write fence cannot catch this one: a read never writes, so nothing
+/// checks it. Refusing is the only thing that bounds it.
+#[tokio::test]
+async fn a_minority_node_refuses_to_host() {
+    let cluster = TestCluster::of_size(3).await;
+    let odd_one_out = 0;
+
+    cluster.net.remove(cluster.nodes[odd_one_out].local());
+    await_not_serving(&cluster, odd_one_out).await;
+
+    let outcome = cluster
+        .system(odd_one_out)
+        .actor_of::<Counter>("orphan")
+        .await;
+    assert!(
+        matches!(outcome, Err(horsie_actor::ActorOfError::NotServing)),
+        "a node with no quorum started an instance anyway"
+    );
+}
+
+/// Losing quorum stops the instances already running, not just the new ones.
+///
+/// Without this a node keeps a live actor answering reads from memory for as
+/// long as the partition lasts. Stopping closes the mailbox, so callers fail
+/// immediately instead of being told something that was true a minute ago.
+#[tokio::test]
+async fn losing_quorum_stops_hosted_instances() {
+    let cluster = TestCluster::of_size(3).await;
+
+    // Find an instance hosted on node 0, so the partition takes its host.
+    let id = (0..64)
+        .map(|i| format!("c{i}"))
+        .find(|id| cluster.nodes[0].owns("counter", id))
+        .expect("some id must land on node 0");
+
+    let actor = cluster.system(0).actor_of::<Counter>(&id).await.unwrap();
+    actor.tell(CounterCmd::Inc(1)).await.unwrap();
+    settle().await;
+    assert!(actor.is_alive());
+
+    cluster.net.remove(cluster.nodes[0].local());
+    await_not_serving(&cluster, 0).await;
+
+    for _ in 0..200 {
+        if !actor.is_alive() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("an instance kept running on a node with no quorum");
+}
+
+/// Regaining quorum brings the node back, and instances restart on demand.
+///
+/// Standing down has to be recoverable: a network blip that permanently
+/// bricked a node would be a worse failure than the one being prevented.
+#[tokio::test]
+async fn a_node_recovers_when_quorum_returns() {
+    let cluster = TestCluster::of_size(3).await;
+    let odd_one_out = 0;
+    let local = cluster.nodes[odd_one_out].local();
+
+    cluster.net.remove(local);
+    await_not_serving(&cluster, odd_one_out).await;
+
+    cluster.net.restore(local);
+
+    // Two separate things, and in this order: the node sees a leader again
+    // before the leader has re-published a live set containing it. In between
+    // it is serving and hosts nothing, which is correct — placement is not its
+    // to decide — but a test that waited only for `serving` would find no
+    // instance assigned to it and look like a product bug.
+    for _ in 0..400 {
+        let node = &cluster.nodes[odd_one_out];
+        if node.serving() && node.live_members().contains(&local) {
+            // Lazily, on the next message — nothing is respawned at recovery.
+            let id = (0..64)
+                .map(|i| format!("c{i}"))
+                .find(|id| node.owns("counter", id))
+                .expect("some id must land back on this node");
+            cluster
+                .system(odd_one_out)
+                .actor_of::<Counter>(&id)
+                .await
+                .expect("a node with quorum must host again");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("a node never recovered after the partition healed");
+}
+
+/// Every node's placement comes from the same agreed live set, so no node can
+/// hold a private opinion about who is up.
+#[tokio::test]
+async fn no_node_holds_a_private_view_of_who_is_live() {
+    let cluster = TestCluster::of_size(3).await;
+    let sets: Vec<_> = cluster.nodes.iter().map(|n| n.live_members()).collect();
+    assert!(
+        sets.windows(2).all(|w| w[0] == w[1]),
+        "nodes disagreed about the live set: {sets:?}"
+    );
+
+    // A failed send must not change that. It is the exact move the old
+    // implementation made, and the one that created split brain.
+    let elsewhere = 1;
+    let before = cluster.nodes[elsewhere].live_members();
+    let _ = cluster
+        .system(elsewhere)
+        .actor_of::<Counter>("nowhere")
+        .await;
+    cluster.net.remove(cluster.nodes[0].local());
+    let _ = cluster
+        .system(elsewhere)
+        .actor_of::<Counter>("nowhere")
+        .await;
+    assert_eq!(
+        cluster.nodes[elsewhere].live_members(),
+        before,
+        "a failed send rewrote this node's view of the cluster"
+    );
+}
+
+/// A partitioned *leader* stands down too, and this is the case that is easy to
+/// get wrong.
+///
+/// A follower cut off from the cluster notices quickly: it stops hearing from a
+/// leader. A leader notices nothing — it goes on reporting itself as the
+/// current leader, because no one has told it otherwise and no one can. What it
+/// cannot fake is an acknowledgement, so the question has to be asked the other
+/// way round: how long since a quorum last answered.
+#[tokio::test]
+async fn a_partitioned_leader_stands_down() {
+    let cluster = TestCluster::of_size(3).await;
+
+    let leader = cluster
+        .nodes
+        .iter()
+        .position(|n| {
+            horsie_actor::WatchReceiver::borrow_watched(&n.raft().metrics()).current_leader
+                == Some(n.local().0)
+        })
+        .expect("the cluster must have elected a leader");
+
+    cluster.net.remove(cluster.nodes[leader].local());
+    await_not_serving(&cluster, leader).await;
+}
+
+/// An actor spawned before the cluster has elected anybody survives.
+///
+/// The stand-down signal means "stop what you are doing", and at startup there
+/// is nothing to stop. Seeding it from "not serving yet" instead would make
+/// every actor spawned during an election exit on its first poll, silently and
+/// with no error anywhere.
+#[tokio::test]
+async fn an_actor_spawned_before_the_first_election_survives() {
+    let net = horsie_actor::InProcessNetwork::new();
+    let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+    let members: Vec<NodeId> = (1..=3).map(NodeId).collect();
+
+    let node = ClusterNode::start(
+        ClusterConfig {
+            local: NodeId(1),
+            bootstrap: members,
+            liveness_window: Duration::from_millis(600),
+        },
+        Arc::new(net.node(NodeId(1))),
+        RaftStore::in_memory_unsafe(),
+    )
+    .await
+    .unwrap();
+
+    // No peers exist, so this node never reaches a quorum and never serves.
+    assert!(!node.serving());
+
+    let system = ActorSystem::clustered(journal, node);
+    let actor = system.spawn_persistent(Counter { id: "early".into() });
+    settle().await;
+    assert!(
+        actor.is_alive(),
+        "an actor spawned before the first election was killed on sight"
+    );
+}
+
+async fn await_not_serving(cluster: &TestCluster, index: usize) {
+    for _ in 0..400 {
+        if !cluster.nodes[index].serving() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("node {index} never stood down");
 }

@@ -1,4 +1,3 @@
-use crate::envelope::Epoch;
 use thiserror::Error;
 
 /// Errors surfaced by [`Journal`](crate::Journal) operations.
@@ -12,14 +11,21 @@ pub enum JournalError {
     #[error("journal serialization error: {0}")]
     Serialization(String),
 
-    /// The write carried an ownership epoch older than the one the log has
-    /// already seen, so some other host owns this instance now and this write
-    /// would have merged two histories. Rejected rather than applied.
-    #[error("write fenced: {pid} is at epoch {current}, write carried {attempted}")]
-    Fenced {
+    /// The log did not end where the writer believed it did, so somebody else
+    /// has written to it and this writer's state is stale. Rejected rather than
+    /// applied, because applying it would splice two divergent histories
+    /// together.
+    ///
+    /// This is the whole write fence. It needs no notion of ownership: a writer
+    /// that is behind is detected by being behind, whatever the reason — a
+    /// second host, a process that was frozen past a failover, a stale
+    /// reactivation. Being *wrong* about who owns an instance is survivable;
+    /// writing from a state that no longer exists is not.
+    #[error("write conflict: {pid} is at sequence {actual}, writer expected {expected}")]
+    Conflict {
         pid: String,
-        current: Epoch,
-        attempted: Epoch,
+        expected: u64,
+        actual: u64,
     },
 }
 
