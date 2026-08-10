@@ -29,4 +29,9 @@ pub enum TellError {
     /// The target actor has stopped and its mailbox is closed.
     #[error("actor mailbox closed")]
     MailboxClosed,
+
+    /// The actor is hosted elsewhere and the command could not be got to it —
+    /// the host is unreachable, or the command would not encode.
+    #[error("the command could not be delivered to the host")]
+    Undeliverable,
 }

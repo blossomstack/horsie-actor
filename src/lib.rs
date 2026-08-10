@@ -41,5 +41,5 @@ pub use persistence_id::PersistenceId;
 pub use persistent::Persistent;
 pub use reply::{ReplyDropped, ReplyTo};
 pub use runtime::{ActorContext, ActorRef};
-pub use system::{ActorOfError, ActorSystem, ClusterActor};
+pub use system::{ActorOfError, ActorSystem, ClusterActor, DispatchError};
 pub use transport::{InProcessNetwork, InProcessTransport, Transport, TransportError};

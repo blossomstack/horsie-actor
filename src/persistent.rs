@@ -1,5 +1,6 @@
 use crate::actor::{CommandEffect, EventSourcedActor};
 use crate::behaviour::{Actor, Flow, StartError};
+use crate::envelope::Epoch;
 use crate::error::JournalError;
 use crate::journal::Journal;
 use crate::persistence_id::PersistenceId;
@@ -21,10 +22,16 @@ pub struct Persistent<A: EventSourcedActor> {
     state: A::State,
     /// Sequence number of the last event folded into `state`.
     seq_nr: u64,
+    /// The generation this host claimed the log at, carried on every write.
+    ///
+    /// `None` outside a cluster: nothing is arbitrating ownership, so nothing
+    /// needs fencing. `Some` means a previous host's writes are already locked
+    /// out, and this one's will be too the moment somebody claims above it.
+    fence: Option<Epoch>,
 }
 
 impl<A: EventSourcedActor> Persistent<A> {
-    pub(crate) fn new(inner: A, journal: Arc<dyn Journal>) -> Self {
+    pub(crate) fn fenced(inner: A, journal: Arc<dyn Journal>, fence: Option<Epoch>) -> Self {
         let pid = inner.persistence_id();
         Self {
             inner,
@@ -35,6 +42,7 @@ impl<A: EventSourcedActor> Persistent<A> {
             // present by the time a command arrives.
             state: A::initial_state(),
             seq_nr: 0,
+            fence,
         }
     }
 }
@@ -70,6 +78,7 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
             events,
             &mut self.state,
             &mut self.seq_nr,
+            self.fence,
         )
         .await;
 
@@ -86,7 +95,14 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
         // the journal would be unsound. Skipped when stopping — the state is
         // discarded next anyway.
         if snapshot && result.is_ok() && !stop {
-            snapshot_state::<A>(&self.pid, &self.journal, &self.state, self.seq_nr).await;
+            snapshot_state::<A>(
+                &self.pid,
+                &self.journal,
+                &self.state,
+                self.seq_nr,
+                self.fence,
+            )
+            .await;
         }
 
         // Reply only now, so an `ask` caller returns the journaled guarantee
@@ -139,6 +155,7 @@ async fn persist_events<A: EventSourcedActor>(
     events: Vec<A::Event>,
     state: &mut A::State,
     seq_nr: &mut u64,
+    fence: Option<Epoch>,
 ) -> (Vec<A::Event>, Result<(), JournalError>) {
     let mut encoded = Vec::with_capacity(events.len());
     for event in &events {
@@ -150,7 +167,7 @@ async fn persist_events<A: EventSourcedActor>(
             }
         }
     }
-    if let Err(e) = journal.persist(pid, &encoded, None).await {
+    if let Err(e) = journal.persist(pid, &encoded, fence).await {
         tracing::error!(%pid, error = %e, "failed to persist events; state left unchanged");
         return (events, Err(e));
     }
@@ -170,6 +187,7 @@ async fn snapshot_state<A: EventSourcedActor>(
     journal: &Arc<dyn Journal>,
     state: &A::State,
     seq_nr: u64,
+    fence: Option<Epoch>,
 ) {
     let bytes = match serde_json::to_vec(state) {
         Ok(b) => b,
@@ -178,7 +196,7 @@ async fn snapshot_state<A: EventSourcedActor>(
             return;
         }
     };
-    if let Err(e) = journal.save_snapshot(pid, bytes, seq_nr, None).await {
+    if let Err(e) = journal.save_snapshot(pid, bytes, seq_nr, fence).await {
         tracing::error!(%pid, error = %e, "failed to save snapshot");
         return;
     }
