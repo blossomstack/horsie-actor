@@ -30,10 +30,10 @@ This is [`examples/counter.rs`](examples/counter.rs) verbatim, so CI compiles
 and runs it — if the API moves, this stops building.
 
 ```rust
+use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, CommandEffect, EventSourcedActor, InMemoryJournal, PersistenceId, spawn_root,
 };
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;

@@ -47,6 +47,11 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      # The README claims its example is examples/counter.rs verbatim. This is
+      # what makes that true rather than aspirational.
+      - name: README example is in sync
+        run: ./scripts/check-readme-example.sh
+
       # --all-targets covers the example, which is the README's code verbatim.
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings

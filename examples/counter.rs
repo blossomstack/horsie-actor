@@ -2,12 +2,15 @@
 //!
 //! Run with `cargo run --example counter`. Kept in sync with the README by
 //! being the same code: this file is what CI compiles.
-#![allow(clippy::unwrap_used, reason = "an example reads better without error plumbing")]
+#![allow(
+    clippy::unwrap_used,
+    reason = "an example reads better without error plumbing"
+)]
 
+use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, CommandEffect, EventSourcedActor, InMemoryJournal, PersistenceId, spawn_root,
 };
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
