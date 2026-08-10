@@ -15,6 +15,7 @@
 
 mod actor;
 mod behaviour;
+mod cluster;
 mod envelope;
 mod error;
 mod journal;
@@ -29,6 +30,7 @@ mod transport;
 
 pub use actor::{CommandEffect, EventSourcedActor};
 pub use behaviour::{Actor, Flow, StartError};
+pub use cluster::Dedup;
 pub use envelope::{Envelope, Epoch, NodeId};
 pub use error::{JournalError, TellError};
 pub use journal::{InMemoryJournal, Journal, JournalResult};
