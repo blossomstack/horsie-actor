@@ -31,7 +31,8 @@ mod transport;
 pub use actor::{CommandEffect, EventSourcedActor};
 pub use behaviour::{Actor, Flow, StartError};
 pub use cluster::{
-    Assignment, Dedup, InstanceKey, PlacementCommand, PlacementEffect, PlacementTable,
+    Assignment, ClusterConfig, ClusterNode, Dedup, InstanceKey, PlacementCommand, PlacementEffect,
+    PlacementTable,
 };
 pub use envelope::{Envelope, Epoch, NodeId};
 pub use error::{JournalError, TellError};
