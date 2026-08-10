@@ -27,6 +27,7 @@ mod system;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testkit;
 mod transport;
+mod transport_tcp;
 
 pub use actor::{CommandEffect, EventSourcedActor};
 pub use behaviour::{Actor, Flow, StartError};
@@ -43,3 +44,4 @@ pub use reply::{ReplyDropped, ReplyTo};
 pub use runtime::{ActorContext, ActorRef};
 pub use system::{ActorOfError, ActorSystem, ClusterActor, DispatchError};
 pub use transport::{InProcessNetwork, InProcessTransport, Transport, TransportError};
+pub use transport_tcp::{TcpConfig, TcpTransport};
