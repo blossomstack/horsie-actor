@@ -120,6 +120,14 @@ impl<J: Journal> Journal for FaultyJournal<J> {
         self.inner.copy_snapshot(from, to).await
     }
 
+    async fn claim_ownership(&self, pid: &PersistenceId) -> JournalResult<Epoch> {
+        self.inner.claim_ownership(pid).await
+    }
+
+    async fn current_epoch(&self, pid: &PersistenceId) -> JournalResult<Option<Epoch>> {
+        self.inner.current_epoch(pid).await
+    }
+
     async fn clear(&self, pid: &PersistenceId) -> JournalResult<()> {
         self.inner.clear(pid).await
     }
