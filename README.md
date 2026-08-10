@@ -9,8 +9,22 @@ same identity recovers exactly where the previous one left off.
 
 ```toml
 [dependencies]
-horsie-actor = "0.2"
+horsie-actor = "0.3"
 ```
+
+## Two traits
+
+`Actor` is the bare contract — a command type, and one command handled at a
+time. It says nothing about storage.
+
+`EventSourcedActor` is the durable one, and `Persistent<A>` adapts it into an
+`Actor`. So persistence is a wrapper, not a property of being an actor: a
+stateless router and an event-sourced aggregate are spawned, addressed and
+supervised through exactly the same machinery, and you pay for a journal only
+where you want one.
+
+`ActorSystem` owns the journal, the registry of actor types reachable by id, and
+the instances currently running.
 
 ## The idea
 
@@ -31,11 +45,8 @@ and runs it — if the API moves, this stops building.
 
 ```rust
 use async_trait::async_trait;
-use horsie_actor::{
-    ActorContext, CommandEffect, EventSourcedActor, InMemoryJournal, PersistenceId, spawn_root,
-};
+use horsie_actor::{ActorContext, ActorSystem, CommandEffect, EventSourcedActor, PersistenceId};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::oneshot;
 
 struct Counter {
@@ -83,7 +94,7 @@ impl EventSourcedActor for Counter {
         &mut self,
         state: &State,
         cmd: Cmd,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut ActorContext<Self::Command>,
     ) -> CommandEffect<Event> {
         match cmd {
             Cmd::Inc(n) => CommandEffect::persist(vec![Event::Incremented(n)]),
@@ -97,8 +108,8 @@ impl EventSourcedActor for Counter {
 
 #[tokio::main]
 async fn main() {
-    let journal = Arc::new(InMemoryJournal::new());
-    let counter = spawn_root(Counter { id: "c1".into() }, journal.clone());
+    let system = ActorSystem::in_memory();
+    let counter = system.spawn_persistent(Counter { id: "c1".into() });
 
     counter.tell(Cmd::Inc(3)).await.unwrap();
     counter.tell(Cmd::Inc(4)).await.unwrap();
@@ -108,7 +119,7 @@ async fn main() {
     assert_eq!(rx.await.unwrap(), 7);
 
     // A second incarnation on the same journal recovers the same value.
-    let revived = spawn_root(Counter { id: "c1".into() }, journal);
+    let revived = system.spawn_persistent(Counter { id: "c1".into() });
     let (tx, rx) = oneshot::channel();
     revived.tell(Cmd::Get(tx)).await.unwrap();
     assert_eq!(rx.await.unwrap(), 7);

@@ -1,5 +1,6 @@
 use crate::error::JournalError;
 use crate::persistence_id::PersistenceId;
+use crate::reply::ReplyTo;
 use crate::runtime::ActorContext;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -31,7 +32,7 @@ pub struct CommandEffect<E> {
     /// the events are durably written, or `Err(JournalError)` if the write failed —
     /// so an [`ActorRef::ask`] caller gets true post-persist backpressure and can
     /// abort on failure. Events are neither folded nor counted on a failed write.
-    pub(crate) ack: Option<tokio::sync::oneshot::Sender<Result<(), JournalError>>>,
+    pub(crate) ack: Option<ReplyTo<Result<(), JournalError>>>,
     /// After the durable write, stop the actor.
     pub(crate) stop: bool,
 }
@@ -82,7 +83,7 @@ impl<E> CommandEffect<E> {
     /// After the persist, report the durable-write outcome on `ack` (post-persist
     /// backpressure for an [`ActorRef::ask`] caller).
     #[must_use]
-    pub fn and_ack(mut self, ack: tokio::sync::oneshot::Sender<Result<(), JournalError>>) -> Self {
+    pub fn and_ack(mut self, ack: ReplyTo<Result<(), JournalError>>) -> Self {
         self.ack = Some(ack);
         self
     }
@@ -148,11 +149,16 @@ pub trait EventSourcedActor: Send + Sized + 'static {
         &mut self,
         state: &Self::State,
         cmd: Self::Command,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut ActorContext<Self::Command>,
     ) -> CommandEffect<Self::Event>;
 
     /// Hook invoked once after recovery completes, before the first live command.
-    async fn on_recovery_complete(&mut self, _state: &Self::State, _ctx: &mut ActorContext<Self>) {}
+    async fn on_recovery_complete(
+        &mut self,
+        _state: &Self::State,
+        _ctx: &mut ActorContext<Self::Command>,
+    ) {
+    }
 
     /// Hook invoked after a batch of events is durably written **and** folded
     /// into `state` — once per successful persist, never for an empty batch or
