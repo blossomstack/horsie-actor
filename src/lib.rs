@@ -43,5 +43,5 @@ pub use persistent::Persistent;
 pub use reply::{ReplyDropped, ReplyTo};
 pub use runtime::{ActorContext, ActorRef};
 pub use system::{ActorOfError, ActorSystem, ClusterActor, DispatchError};
-pub use transport::{InProcessNetwork, InProcessTransport, Transport, TransportError};
+pub use transport::{InProcessNetwork, InProcessTransport, RpcRequest, Transport, TransportError};
 pub use transport_tcp::{TcpConfig, TcpTransport};

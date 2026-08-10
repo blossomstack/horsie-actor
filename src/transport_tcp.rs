@@ -1,14 +1,17 @@
 use crate::envelope::{Envelope, NodeId};
-use crate::transport::{Transport, TransportError};
+use crate::transport::{RpcRequest, Transport, TransportError};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Inbound queue depth, matching the in-process transport so switching between
 /// them does not change backpressure behaviour.
@@ -22,6 +25,23 @@ const MAX_FRAME: u32 = 8 * 1024 * 1024;
 /// different builds is a normal state during a rolling restart, and the honest
 /// outcome is a closed connection, not a garbled envelope.
 const VERSION: u8 = 1;
+
+/// What travels over a connection.
+///
+/// Tagged rather than inferred from shape: a request and an envelope are both
+/// JSON objects, and guessing between them would misroute the first message
+/// whose fields happened to overlap.
+#[derive(Debug, Serialize, Deserialize)]
+enum Frame {
+    /// Fire-and-forget delivery to an actor.
+    Envelope(Envelope),
+    /// A request expecting exactly one [`Frame::Response`] carrying the same id.
+    Request { id: u64, payload: Vec<u8> },
+    /// The answer to a request. `payload` is `None` when the responder was
+    /// dropped without answering, which the caller must see as a failure rather
+    /// than wait out.
+    Response { id: u64, payload: Option<Vec<u8>> },
+}
 
 /// How to reach the other members.
 #[derive(Debug, Clone)]
@@ -41,6 +61,31 @@ pub struct TcpConfig {
     pub secret: Vec<u8>,
 }
 
+/// Callers waiting on a reply, keyed by request id.
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>;
+
+/// One dialled connection to a peer.
+///
+/// The write half is behind an async mutex because frames must not interleave;
+/// the read half belongs to a spawned task, since somebody has to be reading
+/// continuously for a reply ever to arrive. That task is the reason this type
+/// exists at all — the previous version only ever wrote, which is fine for
+/// fire-and-forget and impossible for request/response.
+struct Peer {
+    writer: tokio::sync::Mutex<OwnedWriteHalf>,
+    pending: Pending,
+    next_request: AtomicU64,
+}
+
+impl Peer {
+    async fn write(&self, frame: &Frame) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(frame)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let mut writer = self.writer.lock().await;
+        write_frame(&mut *writer, &bytes).await
+    }
+}
+
 /// A [`Transport`] over TCP.
 ///
 /// Frames are a 4-byte big-endian length followed by JSON. Connections are
@@ -50,8 +95,9 @@ pub struct TcpTransport {
     local: NodeId,
     peers: HashMap<NodeId, SocketAddr>,
     secret: Vec<u8>,
-    outbound: tokio::sync::Mutex<HashMap<NodeId, TcpStream>>,
+    outbound: tokio::sync::Mutex<HashMap<NodeId, Arc<Peer>>>,
     inbox: Mutex<Option<mpsc::Receiver<Envelope>>>,
+    rpc_inbox: Mutex<Option<mpsc::Receiver<RpcRequest>>>,
 }
 
 impl TcpTransport {
@@ -62,6 +108,7 @@ impl TcpTransport {
     pub async fn bind(config: TcpConfig) -> std::io::Result<Arc<Self>> {
         let listener = TcpListener::bind(config.bind).await?;
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
+        let (rpc_tx, rpc_rx) = mpsc::channel(INBOX_CAPACITY);
 
         let transport = Arc::new(Self {
             local: config.local,
@@ -69,6 +116,7 @@ impl TcpTransport {
             secret: config.secret.clone(),
             outbound: tokio::sync::Mutex::new(HashMap::new()),
             inbox: Mutex::new(Some(rx)),
+            rpc_inbox: Mutex::new(Some(rpc_rx)),
         });
 
         let secret = config.secret;
@@ -81,9 +129,10 @@ impl TcpTransport {
                     continue;
                 };
                 let tx = tx.clone();
+                let rpc_tx = rpc_tx.clone();
                 let secret = secret.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve(stream, &secret, tx).await {
+                    if let Err(e) = serve(stream, &secret, tx, rpc_tx).await {
                         tracing::debug!(error = %e, "a cluster peer connection ended");
                     }
                 });
@@ -98,6 +147,73 @@ impl TcpTransport {
     pub fn peers(&self) -> &HashMap<NodeId, SocketAddr> {
         &self.peers
     }
+
+    /// The cached connection to `to`, dialling and handshaking if there is none.
+    async fn peer(&self, to: NodeId) -> Result<Arc<Peer>, TransportError> {
+        let addr = *self.peers.get(&to).ok_or(TransportError::Unreachable(to))?;
+        let mut cache = self.outbound.lock().await;
+        if let Some(existing) = cache.get(&to) {
+            return Ok(existing.clone());
+        }
+
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .map_err(|_| TransportError::Unreachable(to))?;
+        // Nagle batches small writes, and every frame here is small and
+        // latency-sensitive.
+        let _ = stream.set_nodelay(true);
+        handshake_out(&mut stream, self.local, &self.secret)
+            .await
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+
+        let (reader, writer) = stream.into_split();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let peer = Arc::new(Peer {
+            writer: tokio::sync::Mutex::new(writer),
+            pending: pending.clone(),
+            next_request: AtomicU64::new(0),
+        });
+        tokio::spawn(read_replies(reader, pending));
+        cache.insert(to, peer.clone());
+        Ok(peer)
+    }
+
+    /// Forget the connection to `to`, so the next call redials.
+    async fn drop_peer(&self, to: NodeId) {
+        self.outbound.lock().await.remove(&to);
+    }
+}
+
+/// Drain replies from a dialled connection until it closes.
+///
+/// On close every waiting caller is failed by dropping its responder, rather
+/// than left to wait for an answer that can no longer arrive.
+async fn read_replies(mut reader: OwnedReadHalf, pending: Pending) {
+    loop {
+        let Ok(frame) = read_frame_from(&mut reader).await else {
+            break;
+        };
+        match serde_json::from_slice::<Frame>(&frame) {
+            Ok(Frame::Response { id, payload }) => {
+                let waiting = pending.lock().remove(&id);
+                if let (Some(waiting), Some(payload)) = (waiting, payload) {
+                    let _ = waiting.send(payload);
+                }
+            }
+            Ok(_) => {
+                // The dialling side never receives envelopes or requests: each
+                // node dials its peers, so inbound traffic arrives on the
+                // listener instead. Anything else here is a peer running a
+                // protocol we do not.
+                tracing::warn!("a peer sent an unexpected frame on a dialled connection");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not decode a frame from a peer");
+                break;
+            }
+        }
+    }
+    pending.lock().clear();
 }
 
 /// Proof of the shared secret, bound to the announced node id so a captured
@@ -110,7 +226,10 @@ fn proof(secret: &[u8], node: NodeId, nonce: u64) -> [u8; 32] {
     h.finalize().into()
 }
 
-async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+async fn write_frame<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     let len = u32::try_from(bytes.len()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "frame longer than u32")
     })?;
@@ -119,7 +238,7 @@ async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()
     stream.flush().await
 }
 
-async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+async fn read_frame_from<R: AsyncReadExt + Unpin>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     stream.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len);
@@ -156,7 +275,7 @@ async fn handshake_out(
     hello.extend_from_slice(&proof(secret, local, nonce));
     write_frame(stream, &hello).await?;
 
-    let reply = read_frame(stream).await?;
+    let reply = read_frame_from(stream).await?;
     if reply.first() != Some(&VERSION) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -166,13 +285,14 @@ async fn handshake_out(
     Ok(())
 }
 
-/// Accepting side: verify the proof before reading a single envelope.
+/// Accepting side: verify the proof before reading a single frame.
 async fn serve(
     mut stream: TcpStream,
     secret: &[u8],
     tx: mpsc::Sender<Envelope>,
+    rpc_tx: mpsc::Sender<RpcRequest>,
 ) -> std::io::Result<()> {
-    let hello = read_frame(&mut stream).await?;
+    let hello = read_frame_from(&mut stream).await?;
     if hello.len() != 1 + 8 + 8 + 32 || hello[0] != VERSION {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -201,12 +321,49 @@ async fn serve(
 
     write_frame(&mut stream, &[VERSION]).await?;
 
+    let (mut reader, writer) = stream.into_split();
+    // Shared because each request is answered by its own task: a slow handler
+    // must not stop the next frame being read, or one consensus round trip
+    // would serialise every other message from this peer behind it.
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+
     loop {
-        let frame = read_frame(&mut stream).await?;
-        let env: Envelope = serde_json::from_slice(&frame)
+        let frame = read_frame_from(&mut reader).await?;
+        let frame: Frame = serde_json::from_slice(&frame)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        if tx.send(env).await.is_err() {
-            return Ok(()); // the node has shut down
+        match frame {
+            Frame::Envelope(env) => {
+                if tx.send(env).await.is_err() {
+                    return Ok(()); // the node has shut down
+                }
+            }
+            Frame::Request { id, payload } => {
+                let (reply, answer) = oneshot::channel();
+                if rpc_tx.send(RpcRequest { payload, reply }).await.is_err() {
+                    return Ok(());
+                }
+                let writer = writer.clone();
+                tokio::spawn(async move {
+                    // `Err` means the handler dropped the responder. Answering
+                    // with `None` rather than staying silent is what turns a
+                    // node that declined into a failed call instead of a hang.
+                    let payload = answer.await.ok();
+                    let frame = match serde_json::to_vec(&Frame::Response { id, payload }) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "could not encode an rpc response");
+                            return;
+                        }
+                    };
+                    let mut writer = writer.lock().await;
+                    if let Err(e) = write_frame(&mut *writer, &frame).await {
+                        tracing::debug!(error = %e, "could not write an rpc response");
+                    }
+                });
+            }
+            Frame::Response { .. } => {
+                tracing::warn!("a peer sent a response on a connection it dialled");
+            }
         }
     }
 }
@@ -214,45 +371,50 @@ async fn serve(
 #[async_trait]
 impl Transport for TcpTransport {
     async fn send(&self, to: NodeId, env: Envelope) -> Result<(), TransportError> {
-        let addr = *self.peers.get(&to).ok_or(TransportError::Unreachable(to))?;
-        let bytes = serde_json::to_vec(&env).map_err(|e| TransportError::Io(e.to_string()))?;
-
-        let mut cache = self.outbound.lock().await;
-        let stream = match cache.entry(to) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                let mut stream = TcpStream::connect(addr)
-                    .await
-                    .map_err(|_| TransportError::Unreachable(to))?;
-                // Nagle batches small writes, and every envelope here is small
-                // and latency-sensitive.
-                let _ = stream.set_nodelay(true);
-                handshake_out(&mut stream, self.local, &self.secret)
-                    .await
-                    .map_err(|e| TransportError::Io(e.to_string()))?;
-                slot.insert(stream)
-            }
-        };
-        match write_frame(stream, &bytes).await {
+        let peer = self.peer(to).await?;
+        match peer.write(&Frame::Envelope(env)).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Drop the connection so the next send redials rather than
                 // reusing one the peer has already hung up on.
-                cache.remove(&to);
+                self.drop_peer(to).await;
                 Err(TransportError::Io(e.to_string()))
             }
         }
+    }
+
+    async fn rpc(&self, to: NodeId, payload: Vec<u8>) -> Result<Vec<u8>, TransportError> {
+        let peer = self.peer(to).await?;
+        let id = peer.next_request.fetch_add(1, Ordering::Relaxed);
+        let (reply, answer) = oneshot::channel();
+        peer.pending.lock().insert(id, reply);
+
+        if let Err(e) = peer.write(&Frame::Request { id, payload }).await {
+            peer.pending.lock().remove(&id);
+            self.drop_peer(to).await;
+            return Err(TransportError::Io(e.to_string()));
+        }
+
+        // The reader task clears every waiter when the connection closes, so a
+        // peer that dies mid-request fails the call rather than parking it
+        // forever.
+        answer
+            .await
+            .map_err(|_| TransportError::Io(format!("{to} did not answer")))
     }
 
     fn incoming(&self) -> Option<mpsc::Receiver<Envelope>> {
         self.inbox.lock().take()
     }
 
+    fn incoming_rpc(&self) -> Option<mpsc::Receiver<RpcRequest>> {
+        self.rpc_inbox.lock().take()
+    }
+
     fn local_id(&self) -> NodeId {
         self.local
     }
 }
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -346,5 +508,99 @@ mod tests {
         let (a, _b) = pair(b"shared", b"shared").await;
         let err = a.send(NodeId(99), env(b"x")).await.unwrap_err();
         assert!(matches!(err, TransportError::Unreachable(NodeId(99))));
+    }
+
+    /// Answer every request with the request bytes reversed, so a test can tell
+    /// a real round trip from an echo of its own buffer.
+    fn spawn_reverser(t: &Arc<TcpTransport>) {
+        let mut inbox = t.incoming_rpc().unwrap();
+        tokio::spawn(async move {
+            while let Some(req) = inbox.recv().await {
+                let mut answer = req.payload.clone();
+                answer.reverse();
+                let _ = req.reply.send(answer);
+            }
+        });
+    }
+
+    /// The whole point of the new frame type: a request goes out and its answer
+    /// comes back on the same connection.
+    #[tokio::test]
+    async fn a_request_gets_its_answer_back() {
+        let (a, b) = pair(b"shared", b"shared").await;
+        spawn_reverser(&b);
+
+        let answer = a.rpc(NodeId(2), vec![1, 2, 3]).await.unwrap();
+        assert_eq!(answer, vec![3, 2, 1]);
+    }
+
+    /// Answers are matched by request id, not by arrival order. Without that a
+    /// slow handler would hand its answer to whoever asked next — and consensus
+    /// would act on a reply to a different question.
+    #[tokio::test]
+    async fn concurrent_requests_get_their_own_answers() {
+        let (a, b) = pair(b"shared", b"shared").await;
+        let mut inbox = b.incoming_rpc().unwrap();
+        tokio::spawn(async move {
+            let mut held: Vec<RpcRequest> = Vec::new();
+            while let Some(req) = inbox.recv().await {
+                held.push(req);
+                // Answer in reverse order, so replies arrive scrambled relative
+                // to the requests.
+                if held.len() == 3 {
+                    while let Some(req) = held.pop() {
+                        let mut answer = req.payload.clone();
+                        answer.reverse();
+                        let _ = req.reply.send(answer);
+                    }
+                }
+            }
+        });
+
+        let (x, y, z) = tokio::join!(
+            a.rpc(NodeId(2), vec![1, 0]),
+            a.rpc(NodeId(2), vec![2, 0]),
+            a.rpc(NodeId(2), vec![3, 0]),
+        );
+        assert_eq!(x.unwrap(), vec![0, 1]);
+        assert_eq!(y.unwrap(), vec![0, 2]);
+        assert_eq!(z.unwrap(), vec![0, 3]);
+    }
+
+    /// Envelopes and requests share one connection without confusing each
+    /// other, which is the reason frames are tagged rather than shape-sniffed.
+    #[tokio::test]
+    async fn envelopes_and_requests_share_a_connection() {
+        let (a, b) = pair(b"shared", b"shared").await;
+        let mut envelopes = b.incoming().unwrap();
+        spawn_reverser(&b);
+
+        a.send(NodeId(2), env(b"first")).await.unwrap();
+        let answer = a.rpc(NodeId(2), vec![9, 8]).await.unwrap();
+        a.send(NodeId(2), env(b"second")).await.unwrap();
+
+        assert_eq!(answer, vec![8, 9]);
+        assert_eq!(envelopes.recv().await.unwrap().payload, b"first");
+        assert_eq!(envelopes.recv().await.unwrap().payload, b"second");
+    }
+
+    /// A handler that declines fails the call. Silence would be worse than an
+    /// error: consensus would wait out its own timeout on a peer that already
+    /// decided not to answer.
+    #[tokio::test]
+    async fn a_dropped_responder_fails_the_request() {
+        let (a, b) = pair(b"shared", b"shared").await;
+        let mut inbox = b.incoming_rpc().unwrap();
+        tokio::spawn(async move {
+            while let Some(req) = inbox.recv().await {
+                drop(req.reply);
+            }
+        });
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(2), a.rpc(NodeId(2), vec![1]))
+                .await
+                .expect("a declined request must return rather than hang");
+        assert!(outcome.is_err());
     }
 }
