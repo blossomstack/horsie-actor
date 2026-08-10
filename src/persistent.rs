@@ -1,6 +1,5 @@
 use crate::actor::{CommandEffect, EventSourcedActor};
 use crate::behaviour::{Actor, Flow, StartError};
-use crate::envelope::Epoch;
 use crate::error::JournalError;
 use crate::journal::Journal;
 use crate::persistence_id::PersistenceId;
@@ -21,17 +20,16 @@ pub struct Persistent<A: EventSourcedActor> {
     journal: Arc<dyn Journal>,
     state: A::State,
     /// Sequence number of the last event folded into `state`.
-    seq_nr: u64,
-    /// The generation this host claimed the log at, carried on every write.
     ///
-    /// `None` outside a cluster: nothing is arbitrating ownership, so nothing
-    /// needs fencing. `Some` means a previous host's writes are already locked
-    /// out, and this one's will be too the moment somebody claims above it.
-    fence: Option<Epoch>,
+    /// Doubles as the write fence. Every append is conditional on the log still
+    /// ending here, so an instance that has been superseded — by another host,
+    /// or by its own earlier incarnation waking from a pause — is rejected on
+    /// its first write rather than merging its history with the live one.
+    seq_nr: u64,
 }
 
 impl<A: EventSourcedActor> Persistent<A> {
-    pub(crate) fn fenced(inner: A, journal: Arc<dyn Journal>, fence: Option<Epoch>) -> Self {
+    pub(crate) fn new(inner: A, journal: Arc<dyn Journal>) -> Self {
         let pid = inner.persistence_id();
         Self {
             inner,
@@ -42,7 +40,6 @@ impl<A: EventSourcedActor> Persistent<A> {
             // present by the time a command arrives.
             state: A::initial_state(),
             seq_nr: 0,
-            fence,
         }
     }
 }
@@ -78,7 +75,6 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
             events,
             &mut self.state,
             &mut self.seq_nr,
-            self.fence,
         )
         .await;
 
@@ -95,27 +91,20 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
         // the journal would be unsound. Skipped when stopping — the state is
         // discarded next anyway.
         if snapshot && result.is_ok() && !stop {
-            snapshot_state::<A>(
-                &self.pid,
-                &self.journal,
-                &self.state,
-                self.seq_nr,
-                self.fence,
-            )
-            .await;
+            snapshot_state::<A>(&self.pid, &self.journal, &self.state, self.seq_nr).await;
         }
 
-        // A fence rejection is terminal, not a retryable hiccup: this host no
-        // longer owns the log, and nothing will tell it otherwise. Carrying on
-        // would leave a zombie that accepts commands and fails or silently drops
-        // every write until an operator noticed — so stop, which closes the
-        // mailbox and makes every caller fail fast and re-resolve to whoever
-        // owns it now.
-        let fenced = matches!(result, Err(JournalError::Fenced { .. }));
-        if fenced {
+        // A conflict is terminal, not a retryable hiccup: somebody else has
+        // written to this log, so this instance's state is a dead branch and
+        // every future write from it would be rejected too. Carrying on would
+        // leave a zombie that accepts commands and fails every write until an
+        // operator noticed — so stop, which closes the mailbox and makes callers
+        // fail fast and re-resolve to whoever is live now.
+        let conflicted = matches!(result, Err(JournalError::Conflict { .. }));
+        if conflicted {
             tracing::warn!(
                 pid = %self.pid,
-                "this host no longer owns the log; stopping rather than serving stale"
+                "the log has moved past this instance; stopping rather than serving stale"
             );
         }
 
@@ -125,7 +114,7 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
             let _ = ack.send(result);
         }
 
-        if stop || fenced {
+        if stop || conflicted {
             Flow::Stop
         } else {
             Flow::Continue
@@ -173,7 +162,6 @@ async fn persist_events<A: EventSourcedActor>(
     events: Vec<A::Event>,
     state: &mut A::State,
     seq_nr: &mut u64,
-    fence: Option<Epoch>,
 ) -> (Vec<A::Event>, Result<(), JournalError>) {
     let mut encoded = Vec::with_capacity(events.len());
     for event in &events {
@@ -185,7 +173,7 @@ async fn persist_events<A: EventSourcedActor>(
             }
         }
     }
-    if let Err(e) = journal.persist(pid, &encoded, fence).await {
+    if let Err(e) = journal.persist(pid, &encoded, *seq_nr).await {
         tracing::error!(%pid, error = %e, "failed to persist events; state left unchanged");
         return (events, Err(e));
     }
@@ -200,12 +188,15 @@ async fn persist_events<A: EventSourcedActor>(
 }
 
 /// Snapshot `state` at `seq_nr` and compact the now-redundant event log.
+///
+/// The order is load-bearing. Compaction is unconditional, so it is the
+/// snapshot's rejection that stops a stale writer deleting events it never saw
+/// — which means the early return below is a safety property, not tidiness.
 async fn snapshot_state<A: EventSourcedActor>(
     pid: &PersistenceId,
     journal: &Arc<dyn Journal>,
     state: &A::State,
     seq_nr: u64,
-    fence: Option<Epoch>,
 ) {
     let bytes = match serde_json::to_vec(state) {
         Ok(b) => b,
@@ -214,7 +205,7 @@ async fn snapshot_state<A: EventSourcedActor>(
             return;
         }
     };
-    if let Err(e) = journal.save_snapshot(pid, bytes, seq_nr, fence).await {
+    if let Err(e) = journal.save_snapshot(pid, bytes, seq_nr).await {
         tracing::error!(%pid, error = %e, "failed to save snapshot");
         return;
     }

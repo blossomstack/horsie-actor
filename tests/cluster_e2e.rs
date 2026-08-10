@@ -1,5 +1,5 @@
 //! Several real nodes in one process: real placement, real transport, real
-//! fencing. Nothing here is a stand-in for the thing under test.
+//! write fence. Nothing here is a stand-in for the thing under test.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, ActorRef, ActorSystem, ClusterActor, ClusterConfig, ClusterNode, CommandEffect,
-    Envelope, Epoch, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, ReplyTo,
+    Envelope, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, ReplyTo,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -78,19 +78,8 @@ impl ClusterActor for Counter {
     type Command = CounterCmd;
     type Deps = ();
 
-    fn persistence_id(id: &str) -> Option<PersistenceId> {
-        Some(PersistenceId::new("counter", id))
-    }
-
-    fn spawn(
-        id: &str,
-        _deps: (),
-        system: &ActorSystem,
-        fence: Option<Epoch>,
-    ) -> ActorRef<CounterCmd> {
-        // The fence must reach the journal, or a host that lost this instance
-        // keeps writing to it.
-        system.spawn_fenced(Counter { id: id.to_owned() }, fence)
+    fn spawn(id: &str, _deps: (), system: &ActorSystem) -> ActorRef<CounterCmd> {
+        system.spawn_persistent(Counter { id: id.to_owned() })
     }
 }
 
@@ -270,43 +259,36 @@ async fn an_instance_survives_the_death_of_its_host() {
     assert_eq!(value_at_host(&cluster, id).await, 8);
 }
 
-/// A host that claimed a log and then lost it cannot write to it any more.
+/// A writer that has fallen behind cannot append, even though nothing told it.
 ///
-/// This is the fence doing its job end to end: the second host's claim mints a
-/// higher epoch, and the first host's writes stop landing even though nothing
-/// told it so.
+/// The fence, at the journal level: two writers recovered at the same point,
+/// one of them wrote, and the other's next append is where it finds out. Note
+/// there is no claim, no ownership record and no coordination anywhere in this
+/// test — being behind is the whole detection mechanism.
 #[tokio::test]
-async fn a_former_host_cannot_write_after_someone_else_claims() {
+async fn a_stale_writer_cannot_append() {
     let cluster = TestCluster::of_size(3);
-    let pid = PersistenceId::new("counter", "fenced");
+    let pid = PersistenceId::new("counter", "stale");
 
-    let first = cluster.journal.claim_ownership(&pid).await.unwrap();
-    cluster
-        .journal
-        .persist(&pid, &[vec![1]], Some(first))
-        .await
-        .unwrap();
+    // Both writers recovered here.
+    cluster.journal.persist(&pid, &[vec![1]], 0).await.unwrap();
 
-    // A different host takes over.
-    let second = cluster.journal.claim_ownership(&pid).await.unwrap();
-    assert!(second > first);
+    // One of them writes.
+    cluster.journal.persist(&pid, &[vec![2]], 1).await.unwrap();
 
-    // The old one has not been told, and its next write is where it finds out.
+    // The other still believes the log ends at 1.
     let err = cluster
         .journal
-        .persist(&pid, &[vec![2]], Some(first))
+        .persist(&pid, &[vec![3]], 1)
         .await
         .unwrap_err();
     assert!(
-        matches!(err, horsie_actor::JournalError::Fenced { .. }),
-        "a stale host's write was accepted: {err:?}"
+        matches!(err, horsie_actor::JournalError::Conflict { .. }),
+        "a stale writer's append was accepted: {err:?}"
     );
 
-    cluster
-        .journal
-        .persist(&pid, &[vec![3]], Some(second))
-        .await
-        .unwrap();
+    // And the winner carries on from where it actually is.
+    cluster.journal.persist(&pid, &[vec![4]], 2).await.unwrap();
 }
 
 /// Every node resolves an instance to the same host, so no two of them race to
@@ -328,30 +310,34 @@ async fn placement_agrees_across_every_node() {
     }
 }
 
-/// Hosting an instance claims its log. Without this the fence exists but is
-/// never applied, and two hosts write under no generation at all.
+/// Starting an instance writes nothing.
+///
+/// Hosting used to claim the log first, which meant a round trip before serving
+/// and an ownership record to keep. The conditional append made both
+/// unnecessary: an instance that never writes leaves no trace, and one that does
+/// is checked by the write itself. This also pins the decoupling — a registered
+/// actor type with no journal at all is now an ordinary case, not a special one.
 #[tokio::test]
-async fn hosting_an_instance_claims_its_log() {
+async fn starting_an_instance_writes_nothing() {
     let cluster = TestCluster::of_size(3);
-    let id = "claimed";
+    let id = "quiet";
     let pid = PersistenceId::new("counter", id);
-
-    assert_eq!(cluster.journal.current_epoch(&pid).await.unwrap(), None);
 
     let host = cluster.host_of(id);
     let _actor = cluster.system(host).actor_of::<Counter>(id).await.unwrap();
 
-    assert!(
-        cluster.journal.current_epoch(&pid).await.unwrap().is_some(),
-        "hosting did not claim the log, so its writes carry no generation"
+    assert_eq!(
+        cluster.journal.last_seq(&pid).await.unwrap(),
+        0,
+        "hosting an instance touched the log"
     );
 }
 
-/// The end-to-end fence: once a second host claims, the first host's actor
-/// stops being able to write, even though nothing told it so.
+/// The end-to-end fence: a host whose log has moved on stops landing writes.
 ///
-/// This is the failure the whole epoch mechanism exists to prevent — two hosts
-/// appending to one history and each believing it succeeded.
+/// This is the failure the whole mechanism exists to prevent — two hosts
+/// appending to one history, each believing it succeeded, leaving a log that is
+/// neither host's state.
 #[tokio::test]
 async fn a_displaced_host_stops_writing() {
     let cluster = TestCluster::of_size(3);
@@ -367,10 +353,11 @@ async fn a_displaced_host_stops_writing() {
     stale.tell(CounterCmd::Inc(5)).await.unwrap();
     settle().await;
 
-    // Somebody else takes the log — what a partitioned peer taking over does.
-    let usurper = cluster.journal.claim_ownership(&pid).await.unwrap();
+    // Somebody else appends — what a peer that took the instance over does. The
+    // stale actor is not told, and has no way to be.
+    let seven = serde_json::to_vec(&Incremented(7)).unwrap();
+    cluster.journal.persist(&pid, &[seven], 1).await.unwrap();
 
-    // The old host has not been told. Its next write is where it finds out.
     stale.tell(CounterCmd::Inc(100)).await.unwrap();
     settle().await;
 
@@ -379,13 +366,13 @@ async fn a_displaced_host_stops_writing() {
     let elsewhere = (first_host + 1) % 3;
     let fresh = cluster
         .system(elsewhere)
-        .spawn_fenced(Counter { id: id.to_owned() }, Some(usurper));
+        .spawn_persistent(Counter { id: id.to_owned() });
     let value = fresh
         .ask(|reply| CounterCmd::Get(Some(reply)))
         .await
         .unwrap();
     assert_eq!(
-        value, 5,
+        value, 12,
         "the displaced host's write landed; the fence is not being applied"
     );
 }
@@ -398,7 +385,7 @@ async fn a_displaced_host_stops_writing() {
 /// somebody notices. Stopping closes the mailbox, so callers fail immediately
 /// and re-resolve to whoever owns the log now.
 #[tokio::test]
-async fn a_fenced_host_stops_instead_of_serving_stale() {
+async fn a_displaced_host_stops_instead_of_serving_stale() {
     let cluster = TestCluster::of_size(3);
     let id = "zombie";
     let pid = PersistenceId::new("counter", id);
@@ -408,8 +395,10 @@ async fn a_fenced_host_stops_instead_of_serving_stale() {
     actor.tell(CounterCmd::Inc(1)).await.unwrap();
     settle().await;
 
-    // Somebody else takes the log out from under it.
-    cluster.journal.claim_ownership(&pid).await.unwrap();
+    // Somebody else appends, so this host's next write is from a state that no
+    // longer exists.
+    let one = serde_json::to_vec(&Incremented(1)).unwrap();
+    cluster.journal.persist(&pid, &[one], 1).await.unwrap();
 
     // The next write is where it finds out — and it must be the last thing it
     // does.
@@ -475,7 +464,6 @@ async fn a_redelivered_command_is_applied_once() {
         id: id.into(),
         correlation: None,
         message_id: 42,
-        epoch: Epoch(0),
         payload,
     };
     cluster.system(host).dispatch(env.clone()).await.unwrap();

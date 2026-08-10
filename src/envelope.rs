@@ -1,26 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Ownership generation for one actor instance.
-///
-/// Monotonic, assigned by whatever decides placement, and only ever compared —
-/// never interpreted. A journal backend records the highest epoch it has seen
-/// for an instance and rejects any write carrying a lower one.
-///
-/// This is the primitive that makes a disputed election survivable. Deciding who
-/// owns an actor can be briefly wrong — a partitioned host does not know it lost
-/// the argument — but a write carrying a stale epoch fails, so the two hosts
-/// cannot merge into one history.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
-)]
-pub struct Epoch(pub u64);
-
-impl std::fmt::Display for Epoch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// A cluster member's identity.
 ///
 /// Stable across restarts: placement decisions are recorded against it, so a
@@ -57,17 +36,6 @@ pub struct Envelope {
     /// retry is dropped rather than applied a second time — which is what turns
     /// at-least-once delivery into effectively-once processing.
     pub message_id: u128,
-    /// The sender's belief about the owner's generation.
-    ///
-    /// **Written but not yet read.** A sender does not know which generation the
-    /// host claimed, so this is currently `Epoch(0)` — "no assertion" — and the
-    /// receiver does not check it. Staleness is caught one layer down instead:
-    /// the host's own claim fences its writes, so a command delivered to a host
-    /// that has lost the log fails at the journal rather than at the door.
-    ///
-    /// Checking here would reject sooner and more cheaply, and needs the sender
-    /// to learn the host's generation first.
-    pub epoch: Epoch,
     /// The encoded command.
     pub payload: Vec<u8>,
 }

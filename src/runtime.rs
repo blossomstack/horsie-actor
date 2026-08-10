@@ -81,6 +81,22 @@ impl<C: Send + 'static> ActorRef<C> {
         }
     }
 
+    /// Whether the actor is still running.
+    ///
+    /// A local actor stops for reasons its callers never see — it asked to, or
+    /// its log moved past it and it stood down rather than serve stale. The
+    /// registry uses this to notice a dead instance and start a fresh one
+    /// instead of handing out a reference nothing is listening to. A remote
+    /// reference has nothing to inspect and reports `true`; whether the host is
+    /// alive is a question for the send.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        match &self.reach {
+            Reach::Local(tx) => !tx.is_closed(),
+            Reach::Remote(_) => true,
+        }
+    }
+
     /// Deliver `cmd` to the actor's mailbox, waiting if the mailbox is full.
     /// Fails only if the actor has stopped.
     pub async fn tell(&self, cmd: C) -> Result<(), TellError> {

@@ -133,7 +133,6 @@ impl Transport for InProcessTransport {
 )]
 mod tests {
     use super::*;
-    use crate::envelope::Epoch;
 
     fn env(kind: &str, id: &str, payload: &[u8]) -> Envelope {
         Envelope {
@@ -141,7 +140,6 @@ mod tests {
             id: id.into(),
             correlation: None,
             message_id: 1,
-            epoch: Epoch(1),
             payload: payload.to_vec(),
         }
     }

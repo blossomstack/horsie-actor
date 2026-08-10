@@ -262,7 +262,6 @@ impl Transport for TcpTransport {
 )]
 mod tests {
     use super::*;
-    use crate::envelope::Epoch;
 
     fn env(payload: &[u8]) -> Envelope {
         Envelope {
@@ -270,7 +269,6 @@ mod tests {
             id: "c1".into(),
             correlation: None,
             message_id: 1,
-            epoch: Epoch(1),
             payload: payload.to_vec(),
         }
     }

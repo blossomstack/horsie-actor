@@ -4,7 +4,6 @@
 //! crate's own tests unconditionally, and to `server` / `workflow` when they
 //! enable `horsie-actor/test-util`.
 
-use crate::envelope::Epoch;
 use crate::error::JournalError;
 use crate::journal::{Journal, JournalResult};
 use crate::persistence_id::PersistenceId;
@@ -63,14 +62,14 @@ impl<J: Journal> Journal for FaultyJournal<J> {
         &self,
         pid: &PersistenceId,
         events: &[Vec<u8>],
-        fence: Option<Epoch>,
+        expected_last_seq: u64,
     ) -> JournalResult<()> {
         if let Some(budget) = self.persist_budget
             && self.persists.fetch_add(1, Ordering::Relaxed) >= budget
         {
             return Err(JournalError::Backend("injected persist failure".into()));
         }
-        self.inner.persist(pid, events, fence).await
+        self.inner.persist(pid, events, expected_last_seq).await
     }
 
     async fn replay(
@@ -100,12 +99,11 @@ impl<J: Journal> Journal for FaultyJournal<J> {
         pid: &PersistenceId,
         state: Vec<u8>,
         seq_nr: u64,
-        fence: Option<Epoch>,
     ) -> JournalResult<()> {
         if self.fail_snapshot {
             return Err(JournalError::Backend("injected snapshot failure".into()));
         }
-        self.inner.save_snapshot(pid, state, seq_nr, fence).await
+        self.inner.save_snapshot(pid, state, seq_nr).await
     }
 
     async fn latest_snapshot(&self, pid: &PersistenceId) -> JournalResult<Option<(Vec<u8>, u64)>> {
@@ -120,12 +118,8 @@ impl<J: Journal> Journal for FaultyJournal<J> {
         self.inner.copy_snapshot(from, to).await
     }
 
-    async fn claim_ownership(&self, pid: &PersistenceId) -> JournalResult<Epoch> {
-        self.inner.claim_ownership(pid).await
-    }
-
-    async fn current_epoch(&self, pid: &PersistenceId) -> JournalResult<Option<Epoch>> {
-        self.inner.current_epoch(pid).await
+    async fn last_seq(&self, pid: &PersistenceId) -> JournalResult<u64> {
+        self.inner.last_seq(pid).await
     }
 
     async fn clear(&self, pid: &PersistenceId) -> JournalResult<()> {
@@ -172,7 +166,7 @@ pub mod conformance {
     // ── the contract ─────────────────────────────────────────────────────────────
 
     pub async fn persist_then_replay_returns_events_in_order(j: &dyn Journal) {
-        j.persist(&pid("order"), &[vec![1], vec![2], vec![3]], None)
+        j.persist(&pid("order"), &[vec![1], vec![2], vec![3]], 0)
             .await
             .unwrap();
         assert_eq!(
@@ -183,7 +177,7 @@ pub mod conformance {
     }
 
     pub async fn replay_skips_events_at_or_before_after_seq(j: &dyn Journal) {
-        j.persist(&pid("skip"), &[vec![1], vec![2], vec![3]], None)
+        j.persist(&pid("skip"), &[vec![1], vec![2], vec![3]], 0)
             .await
             .unwrap();
         assert_eq!(
@@ -194,10 +188,13 @@ pub mod conformance {
     }
 
     pub async fn logs_are_namespaced_by_kind(j: &dyn Journal) {
-        j.persist(&PersistenceId::new("workflow", "shared"), &[vec![1]], None)
+        j.persist(&PersistenceId::new("workflow", "shared"), &[vec![1]], 0)
             .await
             .unwrap();
-        j.persist(&PersistenceId::new("agent", "shared"), &[vec![2]], None)
+        // Same id under a different kind is a different log, so this write also
+        // starts from an empty one — a backend that keyed on the id alone would
+        // reject it as a conflict.
+        j.persist(&PersistenceId::new("agent", "shared"), &[vec![2]], 0)
             .await
             .unwrap();
         let mut wf = j.replay(&PersistenceId::new("workflow", "shared"), 0).await;
@@ -207,19 +204,25 @@ pub mod conformance {
     }
 
     pub async fn clear_removes_all_state(j: &dyn Journal) {
-        j.persist(&pid("cleared"), &[vec![1]], None).await.unwrap();
+        j.persist(&pid("cleared"), &[vec![1]], 0).await.unwrap();
         j.clear(&pid("cleared")).await.unwrap();
         assert!(drain(j, "cleared", 0).await.is_empty());
+        assert_eq!(
+            j.last_seq(&pid("cleared")).await.unwrap(),
+            0,
+            "a cleared log must look empty to the next writer, numbering included"
+        );
     }
 
     pub async fn persist_continues_numbering_after_compaction(j: &dyn Journal) {
-        j.persist(&pid("numbering"), &[vec![1], vec![2]], None)
+        j.persist(&pid("numbering"), &[vec![1], vec![2]], 0)
             .await
             .unwrap();
         j.delete_events_before(&pid("numbering"), 2).await.unwrap();
-        j.persist(&pid("numbering"), &[vec![3]], None)
-            .await
-            .unwrap();
+        // Compaction removes events, not numbering: the next write still expects
+        // 2. A backend that derived the sequence from the surviving rows would
+        // reject this, and every write after a snapshot with it.
+        j.persist(&pid("numbering"), &[vec![3]], 2).await.unwrap();
         assert_eq!(
             drain(j, "numbering", 2).await,
             vec![vec![3]],
@@ -228,35 +231,34 @@ pub mod conformance {
     }
 
     pub async fn snapshot_roundtrips_with_seq(j: &dyn Journal) {
-        j.save_snapshot(&pid("snap"), vec![9, 9], 5, None)
+        j.persist(&pid("snap"), &[vec![1], vec![2]], 0)
             .await
             .unwrap();
+        j.save_snapshot(&pid("snap"), vec![9, 9], 2).await.unwrap();
         assert_eq!(
             j.latest_snapshot(&pid("snap")).await.unwrap(),
-            Some((vec![9, 9], 5)),
+            Some((vec![9, 9], 2)),
             "a saved snapshot must be readable back with its sequence number"
         );
     }
 
     pub async fn delete_events_before_compacts(j: &dyn Journal) {
-        j.persist(&pid("compact"), &[vec![1], vec![2], vec![3]], None)
+        j.persist(&pid("compact"), &[vec![1], vec![2], vec![3]], 0)
             .await
             .unwrap();
         j.delete_events_before(&pid("compact"), 2).await.unwrap();
         assert_eq!(
             drain(j, "compact", 0).await,
             vec![vec![3]],
-            "delete_events_before must drop events at or below seq_nr"
+            "compaction must drop events at or before the given sequence"
         );
     }
 
     pub async fn copy_snapshot_seeds_new_id(j: &dyn Journal) {
-        j.persist(&pid("src"), &[vec![1], vec![2]], None)
+        j.persist(&pid("src"), &[vec![1], vec![2]], 0)
             .await
             .unwrap();
-        j.save_snapshot(&pid("src"), vec![7], 2, None)
-            .await
-            .unwrap();
+        j.save_snapshot(&pid("src"), vec![7], 2).await.unwrap();
         j.copy_snapshot(&pid("src"), &pid("dst")).await.unwrap();
         assert_eq!(
             j.latest_snapshot(&pid("dst")).await.unwrap(),
@@ -267,6 +269,12 @@ pub mod conformance {
             drain(j, "dst", 2).await.is_empty(),
             "the destination must start with an empty event log"
         );
+        assert_eq!(
+            j.last_seq(&pid("dst")).await.unwrap(),
+            2,
+            "the destination inherits the source's numbering, so its first writer expects it"
+        );
+        j.persist(&pid("dst"), &[vec![8]], 2).await.unwrap();
     }
 
     pub async fn copy_snapshot_without_source_errors(j: &dyn Journal) {
@@ -283,14 +291,12 @@ pub mod conformance {
     /// that never compacts recovers the correct *value* by replaying from event
     /// 0, so the state assertion passes while the bug stands.
     pub async fn snapshot_then_compact_leaves_only_later_events(j: &dyn Journal) {
-        j.persist(&pid("e2e"), &[vec![1], vec![2]], None)
+        j.persist(&pid("e2e"), &[vec![1], vec![2]], 0)
             .await
             .unwrap();
-        j.save_snapshot(&pid("e2e"), vec![42], 2, None)
-            .await
-            .unwrap();
+        j.save_snapshot(&pid("e2e"), vec![42], 2).await.unwrap();
         j.delete_events_before(&pid("e2e"), 2).await.unwrap();
-        j.persist(&pid("e2e"), &[vec![3]], None).await.unwrap();
+        j.persist(&pid("e2e"), &[vec![3]], 2).await.unwrap();
 
         assert_eq!(
             j.latest_snapshot(&pid("e2e")).await.unwrap(),
@@ -302,6 +308,86 @@ pub mod conformance {
             vec![vec![3]],
             "only post-snapshot events should remain in the log"
         );
+    }
+
+    pub async fn last_seq_reports_where_the_log_ends(j: &dyn Journal) {
+        assert_eq!(
+            j.last_seq(&pid("tip")).await.unwrap(),
+            0,
+            "a log that does not exist yet must report 0, not fail"
+        );
+        j.persist(&pid("tip"), &[vec![1], vec![2]], 0)
+            .await
+            .unwrap();
+        assert_eq!(j.last_seq(&pid("tip")).await.unwrap(), 2);
+    }
+
+    // ── the write fence ──────────────────────────────────────────────────────────
+    //
+    // Everything below is one guarantee: a writer whose picture of the log is out
+    // of date cannot write. It is the only thing between two hosts that both
+    // believe they own an instance and a history spliced together out of two
+    // divergent ones, and — unlike anything that checks before writing — it holds
+    // for a process that was frozen through a failover.
+    //
+    // A backend that cannot enforce this must fail these tests rather than skip
+    // them. A fence that does not fence is worse than none, because everything
+    // above it is written believing it holds.
+
+    pub async fn persist_rejects_a_stale_writer(j: &dyn Journal) {
+        j.persist(&pid("stale"), &[vec![1]], 0).await.unwrap();
+        assert!(
+            j.persist(&pid("stale"), &[vec![2]], 0).await.is_err(),
+            "a second writer at the same sequence must be rejected, not appended"
+        );
+        assert_eq!(
+            drain(j, "stale", 0).await,
+            vec![vec![1]],
+            "a rejected write must leave the log exactly as it was"
+        );
+    }
+
+    pub async fn persist_rejects_a_writer_ahead_of_the_log(j: &dyn Journal) {
+        assert!(
+            j.persist(&pid("ahead"), &[vec![1]], 5).await.is_err(),
+            "a writer claiming events the log does not have must be rejected"
+        );
+        assert!(drain(j, "ahead", 0).await.is_empty());
+    }
+
+    /// The more destructive of the two writes, and the easier one to leave
+    /// unguarded: a snapshot is what the next recovery starts from, so a stale
+    /// one silently rewrites history rather than adding to it.
+    pub async fn save_snapshot_rejects_a_stale_writer(j: &dyn Journal) {
+        j.persist(&pid("snapfence"), &[vec![1], vec![2]], 0)
+            .await
+            .unwrap();
+        assert!(
+            j.save_snapshot(&pid("snapfence"), vec![9], 1)
+                .await
+                .is_err(),
+            "a snapshot from behind the log's end must be rejected"
+        );
+        assert!(
+            j.latest_snapshot(&pid("snapfence"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected snapshot must not be stored"
+        );
+        assert_eq!(
+            drain(j, "snapfence", 0).await,
+            vec![vec![1], vec![2]],
+            "a rejected snapshot must leave the events a later compaction would have dropped"
+        );
+    }
+
+    /// Two hosts racing to create the same instance both expect an empty log.
+    /// Exactly one may win, or they would each start a history under one id.
+    pub async fn only_one_writer_can_start_a_log(j: &dyn Journal) {
+        j.persist(&pid("race"), &[vec![1]], 0).await.unwrap();
+        assert!(j.persist(&pid("race"), &[vec![2]], 0).await.is_err());
+        assert_eq!(drain(j, "race", 0).await, vec![vec![1]]);
     }
 }
 
@@ -323,21 +409,21 @@ mod tests {
     #[tokio::test]
     async fn fail_persist_after_lets_the_first_n_through() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new()).fail_persist_after(1);
-        assert!(j.persist(&pid(), &[vec![1]], None).await.is_ok());
-        assert!(j.persist(&pid(), &[vec![2]], None).await.is_err());
-        assert!(j.persist(&pid(), &[vec![3]], None).await.is_err());
+        assert!(j.persist(&pid(), &[vec![1]], 0).await.is_ok());
+        assert!(j.persist(&pid(), &[vec![2]], 1).await.is_err());
+        assert!(j.persist(&pid(), &[vec![3]], 1).await.is_err());
     }
 
     #[tokio::test]
     async fn fail_persist_after_zero_fails_immediately() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new()).fail_persist_after(0);
-        assert!(j.persist(&pid(), &[vec![1]], None).await.is_err());
+        assert!(j.persist(&pid(), &[vec![1]], 0).await.is_err());
     }
 
     #[tokio::test]
     async fn healthy_by_default_delegates_to_inner() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new());
-        j.persist(&pid(), &[vec![7]], None).await.unwrap();
+        j.persist(&pid(), &[vec![7]], 0).await.unwrap();
         let mut s = j.replay(&pid(), 0).await;
         assert_eq!(s.next().await.unwrap().unwrap(), (1, vec![7]));
     }
@@ -345,18 +431,28 @@ mod tests {
     #[tokio::test]
     async fn fail_snapshot_rejects_saves_but_not_persists() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new()).fail_snapshot();
-        assert!(j.persist(&pid(), &[vec![1]], None).await.is_ok());
-        assert!(j.save_snapshot(&pid(), vec![9], 1, None).await.is_err());
+        assert!(j.persist(&pid(), &[vec![1]], 0).await.is_ok());
+        assert!(j.save_snapshot(&pid(), vec![9], 1).await.is_err());
     }
 
     #[tokio::test]
     async fn fail_replay_at_truncates_the_stream_with_an_error() {
         let j = FaultyJournal::wrapping(InMemoryJournal::new()).fail_replay_at(2);
-        j.persist(&pid(), &[vec![1], vec![2], vec![3]], None)
+        j.persist(&pid(), &[vec![1], vec![2], vec![3]], 0)
             .await
             .unwrap();
         let mut s = j.replay(&pid(), 0).await;
         assert!(s.next().await.unwrap().is_ok()); // seq 1
         assert!(s.next().await.unwrap().is_err()); // seq 2 → injected failure
+    }
+
+    /// The wrapper must pass the writer's expectation through untouched.
+    /// Swallowing it — passing 0, say — would make every test that runs through
+    /// this journal exercise an unfenced backend.
+    #[tokio::test]
+    async fn the_wrapper_forwards_the_write_condition() {
+        let j = FaultyJournal::wrapping(InMemoryJournal::new());
+        j.persist(&pid(), &[vec![1]], 0).await.unwrap();
+        assert!(j.persist(&pid(), &[vec![2]], 0).await.is_err());
     }
 }

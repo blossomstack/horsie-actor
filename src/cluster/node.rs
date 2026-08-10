@@ -1,5 +1,5 @@
 use crate::cluster::placement::{PlacementCommand, PlacementTable};
-use crate::envelope::{Envelope, Epoch, NodeId};
+use crate::envelope::{Envelope, NodeId};
 use crate::transport::{Transport, TransportError};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -29,13 +29,13 @@ pub struct ClusterConfig {
 /// Placement here is *rendezvous hashing over the live member set*, not a
 /// replicated log. Every node computes the same host for an instance without
 /// coordinating, and disagreement during a membership change is resolved where
-/// it actually matters — the journal, whose `claim_ownership` mints a strictly
-/// higher epoch and fences the loser out.
+/// it actually matters — the journal, whose conditional append rejects a writer
+/// whose picture of the log is out of date.
 ///
-/// That is the consequence of moving epoch minting into the journal: agreement
-/// stops being what makes hosting safe and becomes what stops two nodes wasting
-/// effort claiming the same log. A stronger agreement mechanism is a churn
-/// optimisation on top of this, not a correctness prerequisite for it.
+/// That is what makes agreement a liveness concern rather than a safety one:
+/// two nodes that disagree about placement waste effort, but only one of them
+/// can write. A stronger agreement mechanism is a churn optimisation on top of
+/// this, not a correctness prerequisite for it.
 pub struct ClusterNode {
     local: NodeId,
     transport: Arc<dyn Transport>,
@@ -134,7 +134,6 @@ impl ClusterNode {
         &self,
         kind: &str,
         id: &str,
-        epoch: Epoch,
         payload: Vec<u8>,
         message_id: u128,
     ) -> Result<(), TransportError> {
@@ -150,7 +149,6 @@ impl ClusterNode {
                 id: id.to_owned(),
                 correlation: None,
                 message_id,
-                epoch,
                 payload: payload.clone(),
             };
             match self.transport.send(owner, env).await {
@@ -241,9 +239,7 @@ mod tests {
             .expect("some id must land on node 2");
 
         let mut inbox = b.incoming().unwrap();
-        a.send("counter", id, Epoch(1), b"hello".to_vec(), 1)
-            .await
-            .unwrap();
+        a.send("counter", id, b"hello".to_vec(), 1).await.unwrap();
 
         let got = inbox.recv().await.unwrap();
         assert_eq!(got.id, id);
@@ -290,7 +286,7 @@ mod tests {
         net.remove(NodeId(2));
         let mut own_inbox = a.incoming().unwrap();
 
-        a.send("counter", id, Epoch(1), b"x".to_vec(), 1)
+        a.send("counter", id, b"x".to_vec(), 1)
             .await
             .expect("the send should have re-resolved onto a live host");
 
@@ -313,10 +309,7 @@ mod tests {
         net.remove(NodeId(2));
         a.mark_down(NodeId(1));
 
-        let err = a
-            .send("counter", "c1", Epoch(1), b"x".to_vec(), 1)
-            .await
-            .unwrap_err();
+        let err = a.send("counter", "c1", b"x".to_vec(), 1).await.unwrap_err();
         assert!(matches!(
             err,
             TransportError::Unreachable(_) | TransportError::Io(_)

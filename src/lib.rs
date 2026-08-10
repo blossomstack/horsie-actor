@@ -35,7 +35,7 @@ pub use cluster::{
     Assignment, ClusterConfig, ClusterNode, Dedup, InstanceKey, PlacementCommand, PlacementEffect,
     PlacementTable,
 };
-pub use envelope::{Envelope, Epoch, NodeId};
+pub use envelope::{Envelope, NodeId};
 pub use error::{JournalError, TellError};
 pub use journal::{InMemoryJournal, Journal, JournalResult};
 pub use persistence_id::PersistenceId;

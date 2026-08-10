@@ -74,7 +74,6 @@ impl Dedup {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::envelope::Epoch;
 
     fn env(message_id: u128) -> Envelope {
         Envelope {
@@ -82,7 +81,6 @@ mod tests {
             id: "c1".into(),
             correlation: None,
             message_id,
-            epoch: Epoch(1),
             payload: Vec::new(),
         }
     }
