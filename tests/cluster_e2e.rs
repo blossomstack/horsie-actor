@@ -423,3 +423,36 @@ async fn a_fenced_host_stops_instead_of_serving_stale() {
     }
     panic!("a displaced host kept accepting commands");
 }
+
+/// `ask` to an actor on another host fails immediately rather than hanging.
+///
+/// A reply handle is a channel into the asking process; shipping the command
+/// elsewhere leaves it behind, so nobody answers. Until replies can be routed
+/// back across a host boundary, refusing is the honest behaviour — a caller can
+/// see an error, and cannot see a request that never returns.
+#[tokio::test]
+async fn ask_to_a_remote_host_is_refused_not_hung() {
+    let cluster = TestCluster::of_size(3);
+    let id = "remote-ask";
+    let host = cluster.host_of(id);
+    let elsewhere = (host + 1) % 3;
+
+    let remote = cluster
+        .system(elsewhere)
+        .actor_of::<Counter>(id)
+        .await
+        .unwrap();
+
+    // Would otherwise wait forever.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        remote.ask(|reply| CounterCmd::Get(Some(reply))),
+    )
+    .await
+    .expect("ask must return rather than hang");
+
+    assert!(matches!(
+        outcome,
+        Err(horsie_actor::TellError::AskNotRoutable)
+    ));
+}
