@@ -95,6 +95,12 @@ struct Mailboxes {
 #[derive(Clone, Default)]
 pub struct InProcessNetwork {
     nodes: Arc<Mutex<HashMap<NodeId, Mailboxes>>>,
+    /// Nodes cut off from the network, with their mailboxes kept aside.
+    ///
+    /// Kept rather than dropped so a partition can heal: the node comes back
+    /// with the queues it had, which is what a network recovering looks like —
+    /// as opposed to a node restarting, which is a different test.
+    detached: Arc<Mutex<HashMap<NodeId, Mailboxes>>>,
 }
 
 impl InProcessNetwork {
@@ -123,14 +129,32 @@ impl InProcessNetwork {
         }
     }
 
-    /// Detach a node: sends to it now fail as unreachable.
+    /// Detach a node: nothing reaches it, and nothing it sends arrives.
     ///
-    /// This is how a test kills a host. Note it leaves the node's own transport
-    /// alive and still believing it is a member, which is exactly the state a
-    /// partitioned host is in — and the state the conditional append exists to
-    /// make survivable.
+    /// This is how a test kills a host, and the cut goes both ways on purpose.
+    /// A node that could still be *heard* would keep its leadership while
+    /// everyone else concluded it was gone — not a partition, just a node with
+    /// a broken inbox, and a state no real network produces.
+    ///
+    /// Its own transport stays up and it goes on believing it is a member,
+    /// which is exactly what being on the wrong side of a partition feels like
+    /// from inside.
     pub fn remove(&self, id: NodeId) {
-        self.nodes.lock().remove(&id);
+        if let Some(mailboxes) = self.nodes.lock().remove(&id) {
+            self.detached.lock().insert(id, mailboxes);
+        }
+    }
+
+    /// Reattach a node detached by [`remove`](Self::remove) — a healed
+    /// partition.
+    ///
+    /// Its mailboxes are the ones it was created with, so whatever it was doing
+    /// resumes rather than restarting, which is what a network coming back
+    /// looks like.
+    pub fn restore(&self, id: NodeId) {
+        if let Some(mailboxes) = self.detached.lock().remove(&id) {
+            self.nodes.lock().insert(id, mailboxes);
+        }
     }
 
     /// Whether `id` is currently reachable.
@@ -156,9 +180,14 @@ impl InProcessTransport {
     /// is full, and holding a synchronous lock across that await would deadlock
     /// every other sender in the process.
     fn mailboxes(&self, to: NodeId) -> Result<Mailboxes, TransportError> {
-        self.network
-            .nodes
-            .lock()
+        let nodes = self.network.nodes.lock();
+        // A detached node cannot send either. Checking the sender's own
+        // presence is what makes `remove` a partition rather than a broken
+        // inbox.
+        if !nodes.contains_key(&self.id) {
+            return Err(TransportError::Unreachable(to));
+        }
+        nodes
             .get(&to)
             .cloned()
             .ok_or(TransportError::Unreachable(to))

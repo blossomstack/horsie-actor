@@ -185,15 +185,54 @@ pub(crate) async fn run_actor<A: Actor>(
     mut rx: mpsc::Receiver<A::Command>,
     mut ctx: ActorContext<A::Command>,
 ) {
+    let mut stand_down = ctx.inner.stand_down.clone();
+    if *stand_down.borrow_and_update() {
+        return;
+    }
+
     if let Err(e) = actor.on_start(&mut ctx).await {
         tracing::error!(error = %e, "actor failed to start; shutting down");
         return;
     }
 
-    while let Some(cmd) = rx.recv().await {
-        match actor.handle(cmd, &mut ctx).await {
+    loop {
+        let cmd = tokio::select! {
+            cmd = rx.recv() => match cmd {
+                Some(cmd) => cmd,
+                None => break,
+            },
+            () = stood_down(&mut stand_down) => break,
+        };
+
+        // The handler is raced against the same signal, so an instance loses
+        // its in-flight work rather than finishing it. That is the point: a
+        // node without quorum cannot know whether this instance now belongs to
+        // somebody else, and a half-finished turn is a smaller loss than one
+        // completed against a history that has moved on.
+        let flow = tokio::select! {
+            flow = actor.handle(cmd, &mut ctx) => flow,
+            () = stood_down(&mut stand_down) => break,
+        };
+        match flow {
             Flow::Continue => {}
             Flow::Stop => break,
+        }
+    }
+}
+
+/// Resolve once this node has stopped serving, and never otherwise.
+///
+/// A system with no cluster holds a signal that is never sent, so this pends
+/// forever and the `select!` around it costs nothing.
+async fn stood_down(watch: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if watch.changed().await.is_err() {
+            // The sender is gone, which means the system is being torn down.
+            // Standing down is the right reading of that.
+            return;
+        }
+        if *watch.borrow_and_update() {
+            return;
         }
     }
 }

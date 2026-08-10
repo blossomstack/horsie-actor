@@ -32,12 +32,15 @@ mod transport_tcp;
 pub use actor::{CommandEffect, EventSourcedActor};
 pub use behaviour::{Actor, Flow, StartError};
 pub use cluster::{
-    Assignment, ClusterConfig, ClusterNode, Dedup, InstanceKey, PlacementCommand, PlacementEffect,
-    PlacementTable,
+    Assignment, ClusterConfig, ClusterNode, Dedup, InstanceKey, LiveSet, Membership, NodeIdx,
+    PlacementCommand, PlacementEffect, PlacementTable, RaftStore, serve_consensus,
 };
 pub use envelope::{Envelope, NodeId};
 pub use error::{JournalError, TellError};
+// Re-exported so a caller can read `ClusterNode::raft().metrics()` without
+// depending on openraft directly.
 pub use journal::{InMemoryJournal, Journal, JournalResult};
+pub use openraft::type_config::async_runtime::watch::WatchReceiver;
 pub use persistence_id::PersistenceId;
 pub use persistent::Persistent;
 pub use reply::{ReplyDropped, ReplyTo};

@@ -154,18 +154,51 @@ and a later `replay(after: n)` line up exactly.
 runtime's concern, so the trait carries no domain types and no serde bounds —
 implement it over Postgres, SQLite, S3, or anything else that can append.
 
-`persist` and `save_snapshot` also take a `fence: Option<Epoch>`. `None` — a
-single-process deployment — always writes. `Some(epoch)` asks the backend to
-remember the highest epoch it has seen for that id and reject anything lower,
-**in the same transaction as the write**. That is a parameter rather than a
-wrapper on purpose: a decorator cannot join a transaction it does not open, so
-it would check ownership and append in two steps, which is the race the fence
-exists to close. A backend that cannot enforce one must return an error rather
-than ignore it.
+`persist` and `save_snapshot` are conditional: they take the sequence number the
+writer believes the log ends at, and append only if it still does. A mismatch is
+a `JournalError::Conflict` and the log is left untouched.
+
+That one parameter is the write fence. It needs no notion of ownership and no
+claim step — a writer that has fallen behind is caught by being behind — and,
+unlike anything that checks before writing, it holds for a process that was
+frozen through a failover and woke up still believing it owned the log. The
+check and the append must be **one operation**, which is why it is a parameter
+and not a wrapper: a decorator cannot join a transaction it does not open, so it
+would read and then write, which is the race being closed. A backend that cannot
+express the condition atomically must return an error rather than append
+anyway.
 
 `InMemoryJournal` ships for tests and single-process runs. With the `test-util`
 feature, `testkit::FaultyJournal` wraps any journal and fails writes or truncates
-replays on demand, so recovery paths can be tested rather than assumed.
+replays on demand, so recovery paths can be tested rather than assumed, and
+`testkit::conformance` is the contract as runnable assertions — including the
+fence — so a new backend can be held to it.
+
+## Clustering
+
+Several nodes can host one actor tree, addressed the same way from any of them:
+`system.actor_of::<A>(&id)` returns an `ActorRef` whether the instance runs here
+or on another node.
+
+Three things, kept separate:
+
+- **Membership** — who is in the cluster — is agreed by Raft, so no node can
+  invent its own answer. This is the part that matters: the alternative is a
+  node that drops a peer the moment one send fails, and a node cut off from its
+  peers then concludes it is the whole cluster.
+- **Liveness** — which members are up — is observed by the leader and
+  replicated, so every node places instances over the same set.
+- **The write fence** — the conditional append above — is what makes a wrong
+  answer to either survivable rather than corrupting.
+
+A node that cannot see a quorum stops: it refuses to start instances, stops the
+ones it is running, and drops their in-flight work. That bounds how long a
+displaced node keeps answering reads, which the fence cannot do because a read
+never writes.
+
+`TcpTransport` carries both actor deliveries and consensus over one
+length-prefixed, authenticated connection. It authenticates the peer; it does
+not encrypt, so run it on a private network or through a TLS tunnel.
 
 ## License
 

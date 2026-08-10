@@ -87,6 +87,15 @@ pub enum ActorOfError {
     /// registry slot and hand each other's callers the wrong `ActorRef`.
     #[error("two actor types are registered under the kind '{0}'")]
     KindCollision(&'static str),
+
+    /// This node cannot see a quorum, so it is not hosting anything.
+    ///
+    /// Refused rather than served. A node in a minority cannot know whether its
+    /// instances have already been given to somebody else, and answering from
+    /// state that may be history is the one failure the write fence cannot
+    /// catch — because a read never writes.
+    #[error("this node has no quorum and is not serving")]
+    NotServing,
 }
 
 /// How many recent message ids a node remembers. Large enough that a retry
@@ -132,6 +141,13 @@ pub(crate) struct SystemInner {
     seen: Mutex<Dedup>,
     /// Live instances, keyed by kind and id.
     live: Mutex<HashMap<(&'static str, String), ErasedRef>>,
+    /// Raised when this node stops serving. Every actor watches it and stops.
+    ///
+    /// A single-node system holds a sender that is never used, so the signal
+    /// never fires and nothing pays for it.
+    pub(crate) stand_down: tokio::sync::watch::Receiver<bool>,
+    /// Kept alive so the receiver above never reports its sender dropped.
+    _stand_down_tx: tokio::sync::watch::Sender<bool>,
 }
 
 /// The runtime an actor tree lives in: its journal, its registered actor types,
@@ -145,6 +161,7 @@ impl ActorSystem {
     /// A system backed by `journal`.
     #[must_use]
     pub fn new(journal: Arc<dyn Journal>) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(false);
         Self {
             inner: Arc::new(SystemInner {
                 journal,
@@ -153,6 +170,8 @@ impl ActorSystem {
                 cluster: None,
                 seen: Mutex::new(Dedup::with_capacity(DEDUP_WINDOW)),
                 live: Mutex::new(HashMap::new()),
+                stand_down: rx,
+                _stand_down_tx: tx,
             }),
         }
     }
@@ -164,6 +183,20 @@ impl ActorSystem {
     /// difference — `actor_of` returns an `ActorRef` either way.
     #[must_use]
     pub fn clustered(journal: Arc<dyn Journal>, cluster: Arc<ClusterNode>) -> Self {
+        // Inverted: actors want to know when to stop, and the node reports when
+        // it may serve.
+        let (tx, rx) = tokio::sync::watch::channel(!cluster.serving());
+        let mut serving = cluster.serving_watch();
+        let relay = tx.clone();
+        tokio::spawn(async move {
+            while serving.changed().await.is_ok() {
+                let stop = !*serving.borrow_and_update();
+                if relay.send(stop).is_err() {
+                    return; // the system is gone
+                }
+            }
+        });
+
         Self {
             inner: Arc::new(SystemInner {
                 journal,
@@ -172,6 +205,8 @@ impl ActorSystem {
                 cluster: Some(cluster),
                 seen: Mutex::new(Dedup::with_capacity(DEDUP_WINDOW)),
                 live: Mutex::new(HashMap::new()),
+                stand_down: rx,
+                _stand_down_tx: tx,
             }),
         }
     }
@@ -234,6 +269,7 @@ impl ActorSystem {
         &self,
         id: &str,
     ) -> Result<ActorRef<A::Command>, ActorOfError> {
+        self.require_serving()?;
         let key = (A::KIND, id.to_owned());
         let factory = self
             .inner
@@ -265,8 +301,17 @@ impl ActorSystem {
         Ok(typed)
     }
 
+    /// Refuse everything while this node has no quorum.
+    fn require_serving(&self) -> Result<(), ActorOfError> {
+        match &self.inner.cluster {
+            Some(cluster) if !cluster.serving() => Err(ActorOfError::NotServing),
+            _ => Ok(()),
+        }
+    }
+
     /// Feed one inbound envelope to the instance it addresses.
     pub async fn dispatch(&self, env: Envelope) -> Result<(), DispatchError> {
+        self.require_serving()?;
         // A repeat is a success, not a failure: the sender retried because it
         // could not tell "lost" from "slow", and the answer to both is that the
         // command has already been applied.
@@ -293,6 +338,8 @@ impl ActorSystem {
         &self,
         id: &str,
     ) -> Result<ActorRef<A::Command>, ActorOfError> {
+        self.require_serving()?;
+
         // Already running here: hand back the same reference regardless of what
         // placement now says. Migrating a live instance mid-conversation would
         // strand whatever it was doing, and the conditional append makes a brief

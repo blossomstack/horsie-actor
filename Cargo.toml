@@ -27,6 +27,15 @@ tracing      = "0.1"
 # Handshake proof only: the peer shows it knows the shared secret, bound to the
 # node id it announces so a captured hello cannot be replayed as another node.
 sha2         = "0.11"
+# Membership consensus. Pinned exactly, and deliberately on the 0.10 alpha line
+# rather than the 0.9 "stable" one: 0.9 predates the Jepsen work entirely, so the
+# safer-sounding pin is the less-tested code. This pin carries the June 2026
+# correctness fixes — #1795 (a leader building inconsistent AppendEntries after a
+# log-read error), #1802 (commit index advancing on a sub-quorum) and #1808
+# (snapshot install retaining stale membership, producing disjoint quorums).
+# `clap` is in openraft's default features and is a command-line parser; nothing
+# here parses one.
+openraft     = { version = "=0.10.0-alpha.33", default-features = false, features = ["serde", "tokio-rt"] }
 
 [dev-dependencies]
 tempfile = "3"
