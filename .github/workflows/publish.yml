@@ -1,0 +1,92 @@
+name: Publish
+
+# Publishes horsie-actor to crates.io via Trusted Publishing (OIDC) — no
+# long-lived token.
+#
+# One-time setup on crates.io, AFTER the crate exists: crate Settings ->
+# Trusted Publishing -> GitHub, repository blossomstack/horsie-actor, workflow
+# publish.yml.
+#
+# Bootstrap caveat: trusted publishing can only be configured for a crate that
+# is already on crates.io, so the very first publish falls back to the
+# CARGO_REGISTRY_TOKEN repo secret. Delete that secret once OIDC is configured.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match ci.yml — single source of truth for the pinned toolchain.
+  RUST_TOOLCHAIN: "1.96.0"
+
+jobs:
+  # Fails fast, before any build, if the pushed tag doesn't match the version in
+  # Cargo.toml — e.g. a `vX.Y.Z` tag pushed before the bump. Left uncaught, that
+  # surfaces minutes later as a confusing publish error instead of a clear one.
+  version-guard:
+    name: Verify tag matches the crate version
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Compare tag to the crate version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "::error::tag v$tag_version does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+          echo "crate at $crate_version, matches tag v$tag_version"
+
+  publish:
+    name: Publish to crates.io
+    needs: version-guard
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # mint the OIDC token exchanged for a temp crates.io token
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Authenticate with crates.io (OIDC)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.4
+        # The first-ever publish has no trusted-publishing config yet; fall
+        # through to the token secret below instead of failing the run.
+        continue-on-error: true
+
+      # Idempotent: a rerun after a partial failure (crates.io rate limit, a
+      # flaky index confirmation) sees the version already present and exits 0
+      # rather than failing on "crate version already uploaded".
+      - name: cargo publish
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if curl -fsS -A "publish-workflow (github.com/${{ github.repository }})" \
+              "https://crates.io/api/v1/crates/horsie-actor/$version" >/dev/null 2>&1; then
+            echo "horsie-actor $version is already published"
+            exit 0
+          fi
+          cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+          # The runner hits spurious HTTP/2 broken-pipe errors against
+          # crates.io which desync cargo's wait-for-publish loop. HTTP/1.1 and
+          # a longer confirmation window keep the publish alive.
+          CARGO_HTTP_MULTIPLEXING: "false"
+          CARGO_PUBLISH_TIMEOUT: "300"

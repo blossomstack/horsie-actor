@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Every base, not only `main`. A stacked PR targets its parent branch, so
+    # gating on `main` gives every PR in a stack but the bottom one *zero*
+    # checks — the ones most in need of review are the ones nobody can verify.
+    branches: ["**"]
+    # Include `edited` so a PR auto-retargeted onto main (e.g. when its parent
+    # in a stack merges) triggers CI — the default types omit base-branch changes.
+    types: [opened, synchronize, reopened, edited]
+
+# Least privilege: jobs only need to read the repo.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned toolchain — single source of truth for CI, and matched by
+  # publish.yml. Bump deliberately: a new stable can introduce clippy lints
+  # that fail under -D warnings.
+  RUST_TOOLCHAIN: "1.96.0"
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # --all-targets covers the example, which is the README's code verbatim.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked --all-features
+
+      # The example is the README. Running it means a broken README fails CI
+      # rather than shipping to crates.io and docs.rs.
+      - name: Run the README example
+        run: cargo run --locked --example counter
+
+      # Catches a missing description/license/readme and any file the package
+      # would omit, at PR time rather than at `cargo publish` time.
+      - name: Packaging
+        run: cargo publish --locked --dry-run
+
+  # Kept separate: MSRV is a promise to consumers, and a failure here means
+  # something different from a failure above (the code is fine, the floor moved).
+  msrv:
+    name: MSRV (rust-version in Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+
+      - name: Build at the declared MSRV
+        run: cargo build --locked --all-features
