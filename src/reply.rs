@@ -13,10 +13,25 @@ pub struct ReplyDropped;
 ///
 /// A thin wrapper over a one-shot channel today. It is its own type — rather
 /// than `oneshot::Sender<R>` spelled out at every call site — because a reply
-/// handle has to survive being carried to another node once actors can be
+/// handle has to survive being carried to another host once actors can be
 /// hosted remotely, and a `oneshot::Sender` cannot. Introducing that later would
 /// mean touching every command variant in every consumer; introducing it now
 /// costs a rename.
+///
+/// # It does not cross a host boundary yet
+///
+/// This is a channel into the asking process. Ship the command elsewhere and
+/// the handle stays behind, so nobody answers. [`ActorRef::ask`] therefore
+/// refuses a remote target outright rather than letting the caller wait
+/// forever.
+///
+/// Note the shape of the trap if you work around that: giving a command a
+/// `#[serde(skip)] Option<ReplyTo<_>>` field makes it encodable, and it then
+/// arrives as `None`, the handler answers nobody, and the caller hangs. The
+/// crate cannot detect that — only the refusal in `ask` stands between you and
+/// it.
+///
+/// [`ActorRef::ask`]: crate::ActorRef::ask
 pub struct ReplyTo<R> {
     tx: oneshot::Sender<R>,
 }
