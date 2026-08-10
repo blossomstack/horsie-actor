@@ -75,6 +75,26 @@ pub trait Journal: Send + Sync + 'static {
     /// the copied state and continues numbering from there.
     async fn copy_snapshot(&self, from: &PersistenceId, to: &PersistenceId) -> JournalResult<()>;
 
+    /// Take ownership of `pid`, returning the epoch the new owner must carry on
+    /// every subsequent write.
+    ///
+    /// Atomically bumps the log's epoch past whatever it was, so a previous
+    /// owner's writes are fenced from this moment on. The bump and the read are
+    /// one operation: two hosts racing to claim get two different epochs, and
+    /// the loser is locked out by the winner's higher one rather than both
+    /// believing they succeeded.
+    ///
+    /// This is why the epoch does not come from whatever elects the owner. The
+    /// journal is already durable — it has to be — so minting epochs here makes
+    /// them monotonic across a total restart for free. An epoch minted by an
+    /// in-memory election would reset to zero after a full outage while the log
+    /// still remembered a higher one, and every write would be fenced out
+    /// forever: safe, and permanently wedged.
+    async fn claim_ownership(&self, pid: &PersistenceId) -> JournalResult<Epoch>;
+
+    /// The epoch `pid` is currently owned at, or `None` if never claimed.
+    async fn current_epoch(&self, pid: &PersistenceId) -> JournalResult<Option<Epoch>>;
+
     /// Remove all persisted state for `pid`. Primarily a test helper.
     async fn clear(&self, pid: &PersistenceId) -> JournalResult<()>;
 }
@@ -206,6 +226,22 @@ impl Journal for InMemoryJournal {
             },
         );
         Ok(())
+    }
+
+    async fn claim_ownership(&self, pid: &PersistenceId) -> JournalResult<Epoch> {
+        let mut map = self.inner.lock();
+        let entry = map.entry(pid.clone()).or_default();
+        entry.epoch = Epoch(entry.epoch.0 + 1);
+        Ok(entry.epoch)
+    }
+
+    async fn current_epoch(&self, pid: &PersistenceId) -> JournalResult<Option<Epoch>> {
+        Ok(self
+            .inner
+            .lock()
+            .get(pid)
+            .map(|e| e.epoch)
+            .filter(|e| e.0 > 0))
     }
 
     async fn clear(&self, pid: &PersistenceId) -> JournalResult<()> {
@@ -433,5 +469,79 @@ mod fence_tests {
             .unwrap();
         j.persist(&pid("a"), &[vec![2]], None).await.unwrap();
         assert_eq!(drain(&j, "a").await, vec![vec![1], vec![2]]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod ownership_tests {
+    use super::*;
+
+    fn pid(id: &str) -> PersistenceId {
+        PersistenceId::new("t", id)
+    }
+
+    /// Claiming mints a strictly higher epoch each time, so the previous owner
+    /// is fenced out the moment somebody else claims.
+    #[tokio::test]
+    async fn claiming_locks_out_the_previous_owner() {
+        let j = InMemoryJournal::new();
+        let first = j.claim_ownership(&pid("a")).await.unwrap();
+        j.persist(&pid("a"), &[vec![1]], Some(first)).await.unwrap();
+
+        let second = j.claim_ownership(&pid("a")).await.unwrap();
+        assert!(second > first, "a claim must outrank the one it replaces");
+
+        // The old owner does not know it lost. Its next write says so.
+        let err = j
+            .persist(&pid("a"), &[vec![2]], Some(first))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JournalError::Fenced { .. }));
+
+        j.persist(&pid("a"), &[vec![3]], Some(second))
+            .await
+            .unwrap();
+    }
+
+    /// Two hosts racing to claim get two different epochs and exactly one of
+    /// them can write. Neither is told it lost — the fence is what tells them.
+    #[tokio::test]
+    async fn a_contested_claim_produces_one_winner() {
+        let j = InMemoryJournal::new();
+        let a = j.claim_ownership(&pid("a")).await.unwrap();
+        let b = j.claim_ownership(&pid("a")).await.unwrap();
+        assert_ne!(a, b);
+
+        let (loser, winner) = if a < b { (a, b) } else { (b, a) };
+        j.persist(&pid("a"), &[vec![1]], Some(winner))
+            .await
+            .unwrap();
+        assert!(
+            j.persist(&pid("a"), &[vec![2]], Some(loser)).await.is_err(),
+            "the lower claim must be fenced"
+        );
+    }
+
+    /// An unclaimed log reports no owner, so a caller can tell "never hosted"
+    /// from "hosted at epoch 1".
+    #[tokio::test]
+    async fn an_unclaimed_log_has_no_epoch() {
+        let j = InMemoryJournal::new();
+        assert_eq!(j.current_epoch(&pid("a")).await.unwrap(), None);
+        let e = j.claim_ownership(&pid("a")).await.unwrap();
+        assert_eq!(j.current_epoch(&pid("a")).await.unwrap(), Some(e));
+    }
+
+    /// The epoch survives a claim by a host that then writes nothing, so a
+    /// crashed claimant still costs its successor a higher number rather than
+    /// leaving the log reusable at the same one.
+    #[tokio::test]
+    async fn a_claim_counts_even_with_no_writes() {
+        let j = InMemoryJournal::new();
+        let first = j.claim_ownership(&pid("a")).await.unwrap();
+        let second = j.claim_ownership(&pid("a")).await.unwrap();
+        let third = j.claim_ownership(&pid("a")).await.unwrap();
+        assert!(first < second && second < third);
     }
 }

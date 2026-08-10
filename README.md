@@ -9,7 +9,7 @@ same identity recovers exactly where the previous one left off.
 
 ```toml
 [dependencies]
-horsie-actor = "0.4"
+horsie-actor = "0.5"
 ```
 
 ## Two traits
