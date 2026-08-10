@@ -113,21 +113,25 @@ impl<C: Send + 'static> ActorRef<C> {
     /// after the durable write, so the caller gets genuine backpressure rather
     /// than an acknowledgement of an intention.
     ///
+    /// Works the same whether the actor is here or on another node: encoding
+    /// the command registers the reply handle against this node, and the answer
+    /// is routed back to it. Note there is no bound on `R` here — the
+    /// requirement that a reply must round-trip lives on `ReplyTo`'s own
+    /// `Serialize`, so it applies exactly to handles that actually cross a
+    /// host and not to every local-only reply type in every consumer.
+    ///
     /// [`CommandEffect::and_ack`]: crate::CommandEffect::and_ack
     pub async fn ask<F, R>(&self, make: F) -> Result<R, TellError>
     where
         F: FnOnce(ReplyTo<R>) -> C,
         R: Send + 'static,
     {
-        // Refuse rather than hang. The reply handle is a channel into this
-        // process; shipping the command to another host leaves it behind, so
-        // nobody would ever answer and the caller would wait forever. Failing
-        // here is the difference between a bug you can see and one you cannot.
-        if matches!(self.reach, Reach::Remote(_)) {
-            return Err(TellError::AskNotRoutable);
-        }
         let (reply, rx) = ReplyTo::channel();
         self.tell(make(reply)).await?;
+        // A remote actor that stops mid-request, a host that goes away, or an
+        // answer that will not decode all end here: the sender is dropped and
+        // the caller is told, rather than waiting on something that is not
+        // coming.
         rx.await.map_err(|_| TellError::MailboxClosed)
     }
 }

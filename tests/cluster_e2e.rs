@@ -26,10 +26,10 @@ struct Counter {
 #[derive(Serialize, Deserialize)]
 enum CounterCmd {
     Inc(i64),
-    /// The reply channel does not survive a hop, so a remote `Get` is not
-    /// something this test asks for — reads go to the hosting node directly.
-    #[serde(skip)]
-    Get(Option<ReplyTo<i64>>),
+    /// A read, answered wherever the instance happens to live. The reply
+    /// channel round-trips like any other field — which is the whole point of
+    /// reply routing, and was impossible before it.
+    Get(ReplyTo<i64>),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -65,9 +65,7 @@ impl EventSourcedActor for Counter {
         match cmd {
             CounterCmd::Inc(n) => CommandEffect::persist(vec![Incremented(n)]),
             CounterCmd::Get(reply) => {
-                if let Some(reply) = reply {
-                    let _ = reply.send(state.value);
-                }
+                let _ = reply.send(state.value);
                 CommandEffect::none()
             }
         }
@@ -222,10 +220,7 @@ fn spawn_dispatch_loop(system: &ActorSystem, node: &Arc<ClusterNode>) {
 async fn value_at_host(cluster: &TestCluster, id: &str) -> i64 {
     let host = cluster.host_of(id);
     let actor = cluster.system(host).actor_of::<Counter>(id).await.unwrap();
-    actor
-        .ask(|reply| CounterCmd::Get(Some(reply)))
-        .await
-        .unwrap()
+    actor.ask(CounterCmd::Get).await.unwrap()
 }
 
 /// Let a cross-node send land. The write is asynchronous by construction — the
@@ -422,10 +417,7 @@ async fn a_displaced_host_stops_writing() {
     let fresh = cluster
         .system(elsewhere)
         .spawn_persistent(Counter { id: id.to_owned() });
-    let value = fresh
-        .ask(|reply| CounterCmd::Get(Some(reply)))
-        .await
-        .unwrap();
+    let value = fresh.ask(CounterCmd::Get).await.unwrap();
     assert_eq!(
         value, 12,
         "the displaced host's write landed; the fence is not being applied"
@@ -468,18 +460,31 @@ async fn a_displaced_host_stops_instead_of_serving_stale() {
     panic!("a displaced host kept accepting commands");
 }
 
-/// `ask` to an actor on another host fails immediately rather than hanging.
+/// `ask` reaches an actor on another host and the answer comes back.
 ///
-/// A reply handle is a channel into the asking process; shipping the command
-/// elsewhere leaves it behind, so nobody answers. Until replies can be routed
-/// back across a host boundary, refusing is the honest behaviour — a caller can
-/// see an error, and cannot see a request that never returns.
+/// This is what reply routing is for, and the reason the whole crate exists in
+/// this shape: the caller writes the same `ask` it would write locally, and
+/// nothing at the call site says where the actor is. Before this, a remote
+/// `ask` was refused outright, because the reply handle is a channel into the
+/// asking process and shipping the command elsewhere left it behind.
 #[tokio::test]
-async fn ask_to_a_remote_host_is_refused_not_hung() {
+async fn ask_reaches_an_actor_on_another_host() {
     let cluster = TestCluster::of_size(3).await;
     let id = "remote-ask";
     let host = cluster.host_of(id);
     let elsewhere = (host + 1) % 3;
+
+    // Give it a value through the hosting node, so the answer is something only
+    // the real instance could know.
+    cluster
+        .system(host)
+        .actor_of::<Counter>(id)
+        .await
+        .unwrap()
+        .tell(CounterCmd::Inc(9))
+        .await
+        .unwrap();
+    settle().await;
 
     let remote = cluster
         .system(elsewhere)
@@ -487,18 +492,37 @@ async fn ask_to_a_remote_host_is_refused_not_hung() {
         .await
         .unwrap();
 
-    // Would otherwise wait forever.
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(2),
-        remote.ask(|reply| CounterCmd::Get(Some(reply))),
-    )
-    .await
-    .expect("ask must return rather than hang");
+    let value = tokio::time::timeout(Duration::from_secs(5), remote.ask(CounterCmd::Get))
+        .await
+        .expect("ask must return rather than hang")
+        .expect("ask across a host must succeed");
+    assert_eq!(value, 9);
+}
 
-    assert!(matches!(
-        outcome,
-        Err(horsie_actor::TellError::AskNotRoutable)
-    ));
+/// A caller whose host cannot be reached is told, rather than left waiting.
+///
+/// The failure mode reply routing must not introduce: an answer that never
+/// comes is indistinguishable from one that is merely slow, and a caller
+/// blocked on it holds whatever it was doing open.
+#[tokio::test]
+async fn an_ask_to_an_unreachable_host_fails_rather_than_hanging() {
+    let cluster = TestCluster::of_size(3).await;
+    let id = "gone";
+    let host = cluster.host_of(id);
+    let elsewhere = (host + 1) % 3;
+
+    cluster.net.remove(cluster.nodes[host].local());
+
+    let remote = cluster
+        .system(elsewhere)
+        .actor_of::<Counter>(id)
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), remote.ask(CounterCmd::Get))
+        .await
+        .expect("ask must return rather than hang");
+    assert!(outcome.is_err());
 }
 
 /// A redelivered command is applied once.
@@ -517,12 +541,19 @@ async fn a_redelivered_command_is_applied_once() {
     let env = Envelope {
         kind: "counter".into(),
         id: id.into(),
-        correlation: None,
         message_id: 42,
         payload,
     };
-    cluster.system(host).dispatch(env.clone()).await.unwrap();
-    cluster.system(host).dispatch(env).await.unwrap();
+    cluster
+        .system(host)
+        .dispatch(horsie_actor::Message::Command(env.clone()))
+        .await
+        .unwrap();
+    cluster
+        .system(host)
+        .dispatch(horsie_actor::Message::Command(env))
+        .await
+        .unwrap();
     settle().await;
 
     assert_eq!(

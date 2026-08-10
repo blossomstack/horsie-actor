@@ -40,15 +40,4 @@ pub enum TellError {
     /// the host is unreachable, or the command would not encode.
     #[error("the command could not be delivered to the host")]
     Undeliverable,
-
-    /// `ask` was used on an actor hosted by another node, and a reply cannot
-    /// yet be routed back across a host boundary.
-    ///
-    /// Refused immediately rather than left to hang. A reply handle does not
-    /// survive being carried to another host: it either fails to encode, or —
-    /// if the field was skipped to make the command encodable — arrives absent,
-    /// the handler answers nobody, and the caller waits forever. An error the
-    /// caller can see beats a request that never returns.
-    #[error("ask is not yet routable to an actor hosted on another node")]
-    AskNotRoutable,
 }

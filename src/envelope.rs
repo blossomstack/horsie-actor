@@ -14,6 +14,28 @@ impl std::fmt::Display for NodeId {
     }
 }
 
+/// An answer travelling back to whoever asked.
+///
+/// Not addressed to an actor, which is why it is not an [`Envelope`]: a reply
+/// belongs to a *caller*, and the correlation id is how the origin node finds
+/// the one still waiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reply {
+    /// Minted by the origin node when the reply handle was encoded.
+    pub correlation: u128,
+    /// The encoded answer.
+    pub payload: Vec<u8>,
+}
+
+/// Anything one node sends another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Message {
+    /// A command for an actor.
+    Command(Envelope),
+    /// An answer for a caller.
+    Reply(Reply),
+}
+
 /// One addressed message between nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -21,17 +43,6 @@ pub struct Envelope {
     pub kind: String,
     /// Instance id within that type.
     pub id: String,
-    /// Set when the sender wants an answer; echoed on the reply so the sender
-    /// can match it to the caller still waiting.
-    ///
-    /// **Always `None` today.** Routing a reply back across a host boundary is
-    /// not built — [`ActorRef::ask`] refuses a remote target rather than
-    /// hanging — so nothing populates or reads this yet. It is here because the
-    /// wire format is the thing most expensive to change later, not because it
-    /// is in use.
-    ///
-    /// [`ActorRef::ask`]: crate::ActorRef::ask
-    pub correlation: Option<u128>,
     /// Deduplication key. The receiver remembers these, so a redelivery after a
     /// retry is dropped rather than applied a second time — which is what turns
     /// at-least-once delivery into effectively-once processing.
