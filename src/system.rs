@@ -332,13 +332,15 @@ impl SystemInner {
         if let Some(link) = self.resolve_local::<C>(path) {
             return Some(link);
         }
-        // Not here. If the address is clustered it may be somewhere else, and
-        // the caller must not be able to tell the difference.
+        // Not here. An actor lives where its nearest clustered ancestor lives,
+        // so that ancestor — not this path — is what placement is asked about.
+        // A path with no clustered ancestor is local, full stop.
         let cluster = self.cluster.as_ref()?;
-        if !self.settings.at(path).clustered.value || cluster.owns(&path.to_string()) {
+        let route = self.settings.clustered_prefix(path)?;
+        if cluster.owns(&route.to_string()) {
             return None;
         }
-        self.remote_link::<C>(path, cluster.clone())
+        self.remote_link::<C>(path, &route, cluster.clone())
     }
 
     /// Whatever is running here at `path`.
@@ -368,13 +370,16 @@ impl SystemInner {
     fn remote_link<C: Send + 'static>(
         &self,
         path: &ActorPath,
+        route: &ActorPath,
         cluster: Arc<ClusterNode>,
     ) -> Option<Link<C>> {
         let wire = self.wire::<C>()?;
         let address = path.to_string();
+        let route = route.to_string();
         Some(Link::Remote(Arc::new(move |cmd: C| {
             let cluster = cluster.clone();
             let address = address.clone();
+            let route = route.clone();
             let wire = wire.clone();
             Box::pin(async move {
                 // Encoded inside the router context, which is what registers any
@@ -385,7 +390,7 @@ impl SystemInner {
                 let payload = crate::reply::with_router(router, || (wire.encode)(&cmd))
                     .ok_or(TellError::Undeliverable)?;
                 cluster
-                    .send(&address, payload, cluster.next_message_id())
+                    .send(&route, &address, payload, cluster.next_message_id())
                     .await
                     .map_err(|_| TellError::Undeliverable)
             })
@@ -587,7 +592,9 @@ impl ActorSystem {
         if clustered
             && let Some(cluster) = &self.inner.cluster
             && !cluster.owns(&path.to_string())
-            && let Some(link) = self.inner.remote_link::<A::Command>(&path, cluster.clone())
+            && let Some(link) = self
+                .inner
+                .remote_link::<A::Command>(&path, &path, cluster.clone())
         {
             return Ok(self.reference(path, Some(link)));
         }
@@ -626,6 +633,23 @@ impl ActorSystem {
             cluster.record_local_assignment(&path.to_string());
         }
         Ok(self.reference(path, Some(link)))
+    }
+
+    /// A reference to `path`, whatever is or is not there.
+    ///
+    /// The general form of [`ActorContext::parent`]: a cold reference that
+    /// resolves on its first send and fails cleanly if the address reaches
+    /// nothing. This is what makes a path an *address* rather than a label — a
+    /// node that knows the name can reach the actor without having been handed
+    /// anything.
+    ///
+    /// `C` is the caller's claim about what lives there. A wrong one does not
+    /// reach the wrong actor: resolution is typed, so it simply finds nothing.
+    ///
+    /// [`ActorContext::parent`]: crate::ActorContext::parent
+    #[must_use]
+    pub fn reference_at<C: Send + 'static>(&self, path: ActorPath) -> ActorRef<C> {
+        self.reference(path, None)
     }
 
     /// What applies at `path`, and which configured pattern decided each part.
@@ -868,7 +892,9 @@ impl ActorSystem {
 
         if let Some(cluster) = &self.inner.cluster
             && !cluster.owns(&path.to_string())
-            && let Some(link) = self.inner.remote_link::<A::Command>(&path, cluster.clone())
+            && let Some(link) = self
+                .inner
+                .remote_link::<A::Command>(&path, &path, cluster.clone())
         {
             return Ok(self.reference(path, Some(link)));
         }

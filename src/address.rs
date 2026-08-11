@@ -262,6 +262,28 @@ impl SettingsTable {
         Settings { clustered }
     }
 
+    /// The deepest ancestor-or-self of `path` that is a clustered singleton.
+    ///
+    /// This is what placement is keyed on, because **an actor lives where its
+    /// nearest clustered ancestor lives**. Only some actors are placed by the
+    /// cluster; the rest are ordinary children that live with their parent, so
+    /// resolving `/acct-7/session-3` when only `/acct-7` is clustered means
+    /// routing to whoever hosts `/acct-7` and walking the rest locally.
+    ///
+    /// `None` for a path with no clustered ancestor at all, which is every path
+    /// in a deployment that configures nothing.
+    #[must_use]
+    pub fn clustered_prefix(&self, path: &ActorPath) -> Option<ActorPath> {
+        let mut candidate = Some(path.clone());
+        while let Some(current) = candidate {
+            if self.at(&current).clustered.value {
+                return Some(current);
+            }
+            candidate = current.parent();
+        }
+        None
+    }
+
     /// Whether anything is configured at all — the single-node shortcut.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -387,6 +409,52 @@ mod tests {
         let settings = table.at(&path(&["acct-7", "session-3"]));
         assert!(settings.clustered.value);
         assert_eq!(settings.clustered.set_by, Some(pattern("/acct-7/*")));
+    }
+
+    /// An actor lives where its nearest clustered ancestor lives, so a child of
+    /// a clustered actor is placed by that ancestor's address, not its own.
+    #[test]
+    fn the_clustered_prefix_is_the_deepest_clustered_ancestor() {
+        let table = SettingsTable::new()
+            .with(pattern("/*"), ActorSettings::clustered())
+            .unwrap();
+
+        // Itself, when it is the clustered one.
+        assert_eq!(
+            table.clustered_prefix(&path(&["acct-7"])),
+            Some(path(&["acct-7"]))
+        );
+        // Its ancestor, for an ordinary child that lives with its parent.
+        assert_eq!(
+            table.clustered_prefix(&path(&["acct-7", "session-3", "agent-main"])),
+            Some(path(&["acct-7"]))
+        );
+    }
+
+    /// The deepest one, so a clustered child is placed on its own address rather
+    /// than inheriting its parent's.
+    #[test]
+    fn a_deeper_clustered_entry_wins_the_prefix() {
+        let table = SettingsTable::new()
+            .with(pattern("/*"), ActorSettings::clustered())
+            .unwrap()
+            .with(pattern("/*/*"), ActorSettings::clustered())
+            .unwrap();
+        assert_eq!(
+            table.clustered_prefix(&path(&["acct-7", "session-3", "agent-main"])),
+            Some(path(&["acct-7", "session-3"]))
+        );
+    }
+
+    /// Nothing configured means nothing is placed by the cluster, which is the
+    /// single-node deployment.
+    #[test]
+    fn nothing_configured_has_no_clustered_prefix() {
+        let table = SettingsTable::new();
+        assert_eq!(
+            table.clustered_prefix(&path(&["acct-7", "session-3"])),
+            None
+        );
     }
 
     /// One pattern twice would put declaration order back in charge, so a table

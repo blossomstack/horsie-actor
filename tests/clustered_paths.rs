@@ -29,6 +29,7 @@ struct Worker {
 #[derive(Serialize, Deserialize)]
 enum Job {
     Which(ReplyTo<u32>),
+    MakeHelper,
 }
 
 #[async_trait]
@@ -36,10 +37,42 @@ impl Actor for Worker {
     type Command = Job;
     type ParentCommand = Root;
 
-    async fn handle(&mut self, cmd: Job, _ctx: &mut ActorContext<Job>) -> Flow {
+    async fn handle(&mut self, cmd: Job, ctx: &mut ActorContext<Job>) -> Flow {
         match cmd {
             Job::Which(reply) => {
                 let _ = reply.send(self.generation);
+                Flow::Continue
+            }
+            Job::MakeHelper => {
+                ctx.actor_of("helper", Helper)
+                    .expect("the child should start");
+                Flow::Continue
+            }
+        }
+    }
+}
+
+/// An ordinary child of a `Worker`: not itself a clustered address, so it lives
+/// wherever its parent does.
+struct Helper;
+
+#[derive(Serialize, Deserialize)]
+enum Errand {
+    Who(ReplyTo<u32>),
+}
+
+#[async_trait]
+impl Actor for Helper {
+    type Command = Errand;
+    type ParentCommand = Job;
+
+    async fn handle(&mut self, cmd: Errand, ctx: &mut ActorContext<Errand, Job>) -> Flow {
+        match cmd {
+            Errand::Who(reply) => {
+                // Answers with its parent's generation, so reaching the child
+                // proves the whole chain resolved.
+                let generation = ctx.parent().ask(Job::Which).await.unwrap_or(0);
+                let _ = reply.send(generation);
                 Flow::Continue
             }
         }
@@ -242,6 +275,7 @@ impl Cluster {
             .expect("raft should start");
             let system = ActorSystem::clustered(journal.clone(), node.clone(), settings.clone());
             system.register_clusterable::<Worker>();
+            system.register_clusterable::<Helper>();
             if let Some(mut inbox) = node.incoming() {
                 let system = system.clone();
                 tokio::spawn(async move {
@@ -379,4 +413,49 @@ async fn a_ref_survives_a_relocation() {
 
     // Nothing was done to `held`.
     assert_eq!(generation(&held).await, 2);
+}
+
+/// **An actor lives where its nearest clustered ancestor lives.** `/w` is
+/// clustered; `/w/helper` is not, so it lives with its parent — and a node that
+/// hosts neither reaches it by routing to whoever hosts `/w` and walking the
+/// rest locally.
+///
+/// This is what keeps clustering something you turn on for a few addresses
+/// rather than for every actor in the tree.
+#[tokio::test]
+async fn a_child_is_reached_through_its_clustered_ancestor() {
+    let cluster = Cluster::of_size(3, &everything_clustered()).await;
+    let host = cluster.host_of("/w", &[]).await;
+    let onlooker = (host + 1) % 3;
+
+    let owner = cluster.systems[host]
+        .actor_of("w", Worker { generation: 5 })
+        .unwrap();
+    owner.tell(Job::MakeHelper).await.unwrap();
+
+    // `/w/helper` matches no pattern, so it is a local actor — but its ancestor
+    // is clustered, and that is what placement is asked about.
+    let child = ActorPath::root().child("w").child("helper");
+    assert!(
+        !cluster.systems[onlooker]
+            .settings_at(&child)
+            .clustered
+            .value
+    );
+
+    let from_afar: ActorRef<Errand> = cluster.systems[onlooker].reference_at(child);
+    assert_eq!(from_afar.ask(Errand::Who).await.unwrap(), 5);
+}
+
+/// A path with no clustered ancestor is local, full stop — naming it from
+/// another node reaches nothing rather than being routed somewhere arbitrary.
+#[tokio::test]
+async fn a_path_with_no_clustered_ancestor_is_not_routed() {
+    let cluster = Cluster::of_size(3, &SettingsTable::new()).await;
+    cluster.systems[0]
+        .actor_of("w", Worker { generation: 5 })
+        .unwrap();
+
+    let elsewhere: ActorRef<Job> = cluster.systems[1].reference_at(ActorPath::root().child("w"));
+    assert!(elsewhere.ask(Job::Which).await.is_err());
 }

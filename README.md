@@ -224,6 +224,8 @@ local-only reply types that make up most of an application.
 
 Matched on the address, not the actor's type, because resolution happens before the actor exists: a node asked for `/acct-7/session-3` has to decide whether that path is clustered with nothing at the path to ask. The default is local, so a single-node deployment configures none of this.
 
+**An actor lives where its nearest clustered ancestor lives.** Only some addresses are placed by the cluster; the rest are ordinary children that live with their parent. Resolving a path means routing to the host of its deepest clustered prefix and walking the remaining segments there — so clustering stays something you turn on for a few addresses rather than for every actor in the tree.
+
 Config *chooses*; it cannot *grant*. A clustered actor's commands must round-trip, and no setting makes them — so `register_clusterable::<A>()` is where that is proved, and creating an actor at a clustered address without it fails there, naming the path and the type.
 
 Three things, kept separate:

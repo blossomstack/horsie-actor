@@ -291,7 +291,11 @@ impl ClusterNode {
         }
     }
 
-    /// Send an already-encoded command to whichever node hosts `path`.
+    /// Send an already-encoded command to whichever node hosts `route`.
+    ///
+    /// `route` and `address` differ whenever the target is an ordinary child of
+    /// a clustered actor: placement knows the ancestor, and the envelope carries
+    /// the full path so the receiving node can walk the rest locally.
     ///
     /// Retries, because a caller cannot usefully do it: each attempt re-resolves
     /// the owner, so a send racing a failover lands on the new host rather than
@@ -299,19 +303,20 @@ impl ClusterNode {
     /// promise — an undeliverable command is dropped and its caller told.
     pub async fn send(
         &self,
-        path: &str,
+        route: &str,
+        address: &str,
         payload: Vec<u8>,
         message_id: u128,
     ) -> Result<(), TransportError> {
         let mut last = None;
         for attempt in 0..SEND_ATTEMPTS {
-            let Some(owner) = self.owner_of(path) else {
+            let Some(owner) = self.owner_of(route) else {
                 return Err(TransportError::Io(format!(
-                    "no live member can host {path}"
+                    "no live member can host {route}"
                 )));
             };
             let env = Envelope {
-                path: path.to_owned(),
+                path: address.to_owned(),
                 message_id,
                 payload: payload.clone(),
             };
@@ -326,7 +331,7 @@ impl ClusterNode {
                 }
             }
         }
-        Err(last.unwrap_or_else(|| TransportError::Io(format!("gave up delivering to {path}"))))
+        Err(last.unwrap_or_else(|| TransportError::Io(format!("gave up delivering to {address}"))))
     }
 
     /// The stream of messages arriving here, taken once.
