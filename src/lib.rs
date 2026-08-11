@@ -8,8 +8,16 @@
 //! persistence out of the mailbox loop and lets both kinds be spawned,
 //! addressed and hosted identically.
 //!
-//! [`ActorSystem`] owns the journal, the registry of actor types that can be
-//! reached by id, and the instances currently running. Registered types can be
+//! Every actor has an [`ActorPath`] — `/acct-7/session-3/agent-main` — and an
+//! [`ActorRef`] is that path plus a cached link to whatever it resolves to right
+//! now. A send that fails drops the cache, resolves once more and retries, so a
+//! reference held across a restart or a reactivation keeps working without its
+//! holder knowing anything happened. A path is created by its parent and never
+//! by resolution: a reference cannot wake an actor nobody asked for.
+//!
+//! [`ActorSystem`] owns the journal, every actor currently running (keyed by
+//! path) and the registry of actor types that can be
+//! reached by id. Registered types can be
 //! hosted across several nodes: membership is agreed by Raft, placement hashes
 //! over the members the leader reports as live, replies route back to whoever
 //! asked, and a node that cannot see a quorum stops what it hosts. None of that is what keeps a log consistent —
@@ -25,6 +33,7 @@ mod cluster;
 mod envelope;
 mod error;
 mod journal;
+mod path;
 mod persistence_id;
 mod persistent;
 mod reply;
@@ -36,7 +45,7 @@ mod transport;
 mod transport_tcp;
 
 pub use actor::{CommandEffect, EventSourcedActor};
-pub use behaviour::{Actor, Flow, StartError};
+pub use behaviour::{Actor, Flow, Root, StartError};
 pub use cluster::{
     Assignment, ClusterConfig, ClusterNode, Dedup, InstanceKey, LiveSet, Membership, NodeIdx,
     PlacementCommand, PlacementEffect, PlacementTable, RaftStore, serve_consensus,
@@ -47,6 +56,7 @@ pub use journal::{InMemoryJournal, Journal, JournalResult};
 // Re-exported so a caller can read `ClusterNode::raft().metrics()` without
 // taking its own dependency on openraft.
 pub use openraft::type_config::async_runtime::watch::WatchReceiver;
+pub use path::{ActorPath, is_valid_name};
 pub use persistence_id::PersistenceId;
 pub use persistent::Persistent;
 pub use reply::{ReplyDropped, ReplyRouter, ReplyTo};

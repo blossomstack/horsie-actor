@@ -9,9 +9,9 @@
 
 use async_trait::async_trait;
 use horsie_actor::{
-    ActorContext, ActorRef, ActorSystem, ClusterActor, ClusterConfig, ClusterNode, CommandEffect,
-    Envelope, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, RaftStore,
-    ReplyTo,
+    ActorContext, ActorPath, ActorRef, ActorSystem, ClusterActor, ClusterConfig, ClusterNode,
+    CommandEffect, Envelope, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId,
+    RaftStore, ReplyTo, Root,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -52,6 +52,7 @@ impl EventSourcedActor for Counter {
     type Command = CounterCmd;
     type Event = Incremented;
     type State = CounterState;
+    type ParentCommand = Root;
 
     fn persistence_id(&self) -> PersistenceId {
         PersistenceId::new("counter", self.id.clone())
@@ -76,7 +77,7 @@ impl EventSourcedActor for Counter {
                 CommandEffect::none()
             }
             CounterCmd::IncOther { id, by } => {
-                if let Ok(peer) = _ctx.actor_of::<Counter>(&id).await {
+                if let Ok(peer) = _ctx.singleton_of::<Counter>(&id).await {
                     let _ = peer.tell(CounterCmd::Inc(by)).await;
                 }
                 CommandEffect::none()
@@ -90,8 +91,8 @@ impl ClusterActor for Counter {
     type Command = CounterCmd;
     type Deps = ();
 
-    fn spawn(id: &str, _deps: (), system: &ActorSystem) -> ActorRef<CounterCmd> {
-        system.spawn_persistent(Counter { id: id.to_owned() })
+    fn spawn(id: &str, _deps: (), system: &ActorSystem, path: ActorPath) -> ActorRef<CounterCmd> {
+        system.spawn_persistent_at(path, Counter { id: id.to_owned() })
     }
 }
 
@@ -232,7 +233,11 @@ fn spawn_dispatch_loop(system: &ActorSystem, node: &Arc<ClusterNode>) {
 /// thing it is trying to prove.
 async fn value_at_host(cluster: &TestCluster, id: &str) -> i64 {
     let host = cluster.host_of(id);
-    let actor = cluster.system(host).actor_of::<Counter>(id).await.unwrap();
+    let actor = cluster
+        .system(host)
+        .singleton_of::<Counter>(id)
+        .await
+        .unwrap();
     actor.ask(CounterCmd::Get).await.unwrap()
 }
 
@@ -255,7 +260,7 @@ async fn a_caller_reaches_an_instance_hosted_on_another_node() {
 
     let remote = cluster
         .system(elsewhere)
-        .actor_of::<Counter>(id)
+        .singleton_of::<Counter>(id)
         .await
         .unwrap();
     remote.tell(CounterCmd::Inc(5)).await.unwrap();
@@ -274,7 +279,7 @@ async fn all_nodes_address_one_instance() {
     for i in 0..3 {
         cluster
             .system(i)
-            .actor_of::<Counter>(id)
+            .singleton_of::<Counter>(id)
             .await
             .unwrap()
             .tell(CounterCmd::Inc(1))
@@ -297,7 +302,7 @@ async fn an_instance_survives_the_death_of_its_host() {
 
     cluster
         .system(host)
-        .actor_of::<Counter>(id)
+        .singleton_of::<Counter>(id)
         .await
         .unwrap()
         .tell(CounterCmd::Inc(5))
@@ -314,7 +319,7 @@ async fn an_instance_survives_the_death_of_its_host() {
     assert_ne!(new_host, host, "the instance stayed on the dead node");
     let revived = cluster
         .system(new_host)
-        .actor_of::<Counter>(id)
+        .singleton_of::<Counter>(id)
         .await
         .unwrap();
     revived.tell(CounterCmd::Inc(3)).await.unwrap();
@@ -387,7 +392,11 @@ async fn starting_an_instance_writes_nothing() {
     let pid = PersistenceId::new("counter", id);
 
     let host = cluster.host_of(id);
-    let _actor = cluster.system(host).actor_of::<Counter>(id).await.unwrap();
+    let _actor = cluster
+        .system(host)
+        .singleton_of::<Counter>(id)
+        .await
+        .unwrap();
 
     assert_eq!(
         cluster.journal.last_seq(&pid).await.unwrap(),
@@ -410,7 +419,7 @@ async fn a_displaced_host_stops_writing() {
     let first_host = cluster.host_of(id);
     let stale = cluster
         .system(first_host)
-        .actor_of::<Counter>(id)
+        .singleton_of::<Counter>(id)
         .await
         .unwrap();
     stale.tell(CounterCmd::Inc(5)).await.unwrap();
@@ -427,9 +436,12 @@ async fn a_displaced_host_stops_writing() {
     // Read through a freshly recovered instance rather than the stale actor's
     // own memory, since the point is what actually reached the journal.
     let elsewhere = (first_host + 1) % 3;
-    let fresh = cluster
-        .system(elsewhere)
-        .spawn_persistent(Counter { id: id.to_owned() });
+    // Unregistered, and deliberately: a second incarnation over the same
+    // journal, which is what a peer taking the instance over would be.
+    let fresh = cluster.system(elsewhere).spawn_persistent_at(
+        ActorPath::root().child("fresh"),
+        Counter { id: id.to_owned() },
+    );
     let value = fresh.ask(CounterCmd::Get).await.unwrap();
     assert_eq!(
         value, 12,
@@ -451,7 +463,11 @@ async fn a_displaced_host_stops_instead_of_serving_stale() {
     let pid = PersistenceId::new("counter", id);
 
     let host = cluster.host_of(id);
-    let actor = cluster.system(host).actor_of::<Counter>(id).await.unwrap();
+    let actor = cluster
+        .system(host)
+        .singleton_of::<Counter>(id)
+        .await
+        .unwrap();
     actor.tell(CounterCmd::Inc(1)).await.unwrap();
     settle().await;
 
@@ -491,7 +507,7 @@ async fn ask_reaches_an_actor_on_another_host() {
     // the real instance could know.
     cluster
         .system(host)
-        .actor_of::<Counter>(id)
+        .singleton_of::<Counter>(id)
         .await
         .unwrap()
         .tell(CounterCmd::Inc(9))
@@ -501,7 +517,7 @@ async fn ask_reaches_an_actor_on_another_host() {
 
     let remote = cluster
         .system(elsewhere)
-        .actor_of::<Counter>(id)
+        .singleton_of::<Counter>(id)
         .await
         .unwrap();
 
@@ -528,7 +544,7 @@ async fn an_ask_to_an_unreachable_host_fails_rather_than_hanging() {
 
     let remote = cluster
         .system(elsewhere)
-        .actor_of::<Counter>(id)
+        .singleton_of::<Counter>(id)
         .await
         .unwrap();
 
@@ -597,7 +613,7 @@ async fn a_send_to_a_departed_host_fails_rather_than_re_aiming() {
 
     let remote = cluster
         .system(elsewhere)
-        .actor_of::<Counter>(id)
+        .singleton_of::<Counter>(id)
         .await
         .unwrap();
     assert!(
@@ -621,7 +637,7 @@ async fn a_send_lands_elsewhere_once_the_cluster_agrees_the_host_is_gone() {
 
     let remote = cluster
         .system(elsewhere)
-        .actor_of::<Counter>(id)
+        .singleton_of::<Counter>(id)
         .await
         .unwrap();
     remote.tell(CounterCmd::Inc(7)).await.unwrap();
@@ -679,7 +695,7 @@ async fn a_minority_node_refuses_to_host() {
 
     let outcome = cluster
         .system(odd_one_out)
-        .actor_of::<Counter>("orphan")
+        .singleton_of::<Counter>("orphan")
         .await;
     assert!(
         matches!(outcome, Err(horsie_actor::ActorOfError::NotServing)),
@@ -702,7 +718,11 @@ async fn losing_quorum_stops_hosted_instances() {
         .find(|id| cluster.nodes[0].owns("counter", id))
         .expect("some id must land on node 0");
 
-    let actor = cluster.system(0).actor_of::<Counter>(&id).await.unwrap();
+    let actor = cluster
+        .system(0)
+        .singleton_of::<Counter>(&id)
+        .await
+        .unwrap();
     actor.tell(CounterCmd::Inc(1)).await.unwrap();
     settle().await;
     assert!(actor.is_alive());
@@ -749,7 +769,7 @@ async fn a_node_recovers_when_quorum_returns() {
                 .expect("some id must land back on this node");
             cluster
                 .system(odd_one_out)
-                .actor_of::<Counter>(&id)
+                .singleton_of::<Counter>(&id)
                 .await
                 .expect("a node with quorum must host again");
             return;
@@ -776,12 +796,12 @@ async fn no_node_holds_a_private_view_of_who_is_live() {
     let before = cluster.nodes[elsewhere].live_members();
     let _ = cluster
         .system(elsewhere)
-        .actor_of::<Counter>("nowhere")
+        .singleton_of::<Counter>("nowhere")
         .await;
     cluster.net.remove(cluster.nodes[0].local());
     let _ = cluster
         .system(elsewhere)
-        .actor_of::<Counter>("nowhere")
+        .singleton_of::<Counter>("nowhere")
         .await;
     assert_eq!(
         cluster.nodes[elsewhere].live_members(),
@@ -842,7 +862,7 @@ async fn an_actor_reaches_another_instance_by_id() {
 
     let caller = cluster
         .system(cluster.host_of(&from))
-        .actor_of::<Counter>(&from)
+        .singleton_of::<Counter>(&from)
         .await
         .unwrap();
     caller
@@ -884,7 +904,10 @@ async fn an_actor_spawned_before_the_first_election_survives() {
     assert!(!node.serving());
 
     let system = ActorSystem::clustered(journal, node);
-    let actor = system.spawn_persistent(Counter { id: "early".into() });
+    let actor = system.spawn_persistent_at(
+        ActorPath::root().child("early"),
+        Counter { id: "early".into() },
+    );
     settle().await;
     assert!(
         actor.is_alive(),

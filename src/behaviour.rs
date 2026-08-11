@@ -8,8 +8,10 @@ use thiserror::Error;
 pub enum Flow {
     /// Keep processing the mailbox.
     Continue,
-    /// Stop the actor. Its mailbox is dropped, and every [`ActorRef`] to it
-    /// starts failing with [`TellError::MailboxClosed`].
+    /// Stop the actor. Its mailbox is dropped, so an [`ActorRef`] to it fails
+    /// with [`TellError::MailboxClosed`] — until somebody creates an actor at
+    /// the same path again, at which point the same reference reaches the new
+    /// one. A reference names a path, not an instance.
     ///
     /// [`ActorRef`]: crate::ActorRef
     /// [`TellError::MailboxClosed`]: crate::TellError::MailboxClosed
@@ -40,18 +42,50 @@ pub trait Actor: Send + Sized + 'static {
     /// Messages the actor accepts.
     type Command: Send + 'static;
 
+    /// What this actor's parent accepts — and so what
+    /// [`ActorContext::parent`] hands back a reference to. [`Root`] for a
+    /// top-level actor, whose parent takes no messages at all.
+    ///
+    /// An associated type rather than a lookup by name, so a child reaching
+    /// upwards is checked by the compiler. The parent's *commands* rather than
+    /// the parent's type, because that is all a child depends on — and because
+    /// it is what lets a test put a double at the parent's path without the
+    /// child knowing or the parent's implementation being nameable.
+    ///
+    /// [`ActorContext::parent`]: crate::ActorContext::parent
+    type ParentCommand: Send + 'static;
+
     /// Handle one command, then say whether to keep going.
-    async fn handle(&mut self, cmd: Self::Command, ctx: &mut ActorContext<Self::Command>) -> Flow;
+    async fn handle(
+        &mut self,
+        cmd: Self::Command,
+        ctx: &mut ActorContext<Self::Command, Self::ParentCommand>,
+    ) -> Flow;
 
     /// Runs once before the first command is handled.
     ///
     /// Returning `Err` aborts startup: the actor processes nothing and its
     /// mailbox closes. That is the honest outcome for a failed recovery — an
     /// actor that cannot rebuild its state has nothing to serve.
-    async fn on_start(&mut self, _ctx: &mut ActorContext<Self::Command>) -> Result<(), StartError> {
+    async fn on_start(
+        &mut self,
+        _ctx: &mut ActorContext<Self::Command, Self::ParentCommand>,
+    ) -> Result<(), StartError> {
         Ok(())
     }
 }
+
+/// What the root of the tree accepts: nothing.
+///
+/// `/` exists so that every actor has a parent and a path has somewhere to
+/// start. It is not a guardian, it does not supervise, and it holds no
+/// behaviour — so an actor at the top declares `type ParentCommand = Root` and
+/// gets a reference from [`ActorContext::parent`] it can hold and never send
+/// through. This type has no values; the type system is what says root takes no
+/// messages, rather than a runtime error on the first attempt.
+///
+/// [`ActorContext::parent`]: crate::ActorContext::parent
+pub enum Root {}
 
 #[cfg(test)]
 #[allow(
@@ -77,6 +111,7 @@ mod tests {
     #[async_trait]
     impl Actor for Adder {
         type Command = Cmd;
+        type ParentCommand = Root;
 
         async fn handle(&mut self, cmd: Cmd, _ctx: &mut ActorContext<Cmd>) -> Flow {
             match cmd {
@@ -98,7 +133,7 @@ mod tests {
     #[tokio::test]
     async fn plain_actor_needs_no_journal() {
         let system = ActorSystem::in_memory();
-        let actor = system.spawn(Adder { total: 0 });
+        let actor = system.actor_of("adder", Adder { total: 0 }).unwrap();
         actor.tell(Cmd::Add(2)).await.unwrap();
         actor.tell(Cmd::Add(3)).await.unwrap();
         let (tx, rx) = oneshot::channel();
@@ -114,13 +149,14 @@ mod tests {
         #[async_trait]
         impl Actor for Stopper {
             type Command = ();
+            type ParentCommand = Root;
             async fn handle(&mut self, _cmd: (), _ctx: &mut ActorContext<()>) -> Flow {
                 Flow::Stop
             }
         }
 
         let system = ActorSystem::in_memory();
-        let actor = system.spawn(Stopper);
+        let actor = system.actor_of("stopper", Stopper).unwrap();
         actor.tell(()).await.unwrap();
         // Loop rather than sleep: the stop is processed on the actor's own task,
         // so the close is observable soon but not synchronously.

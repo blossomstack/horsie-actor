@@ -1,16 +1,24 @@
-use crate::behaviour::{Actor, Flow};
+use crate::actor::EventSourcedActor;
+use crate::behaviour::{Actor, Flow, Root};
 use crate::error::TellError;
 use crate::journal::Journal;
+use crate::path::{ActorPath, is_valid_name};
 use crate::reply::ReplyTo;
-use crate::system::SystemInner;
-use std::sync::Arc;
+use crate::system::{ActorOfError, SystemInner};
+use parking_lot::Mutex;
+use std::marker::PhantomData;
+use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
 
 /// Mailbox capacity for every spawned actor.
 pub(crate) const MAILBOX_CAPACITY: usize = 64;
 
-/// How a reference actually reaches its actor.
-enum Reach<C> {
+/// Where a path currently resolves to.
+///
+/// A *cache*, not an identity. The identity is the path; this is how to reach
+/// whatever is at it right now, and it is replaced rather than repaired when the
+/// instance behind it goes away.
+pub(crate) enum Link<C> {
     /// The actor's mailbox, in this process.
     Local(mpsc::Sender<C>),
     /// A closure that encodes the command and ships it to whichever node hosts
@@ -19,91 +27,151 @@ enum Reach<C> {
     Remote(RemoteSend<C>),
 }
 
-type RemoteSend<C> =
+pub(crate) type RemoteSend<C> =
     Arc<dyn Fn(C) -> futures_util::future::BoxFuture<'static, Result<(), TellError>> + Send + Sync>;
 
-impl<C> Clone for Reach<C> {
+impl<C> Clone for Link<C> {
     fn clone(&self) -> Self {
         match self {
-            Reach::Local(tx) => Reach::Local(tx.clone()),
-            Reach::Remote(f) => Reach::Remote(f.clone()),
+            Link::Local(tx) => Link::Local(tx.clone()),
+            Link::Remote(f) => Link::Remote(f.clone()),
+        }
+    }
+}
+
+impl<C> Link<C> {
+    /// Whether this link still reaches something.
+    ///
+    /// A remote link has nothing to inspect and reports `true`; whether the host
+    /// is alive is a question for the send.
+    pub(crate) fn is_alive(&self) -> bool {
+        match self {
+            Link::Local(tx) => !tx.is_closed(),
+            Link::Remote(_) => true,
+        }
+    }
+
+    /// Send, handing the command back when it can still be tried elsewhere.
+    ///
+    /// A local send that fails returns the command, which is what makes a
+    /// re-resolve-and-retry possible at all. A remote one has already consumed
+    /// it — encoding takes ownership — so it returns `None` and the failure is
+    /// final.
+    async fn send(&self, cmd: C) -> Result<(), (TellError, Option<C>)>
+    where
+        C: Send + 'static,
+    {
+        match self {
+            Link::Local(tx) => tx
+                .send(cmd)
+                .await
+                .map_err(|e| (TellError::MailboxClosed, Some(e.0))),
+            Link::Remote(send) => send(cmd).await.map_err(|e| (e, None)),
         }
     }
 }
 
 /// A cheap, cloneable handle for sending commands to an actor.
 ///
-/// Says nothing about where the actor is. The same type, `tell` and `ask` work
-/// whether it is in this process or on another node, which is what lets business
-/// logic be written once and hosted either way.
+/// **A name, not a handle.** It is a path plus a cached link: the path is what
+/// the reference *is*, and the link is where that path happened to resolve last
+/// time. A send that fails drops the cache, re-resolves once and retries — so a
+/// reference held across a restart, an idle offload, or (later) a move to
+/// another node keeps working, with the holder doing nothing and knowing
+/// nothing.
+///
+/// Says nothing about *where* the actor is either. The same type, `tell` and
+/// `ask` work whether it is in this process or on another node, which is what
+/// lets business logic be written once and hosted either way.
 pub struct ActorRef<C> {
-    reach: Reach<C>,
+    path: ActorPath,
+    /// Shared across clones, so one re-resolution serves all of them. `None`
+    /// means "not resolved yet, or the last link failed" — both of which are
+    /// answered the same way, by resolving.
+    link: Arc<Mutex<Option<Link<C>>>>,
+    /// The registry to re-resolve against. Weak because the registry holds
+    /// references too; a strong one here would make every actor keep its own
+    /// system alive forever.
+    system: Weak<SystemInner>,
 }
 
-// Manual `Clone` — a `Sender<C>` clones regardless of whether `C: Clone`.
+// Manual `Clone` — the derive would demand `C: Clone`, and a handle is
+// cloneable whatever it carries.
 impl<C> Clone for ActorRef<C> {
     fn clone(&self) -> Self {
         Self {
-            reach: self.reach.clone(),
+            path: self.path.clone(),
+            link: self.link.clone(),
+            system: self.system.clone(),
         }
     }
 }
 
-// Manual too, and for the same reason: a handle is printable whether or not its
-// command type is. There is nothing useful to show beyond liveness — the
-// mailbox contents belong to the actor.
+// Manual too, and for the same reason. The path is the useful part: the mailbox
+// contents belong to the actor, and the link is an implementation detail that
+// changes under the holder.
 impl<C> std::fmt::Debug for ActorRef<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.reach {
-            Reach::Local(tx) => f
-                .debug_struct("ActorRef")
-                .field("reach", &"local")
-                .field("alive", &!tx.is_closed())
-                .finish(),
-            Reach::Remote(_) => f
-                .debug_struct("ActorRef")
-                .field("reach", &"remote")
-                .finish(),
-        }
+        f.debug_struct("ActorRef")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
 impl<C: Send + 'static> ActorRef<C> {
-    pub(crate) fn new(tx: mpsc::Sender<C>) -> Self {
+    /// A reference to `path`, with `link` as its starting cache.
+    pub(crate) fn at(path: ActorPath, link: Option<Link<C>>, system: Weak<SystemInner>) -> Self {
         Self {
-            reach: Reach::Local(tx),
+            path,
+            link: Arc::new(Mutex::new(link)),
+            system,
         }
     }
 
-    pub(crate) fn remote(send: RemoteSend<C>) -> Self {
-        Self {
-            reach: Reach::Remote(send),
-        }
+    /// The name this reference addresses.
+    #[must_use]
+    pub fn path(&self) -> &ActorPath {
+        &self.path
     }
 
-    /// Whether the actor is still running.
+    /// Whether this path currently reaches a running actor.
     ///
-    /// A local actor stops for reasons its callers never see — it asked to, or
-    /// its log moved past it and it stood down rather than serve stale. The
-    /// registry uses this to notice a dead instance and start a fresh one
-    /// instead of handing out a reference nothing is listening to. A remote
-    /// reference has nothing to inspect and reports `true`; whether the host is
-    /// alive is a question for the send.
+    /// Deliberately not part of sending: a caller does not have to check, because
+    /// a send that finds a stale link resolves the path again by itself. This
+    /// exists for the few places that genuinely ask a question about the *world*
+    /// — a test waiting for a node to stand down — rather than about a handle.
     #[must_use]
     pub fn is_alive(&self) -> bool {
-        match &self.reach {
-            Reach::Local(tx) => !tx.is_closed(),
-            Reach::Remote(_) => true,
+        if self.cached().is_some_and(|link| link.is_alive()) {
+            return true;
         }
+        self.resolve().is_some()
     }
 
     /// Deliver `cmd` to the actor's mailbox, waiting if the mailbox is full.
-    /// Fails only if the actor has stopped.
+    ///
+    /// Fails if the path reaches nothing: no actor was ever created there, or the
+    /// one that was has stopped and nobody has recreated it. A path whose actor
+    /// *has* been recreated is not a failure — the link is refreshed and the
+    /// command delivered.
     pub async fn tell(&self, cmd: C) -> Result<(), TellError> {
-        match &self.reach {
-            Reach::Local(tx) => tx.send(cmd).await.map_err(|_| TellError::MailboxClosed),
-            Reach::Remote(send) => send(cmd).await,
-        }
+        let Some(link) = self.cached() else {
+            let link = self.resolve().ok_or(TellError::MailboxClosed)?;
+            return link.send(cmd).await.map_err(|(e, _)| e);
+        };
+
+        let cmd = match link.send(cmd).await {
+            Ok(()) => return Ok(()),
+            Err((e, None)) => return Err(e),
+            Err((_, Some(cmd))) => cmd,
+        };
+
+        // Exactly once. Re-resolving in a loop would turn a genuinely dead
+        // actor into a spin against a registry that is not going to change; the
+        // second failure is the honest answer.
+        self.forget(&link);
+        let link = self.resolve().ok_or(TellError::MailboxClosed)?;
+        link.send(cmd).await.map_err(|(e, _)| e)
     }
 
     /// Send a request and await the actor's reply — the request/response pattern.
@@ -134,63 +202,191 @@ impl<C: Send + 'static> ActorRef<C> {
         // coming.
         rx.await.map_err(|_| TellError::MailboxClosed)
     }
+
+    pub(crate) fn cached(&self) -> Option<Link<C>> {
+        self.link.lock().clone()
+    }
+
+    /// Drop `stale` from the cache, unless somebody has already replaced it.
+    fn forget(&self, stale: &Link<C>) {
+        let mut slot = self.link.lock();
+        if slot.as_ref().is_some_and(|link| link.is_same(stale)) {
+            *slot = None;
+        }
+    }
+
+    /// Look the path up in the registry and cache what comes back.
+    ///
+    /// `None` when the path reaches nothing — including when it holds a stopped
+    /// actor. Resolution never *creates*: a ref that woke an actor up would break
+    /// the rule that reading a session must not load it.
+    fn resolve(&self) -> Option<Link<C>> {
+        let system = self.system.upgrade()?;
+        let found = system.resolve::<C>(&self.path)?;
+        *self.link.lock() = Some(found.clone());
+        Some(found)
+    }
 }
 
-/// Handle to the runtime from inside an actor: spawn children, reference self,
-/// and reach the journal directly when an actor manages persistence itself.
+impl<C> Link<C> {
+    /// Whether two links reach the same place, so that dropping a stale one
+    /// cannot discard a fresh one a concurrent send just resolved.
+    fn is_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Link::Local(a), Link::Local(b)) => a.same_channel(b),
+            (Link::Remote(a), Link::Remote(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// Handle to the runtime from inside an actor: its own path, its parent, its
+/// children, and the journal for actors that manage persistence themselves.
 ///
-/// Parameterized by the **command** type rather than the actor type, so an actor
-/// and an adapter wrapping it (see [`Persistent`]) hand out the same context.
-/// Parameterized by actor type they would be two incompatible types for one
-/// mailbox.
+/// Parameterized by the **command** types rather than the actor types, so an
+/// actor and an adapter wrapping it (see [`Persistent`]) hand out the same
+/// context. Parameterized by actor type they would be two incompatible types for
+/// one mailbox.
+///
+/// `PC` is the parent's command type, which is what makes [`parent`](Self::parent)
+/// a typed reference rather than a lookup by string. It defaults to [`Root`], so
+/// an actor at the top of the tree writes `ActorContext<MyCommand>` and never
+/// mentions it.
 ///
 /// [`Persistent`]: crate::Persistent
-pub struct ActorContext<C> {
+/// [`Root`]: crate::Root
+pub struct ActorContext<C, PC = Root> {
     pub(crate) inner: Arc<SystemInner>,
     pub(crate) self_tx: mpsc::Sender<C>,
+    pub(crate) path: ActorPath,
+    /// `fn() -> PC` rather than `PC`, so the context is `Send`/`Sync` on its own
+    /// merits and does not inherit the parent command type's.
+    pub(crate) parent: PhantomData<fn() -> PC>,
 }
 
-impl<C: Send + 'static> ActorContext<C> {
-    /// A reference to this actor's own mailbox.
-    pub fn self_ref(&self) -> ActorRef<C> {
-        ActorRef::new(self.self_tx.clone())
+impl<C: Send + 'static, PC: Send + 'static> ActorContext<C, PC> {
+    /// Where this actor is, which is what it is.
+    #[must_use]
+    pub fn path(&self) -> &ActorPath {
+        &self.path
     }
 
-    /// The instance of `A` registered under `id`, wherever the cluster puts it.
+    /// A reference to this actor's own mailbox.
+    #[must_use]
+    pub fn self_ref(&self) -> ActorRef<C> {
+        ActorRef::at(
+            self.path.clone(),
+            Some(Link::Local(self.self_tx.clone())),
+            Arc::downgrade(&self.inner),
+        )
+    }
+
+    /// A reference to this actor's parent.
     ///
-    /// The same resolution [`ActorSystem::actor_of`] does, reached from inside
-    /// an actor — which is where most of it happens: an actor that needs a
-    /// sibling, a parent, or a service knows the id, not the reference. Handing
-    /// references down at construction cannot survive clustering, because the
-    /// host that builds an instance may never have seen whoever would have
-    /// handed it one.
-    pub async fn actor_of<A: crate::ClusterActor>(
+    /// An ordinary reference to an ordinary path — nothing was handed down at
+    /// construction, which is what an actor built on a host that never saw its
+    /// parent needs. An actor at the top of the tree gets a reference it can
+    /// hold and never send through, because [`Root`] has no values: the type
+    /// system says root takes no messages.
+    ///
+    /// [`Root`]: crate::Root
+    #[must_use]
+    pub fn parent(&self) -> ActorRef<PC> {
+        ActorRef::at(
+            self.path.parent().unwrap_or_else(ActorPath::root),
+            None,
+            Arc::downgrade(&self.inner),
+        )
+    }
+
+    /// The child named `name`, creating it from `actor` if it is not there.
+    ///
+    /// Get-or-create: two callers naming one path get one actor, and the loser's
+    /// `actor` is dropped without ever being started. That matters most for
+    /// event-sourced children, where two instances at one name means two actors
+    /// writing one journal.
+    ///
+    /// The bound is what makes the tree honest — a child may only be created
+    /// under a parent whose commands it declared as its
+    /// [`ParentCommand`](Actor::ParentCommand).
+    pub fn actor_of<B>(&self, name: &str, actor: B) -> Result<ActorRef<B::Command>, ActorOfError>
+    where
+        B: Actor<ParentCommand = C>,
+    {
+        self.system().get_or_create(&self.path, name, actor)
+    }
+
+    /// The event-sourced child named `name`, creating it from `actor` if it is
+    /// not there. It recovers from its own `persistence_id` before accepting
+    /// commands.
+    pub fn actor_of_persistent<B>(
+        &self,
+        name: &str,
+        actor: B,
+    ) -> Result<ActorRef<B::Command>, ActorOfError>
+    where
+        B: EventSourcedActor<ParentCommand = C>,
+    {
+        self.system().get_or_create(
+            &self.path,
+            name,
+            crate::Persistent::new(actor, self.journal().clone()),
+        )
+    }
+
+    /// The instance of a registered type `A` under `id`, wherever the cluster
+    /// puts it.
+    ///
+    /// The `(kind, id)` addressing the cluster layer still uses, reached from
+    /// inside an actor. Superseded by paths — a clustered actor becomes an
+    /// ordinary path that happens to resolve to another node — but that is the
+    /// next step, not this one.
+    pub async fn singleton_of<A: crate::ClusterActor>(
         &self,
         id: &str,
-    ) -> Result<ActorRef<A::Command>, crate::ActorOfError> {
-        crate::ActorSystem::from_inner(self.inner.clone())
-            .actor_of::<A>(id)
-            .await
-    }
-
-    /// Spawn a child actor in the same system.
-    pub fn spawn<B: Actor>(&self, actor: B) -> ActorRef<B::Command> {
-        crate::system::spawn_in(actor, self.inner.clone())
-    }
-
-    /// Spawn an event-sourced child. It recovers from its own `persistence_id`
-    /// before accepting commands.
-    pub fn spawn_persistent<B: crate::actor::EventSourcedActor>(
-        &self,
-        actor: B,
-    ) -> ActorRef<B::Command> {
-        crate::system::spawn_persistent_in(actor, self.inner.clone())
+    ) -> Result<ActorRef<A::Command>, ActorOfError> {
+        self.system().singleton_of::<A>(id).await
     }
 
     /// Direct journal access for actors that manage persistence themselves
     /// (e.g. copying a snapshot to seed a forked instance).
+    #[must_use]
     pub fn journal(&self) -> &Arc<dyn Journal> {
         &self.inner.journal
+    }
+
+    fn system(&self) -> crate::ActorSystem {
+        crate::ActorSystem::from_inner(self.inner.clone())
+    }
+}
+
+/// Start an actor at `path` and return the link to its mailbox.
+///
+/// Registration is deliberately not here: the registry is the one thing that
+/// decides what lives at a path, and a spawn that also registered would give it
+/// a second owner.
+pub(crate) fn spawn_at<A: Actor>(
+    actor: A,
+    inner: Arc<SystemInner>,
+    path: ActorPath,
+) -> Link<A::Command> {
+    let (tx, rx) = tokio::sync::mpsc::channel(MAILBOX_CAPACITY);
+    let ctx = ActorContext {
+        inner,
+        self_tx: tx.clone(),
+        path,
+        parent: PhantomData,
+    };
+    tokio::spawn(run_actor(actor, rx, ctx));
+    Link::Local(tx)
+}
+
+/// Reject a name that could not be one path segment.
+pub(crate) fn check_name(name: &str) -> Result<(), ActorOfError> {
+    if is_valid_name(name) {
+        Ok(())
+    } else {
+        Err(ActorOfError::InvalidName(name.to_owned()))
     }
 }
 
@@ -204,13 +400,13 @@ impl<C: Send + 'static> ActorContext<C> {
 pub(crate) async fn run_actor<A: Actor>(
     mut actor: A,
     mut rx: mpsc::Receiver<A::Command>,
-    mut ctx: ActorContext<A::Command>,
+    mut ctx: ActorContext<A::Command, A::ParentCommand>,
 ) {
     let mut stand_down = ctx.inner.stand_down.clone();
     stand_down.mark_unchanged();
 
     if let Err(e) = actor.on_start(&mut ctx).await {
-        tracing::error!(error = %e, "actor failed to start; shutting down");
+        tracing::error!(path = %ctx.path, error = %e, "actor failed to start; shutting down");
         return;
     }
 
