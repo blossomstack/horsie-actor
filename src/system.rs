@@ -375,6 +375,12 @@ impl ActorSystem {
     /// The escape hatch a [`ClusterActor::spawn`] implementation uses: the
     /// registry decides what lives at a path, so a spawn that also registered
     /// would give that fact a second owner.
+    ///
+    /// Nothing else should reach for this. An unregistered actor is not at its
+    /// path as far as resolution is concerned, so the returned reference is the
+    /// only way to it and dies with it, and a second actor started at a path
+    /// something is already registered at is invisible to everyone but its
+    /// creator. [`actor_of`](Self::actor_of) is what an ordinary caller wants.
     pub fn spawn_at<A: Actor>(&self, path: ActorPath, actor: A) -> ActorRef<A::Command> {
         let link = spawn_at(actor, self.inner.clone(), path.clone());
         self.reference(path, Some(link))
