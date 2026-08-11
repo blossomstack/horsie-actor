@@ -57,7 +57,7 @@ impl<C> Link<C> {
     /// re-resolve-and-retry possible at all. A remote one has already consumed
     /// it — encoding takes ownership — so it returns `None` and the failure is
     /// final.
-    async fn send(&self, cmd: C) -> Result<(), (TellError, Option<C>)>
+    pub(crate) async fn send(&self, cmd: C) -> Result<(), (TellError, Option<C>)>
     where
         C: Send + 'static,
     {

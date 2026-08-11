@@ -246,10 +246,9 @@ mod tests {
     use super::*;
     use crate::envelope::Envelope;
 
-    fn env(kind: &str, id: &str, payload: &[u8]) -> Message {
+    fn env(path: &str, payload: &[u8]) -> Message {
         Message::Command(Envelope {
-            kind: kind.into(),
-            id: id.into(),
+            path: path.into(),
             message_id: 1,
             payload: payload.to_vec(),
         })
@@ -270,12 +269,12 @@ mod tests {
         let b = net.node(NodeId(2));
         let mut inbox = b.incoming().unwrap();
 
-        a.send(NodeId(2), env("counter", "c1", b"hello"))
+        a.send(NodeId(2), env("/counter/c1", b"hello"))
             .await
             .unwrap();
 
         let got = delivered(inbox.recv().await.unwrap());
-        assert_eq!(got.kind, "counter");
+        assert_eq!(got.path, "/counter/c1");
         assert_eq!(got.payload, b"hello");
     }
 
@@ -291,7 +290,7 @@ mod tests {
         let mut b_inbox = b.incoming().unwrap();
         let mut c_inbox = c.incoming().unwrap();
 
-        a.send(NodeId(2), env("counter", "c1", b"x")).await.unwrap();
+        a.send(NodeId(2), env("/counter/c1", b"x")).await.unwrap();
 
         assert!(b_inbox.recv().await.is_some());
         assert!(
@@ -311,7 +310,7 @@ mod tests {
         net.remove(NodeId(2));
 
         let err = a
-            .send(NodeId(2), env("counter", "c1", b"x"))
+            .send(NodeId(2), env("/counter/c1", b"x"))
             .await
             .unwrap_err();
         assert!(matches!(err, TransportError::Unreachable(NodeId(2))));
@@ -330,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_message_round_trips_through_serde() {
-        let original = env("counter", "c1", b"payload");
+        let original = env("/counter/c1", b"payload");
         let bytes = serde_json::to_vec(&original).unwrap();
         let back: Message = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(original, back);

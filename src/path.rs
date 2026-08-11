@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use thiserror::Error;
 
 /// Where an actor is in the tree, and therefore what it *is*.
 ///
@@ -49,6 +50,31 @@ impl ActorPath {
         }
     }
 
+    /// Read a path back from its display form, `/a/b/c`.
+    ///
+    /// The inverse of [`Display`](fmt::Display), and it exists because a path
+    /// crosses a host as a string: the receiving node has the text and needs the
+    /// address.
+    ///
+    /// # Errors
+    /// If it is not absolute, or has an empty segment — the two ways a string
+    /// could stand for more than one path, or for none.
+    pub fn parse(text: &str) -> Result<Self, InvalidPath> {
+        let Some(rest) = text.strip_prefix('/') else {
+            return Err(InvalidPath(text.to_owned()));
+        };
+        if rest.is_empty() {
+            return Ok(Self::root());
+        }
+        let segments: Vec<String> = rest.split('/').map(str::to_owned).collect();
+        if segments.iter().any(|s| s.is_empty()) {
+            return Err(InvalidPath(text.to_owned()));
+        }
+        Ok(Self {
+            segments: Arc::from(segments),
+        })
+    }
+
     /// This path's parent, or `None` at the root.
     #[must_use]
     pub fn parent(&self) -> Option<Self> {
@@ -90,6 +116,11 @@ impl ActorPath {
                 .all(|(a, b)| a == b)
     }
 }
+
+/// A string that does not stand for exactly one path.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("'{0}' is not an actor path")]
+pub struct InvalidPath(pub String);
 
 /// Whether `name` can be one segment of a path.
 ///
@@ -177,6 +208,23 @@ mod tests {
     fn a_prefix_is_matched_by_segment_not_by_string() {
         let path = ActorPath::root().child("ab");
         assert!(!path.starts_with(&ActorPath::root().child("a")));
+    }
+
+    /// A path crosses a host as a string, so the text has to come back as the
+    /// same address — and a string that stands for no path has to be refused
+    /// rather than guessed at.
+    #[test]
+    fn a_path_round_trips_through_its_display() {
+        for text in ["/", "/acct-7", "/acct-7/session-3/agent-main"] {
+            assert_eq!(ActorPath::parse(text).unwrap().to_string(), text);
+        }
+        for text in ["", "acct-7", "/a//b", "/a/"] {
+            assert_eq!(
+                ActorPath::parse(text),
+                Err(InvalidPath(text.to_owned())),
+                "{text} should not parse"
+            );
+        }
     }
 
     #[test]

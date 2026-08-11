@@ -220,6 +220,14 @@ cross a host — `ClusterActor` already requires its command type to round-trip,
 and a command holding a `ReplyTo<R>` only does if `R` does — and never to the
 local-only reply types that make up most of an application.
 
+**Which addresses are clustered is configuration.** An entry is a pattern over paths — `/*`, `/acct-7/*` — and a set of settings, and an address takes every matching entry merged *per field*, most specific winning. Declaration order decides nothing. `system.settings_at(&path)` answers what applies and which entry set it, because patterns compose invisibly and config that cannot be explained gets worked around rather than fixed.
+
+Matched on the address, not the actor's type, because resolution happens before the actor exists: a node asked for `/acct-7/session-3` has to decide whether that path is clustered with nothing at the path to ask. The default is local, so a single-node deployment configures none of this.
+
+**An actor lives where its nearest clustered ancestor lives.** Only some addresses are placed by the cluster; the rest are ordinary children that live with their parent. Resolving a path means routing to the host of its deepest clustered prefix and walking the remaining segments there — so clustering stays something you turn on for a few addresses rather than for every actor in the tree.
+
+Config *chooses*; it cannot *grant*. A clustered actor's commands must round-trip, and no setting makes them — so `register_clusterable::<A>()` is where that is proved, and creating an actor at a clustered address without it fails there, naming the path and the type.
+
 Three things, kept separate:
 
 - **Membership** — who is in the cluster — is agreed by Raft, so no node can

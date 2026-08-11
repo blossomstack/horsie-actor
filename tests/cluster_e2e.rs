@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, ActorPath, ActorRef, ActorSystem, ClusterActor, ClusterConfig, ClusterNode,
     CommandEffect, Envelope, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId,
-    RaftStore, ReplyTo, Root,
+    RaftStore, ReplyTo, Root, SettingsTable,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -96,6 +96,12 @@ impl ClusterActor for Counter {
     }
 }
 
+/// Where a registered singleton sits: `/counter/<id>`, the bridge the cluster
+/// layer still addresses through.
+fn at(id: &str) -> String {
+    format!("/counter/{id}")
+}
+
 // ---------------------------------------------------------------- the harness
 
 /// N nodes sharing one journal — which is what a real cluster has, since the
@@ -135,7 +141,8 @@ impl TestCluster {
             )
             .await
             .expect("raft should start");
-            let system = ActorSystem::clustered(journal.clone(), node.clone());
+            let system =
+                ActorSystem::clustered(journal.clone(), node.clone(), SettingsTable::new());
             system.register::<Counter>(());
             spawn_dispatch_loop(&system, &node);
             systems.push(system);
@@ -180,7 +187,7 @@ impl TestCluster {
     fn host_of(&self, id: &str) -> usize {
         self.nodes
             .iter()
-            .position(|n| n.owns("counter", id))
+            .position(|n| n.owns(&at(id)))
             .expect("some node must host it")
     }
 
@@ -366,11 +373,7 @@ async fn placement_agrees_across_every_node() {
     let cluster = TestCluster::of_size(5).await;
     for i in 0..40 {
         let id = format!("c{i}");
-        let hosts: Vec<_> = cluster
-            .nodes
-            .iter()
-            .map(|n| n.owner_of("counter", &id))
-            .collect();
+        let hosts: Vec<_> = cluster.nodes.iter().map(|n| n.owner_of(&at(&id))).collect();
         assert!(
             hosts.windows(2).all(|w| w[0] == w[1]),
             "nodes disagreed about {id}: {hosts:?}"
@@ -568,8 +571,7 @@ async fn a_redelivered_command_is_applied_once() {
     // confirm.
     let payload = serde_json::to_vec(&CounterCmd::Inc(5)).unwrap();
     let env = Envelope {
-        kind: "counter".into(),
-        id: id.into(),
+        path: at(id),
         message_id: 42,
         payload,
     };
@@ -715,7 +717,7 @@ async fn losing_quorum_stops_hosted_instances() {
     // Find an instance hosted on node 0, so the partition takes its host.
     let id = (0..64)
         .map(|i| format!("c{i}"))
-        .find(|id| cluster.nodes[0].owns("counter", id))
+        .find(|id| cluster.nodes[0].owns(&at(id)))
         .expect("some id must land on node 0");
 
     let actor = cluster
@@ -765,7 +767,7 @@ async fn a_node_recovers_when_quorum_returns() {
             // Lazily, on the next message — nothing is respawned at recovery.
             let id = (0..64)
                 .map(|i| format!("c{i}"))
-                .find(|id| node.owns("counter", id))
+                .find(|id| node.owns(&at(id)))
                 .expect("some id must land back on this node");
             cluster
                 .system(odd_one_out)
@@ -903,7 +905,7 @@ async fn an_actor_spawned_before_the_first_election_survives() {
     // No peers exist, so this node never reaches a quorum and never serves.
     assert!(!node.serving());
 
-    let system = ActorSystem::clustered(journal, node);
+    let system = ActorSystem::clustered(journal, node, SettingsTable::new());
     let actor = system.spawn_persistent_at(
         ActorPath::root().child("early"),
         Counter { id: "early".into() },
