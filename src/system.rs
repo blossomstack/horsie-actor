@@ -85,11 +85,17 @@ fn singleton_parts(path: &ActorPath) -> Option<(&str, &str)> {
 
 /// Build the closure that decodes for one actor and hands it the command.
 ///
-/// Takes the reference rather than the path, so delivery cannot resolve to a
-/// different instance than the one this entry is for.
-fn deliver_to<C: Send + 'static>(actor: ActorRef<C>, wire: Wire<C>) -> DeliverHere {
+/// Takes the *link* rather than a reference, so an inbound message is delivered
+/// to the instance this entry is for and nothing else. A reference would
+/// re-resolve when that instance is gone, and re-resolving could hand the
+/// message straight back to another node — which, while two nodes disagree about
+/// placement for a moment, is a forwarding loop that dedup cannot see, because
+/// every hop mints a fresh message id. Dispatch delivers what is here or says it
+/// cannot.
+fn deliver_to<C: Send + 'static>(path: ActorPath, link: Link<C>, wire: Wire<C>) -> DeliverHere {
     Arc::new(move |payload, system| {
-        let actor = actor.clone();
+        let path = path.clone();
+        let link = link.clone();
         let wire = wire.clone();
         Box::pin(async move {
             // Decoded inside the router context so a `ReplyTo` in the command
@@ -103,9 +109,8 @@ fn deliver_to<C: Send + 'static>(actor: ActorRef<C>, wire: Wire<C>) -> DeliverHe
                 }
                 None => (wire.decode)(&payload),
             }
-            .ok_or_else(|| DispatchError::Decode(actor.path().to_string()))?;
-            actor
-                .tell(cmd)
+            .ok_or_else(|| DispatchError::Decode(path.to_string()))?;
+            link.send(cmd)
                 .await
                 .map_err(|_| DispatchError::MailboxClosed)
         })
@@ -623,7 +628,7 @@ impl ActorSystem {
         live.insert(
             path.clone(),
             Entry {
-                deliver: wire.map(|wire| deliver_to(reference.clone(), wire)),
+                deliver: wire.map(|wire| deliver_to(path.clone(), link.clone(), wire)),
                 reference: Arc::new(reference) as ErasedRef,
             },
         );
@@ -795,7 +800,9 @@ impl ActorSystem {
         live.insert(
             path.clone(),
             Entry {
-                deliver: wire.map(|wire| deliver_to(typed.clone(), wire)),
+                deliver: wire
+                    .zip(typed.cached())
+                    .map(|(wire, link)| deliver_to(path.clone(), link, wire)),
                 reference: erased,
             },
         );
