@@ -8,8 +8,12 @@
 )]
 
 use async_trait::async_trait;
-use horsie_actor::{ActorContext, ActorSystem, CommandEffect, EventSourcedActor, PersistenceId};
+use horsie_actor::{
+    ActorContext, ActorSystem, CommandEffect, EventSourcedActor, InMemoryJournal, PersistenceId,
+    Root,
+};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 struct Counter {
@@ -36,6 +40,8 @@ impl EventSourcedActor for Counter {
     type Command = Cmd;
     type Event = Event;
     type State = State;
+    // A top-level actor is a child of the root, which takes no messages.
+    type ParentCommand = Root;
 
     fn persistence_id(&self) -> PersistenceId {
         PersistenceId::new("counter", self.id.clone())
@@ -71,8 +77,13 @@ impl EventSourcedActor for Counter {
 
 #[tokio::main]
 async fn main() {
-    let system = ActorSystem::in_memory();
-    let counter = system.spawn_persistent(Counter { id: "c1".into() });
+    let journal = Arc::new(InMemoryJournal::new());
+    let system = ActorSystem::new(journal.clone());
+    // `/c1` — a top-level actor, created by the system under the root. The name
+    // is the actor's identity for as long as it exists.
+    let counter = system
+        .actor_of_persistent("c1", Counter { id: "c1".into() })
+        .unwrap();
 
     counter.tell(Cmd::Inc(3)).await.unwrap();
     counter.tell(Cmd::Inc(4)).await.unwrap();
@@ -81,8 +92,12 @@ async fn main() {
     counter.tell(Cmd::Get(tx)).await.unwrap();
     assert_eq!(rx.await.unwrap(), 7);
 
-    // A second incarnation on the same journal recovers the same value.
-    let revived = system.spawn_persistent(Counter { id: "c1".into() });
+    // A fresh system over the same journal — a restart, in effect. The second
+    // incarnation replays what the first one wrote.
+    let restarted = ActorSystem::new(journal);
+    let revived = restarted
+        .actor_of_persistent("c1", Counter { id: "c1".into() })
+        .unwrap();
     let (tx, rx) = oneshot::channel();
     revived.tell(Cmd::Get(tx)).await.unwrap();
     assert_eq!(rx.await.unwrap(), 7);

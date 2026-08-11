@@ -132,6 +132,13 @@ pub trait EventSourcedActor: Send + Sized + 'static {
     /// lends `&State` to `handle_command` across await points.
     type State: Send + Sync + Serialize + DeserializeOwned + 'static;
 
+    /// What this actor's parent accepts — see [`Actor::ParentCommand`], which
+    /// [`Persistent`] carries through verbatim.
+    ///
+    /// [`Actor::ParentCommand`]: crate::Actor::ParentCommand
+    /// [`Persistent`]: crate::Persistent
+    type ParentCommand: Send + 'static;
+
     /// Identity under which this actor's events and snapshots are stored — its kind
     /// (actor type) plus a per-instance id. See [`PersistenceId`].
     fn persistence_id(&self) -> PersistenceId;
@@ -149,14 +156,14 @@ pub trait EventSourcedActor: Send + Sized + 'static {
         &mut self,
         state: &Self::State,
         cmd: Self::Command,
-        ctx: &mut ActorContext<Self::Command>,
+        ctx: &mut ActorContext<Self::Command, Self::ParentCommand>,
     ) -> CommandEffect<Self::Event>;
 
     /// Hook invoked once after recovery completes, before the first live command.
     async fn on_recovery_complete(
         &mut self,
         _state: &Self::State,
-        _ctx: &mut ActorContext<Self::Command>,
+        _ctx: &mut ActorContext<Self::Command, Self::ParentCommand>,
     ) {
     }
 

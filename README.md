@@ -23,8 +23,8 @@ stateless router and an event-sourced aggregate are spawned, addressed and
 supervised through exactly the same machinery, and you pay for a journal only
 where you want one.
 
-`ActorSystem` owns the journal, the registry of actor types reachable by id, and
-the instances currently running.
+`ActorSystem` owns the journal, every actor currently running — keyed by path —
+and the registry of actor types reachable by id.
 
 ## The idea
 
@@ -45,8 +45,12 @@ and runs it — if the API moves, this stops building.
 
 ```rust
 use async_trait::async_trait;
-use horsie_actor::{ActorContext, ActorSystem, CommandEffect, EventSourcedActor, PersistenceId};
+use horsie_actor::{
+    ActorContext, ActorSystem, CommandEffect, EventSourcedActor, InMemoryJournal, PersistenceId,
+    Root,
+};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 struct Counter {
@@ -73,6 +77,8 @@ impl EventSourcedActor for Counter {
     type Command = Cmd;
     type Event = Event;
     type State = State;
+    // A top-level actor is a child of the root, which takes no messages.
+    type ParentCommand = Root;
 
     fn persistence_id(&self) -> PersistenceId {
         PersistenceId::new("counter", self.id.clone())
@@ -108,8 +114,13 @@ impl EventSourcedActor for Counter {
 
 #[tokio::main]
 async fn main() {
-    let system = ActorSystem::in_memory();
-    let counter = system.spawn_persistent(Counter { id: "c1".into() });
+    let journal = Arc::new(InMemoryJournal::new());
+    let system = ActorSystem::new(journal.clone());
+    // `/c1` — a top-level actor, created by the system under the root. The name
+    // is the actor's identity for as long as it exists.
+    let counter = system
+        .actor_of_persistent("c1", Counter { id: "c1".into() })
+        .unwrap();
 
     counter.tell(Cmd::Inc(3)).await.unwrap();
     counter.tell(Cmd::Inc(4)).await.unwrap();
@@ -118,13 +129,34 @@ async fn main() {
     counter.tell(Cmd::Get(tx)).await.unwrap();
     assert_eq!(rx.await.unwrap(), 7);
 
-    // A second incarnation on the same journal recovers the same value.
-    let revived = system.spawn_persistent(Counter { id: "c1".into() });
+    // A fresh system over the same journal — a restart, in effect. The second
+    // incarnation replays what the first one wrote.
+    let restarted = ActorSystem::new(journal);
+    let revived = restarted
+        .actor_of_persistent("c1", Counter { id: "c1".into() })
+        .unwrap();
     let (tx, rx) = oneshot::channel();
     revived.tell(Cmd::Get(tx)).await.unwrap();
     assert_eq!(rx.await.unwrap(), 7);
 }
 ```
+
+## A reference is a name
+
+Every actor has a path. `/` is the root; a top-level actor is created by the system under it, and every other actor is created by its parent, under its parent's path. `/acct-7/session-3/agent-main` names one actor for as long as that actor exists.
+
+An `ActorRef` is that path plus a cached link to whatever it resolves to right now. A send uses the cache; a send that fails drops it, resolves the path once more and retries. So a reference held across a stop, a restart, or a reactivation after an idle offload keeps working, and the holder does nothing and knows nothing:
+
+```rust
+let held = system.actor_of("worker", Worker::new())?;
+held.tell(Stop).await?;              // the instance goes away
+system.actor_of("worker", Worker::new())?;   // a different instance, same name
+held.tell(Ping).await?;              // still delivers — to the new one
+```
+
+Resolution never *creates*. A path with nothing at it fails the send, so a reference cannot wake an actor that nobody asked for.
+
+`ctx.actor_of(name, actor)` creates a child under the current actor; `ctx.parent()` is an ordinary reference to the parent's path, typed by the actor's `ParentCommand`, so a child reaches upwards without having been handed anything at construction. Both are get-or-create: two callers naming one path get one actor, and the loser's actor value is dropped without ever being started.
 
 ## Durability you can wait on
 
@@ -177,8 +209,8 @@ fence — so a new backend can be held to it.
 ## Clustering
 
 Several nodes can host one actor tree, addressed the same way from any of them:
-`system.actor_of::<A>(&id)` returns an `ActorRef` whether the instance runs here
-or on another node, and `tell` and `ask` both work across the boundary. A reply
+`system.singleton_of::<A>(&id)` returns an `ActorRef` whether the instance runs
+here or on another node, and `tell` and `ask` both work across the boundary. A reply
 handle carries the node that asked and a correlation id, so the answer finds its
 way back to a caller still awaiting it.
 
