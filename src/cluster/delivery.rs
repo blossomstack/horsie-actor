@@ -77,8 +77,7 @@ mod tests {
 
     fn env(message_id: u128) -> Envelope {
         Envelope {
-            kind: "counter".into(),
-            id: "c1".into(),
+            path: "/counter/c1".into(),
             message_id,
             payload: Vec::new(),
         }

@@ -14,8 +14,14 @@ pub struct Assignment {
     pub node: NodeId,
 }
 
-/// One instance's identity in the table: actor kind plus instance id.
-pub type InstanceKey = (String, String);
+/// One instance's identity in the table: its [`ActorPath`], as text.
+///
+/// Text rather than the type itself because this table is proposed through
+/// Raft, and the log is a serialized thing. Every reader parses it straight back
+/// into a path.
+///
+/// [`ActorPath`]: crate::ActorPath
+pub type InstanceKey = String;
 
 /// A decision to record. Applying these in the same order on every node is what
 /// makes the table agree.
@@ -27,13 +33,9 @@ pub enum PlacementCommand {
     /// assigned to a live node, so a race between two nodes proposing the same
     /// assignment resolves to whichever the log ordered first rather than
     /// flapping.
-    Assign {
-        kind: String,
-        id: String,
-        node: NodeId,
-    },
+    Assign { path: String, node: NodeId },
     /// Give up an instance — a graceful handover, or an idle unload.
-    Release { kind: String, id: String },
+    Release { path: String },
     /// A node is gone. Releases everything it owned, so the next message to any
     /// of those instances reassigns it somewhere alive.
     NodeDown { node: NodeId },
@@ -82,8 +84,8 @@ impl PlacementTable {
                 self.members.insert(node);
                 PlacementEffect::NoChange
             }
-            PlacementCommand::Assign { kind, id, node } => {
-                let key = (kind, id);
+            PlacementCommand::Assign { path, node } => {
+                let key = path;
                 match self.assignments.get(&key) {
                     // Held by a node that is still alive: leave it. Reassigning
                     // a live instance would give two hosts a reason to claim the
@@ -98,8 +100,8 @@ impl PlacementTable {
                     }
                 }
             }
-            PlacementCommand::Release { kind, id } => {
-                if self.assignments.remove(&(kind, id)).is_some() {
+            PlacementCommand::Release { path } => {
+                if self.assignments.remove(&path).is_some() {
                     PlacementEffect::Released(1)
                 } else {
                     PlacementEffect::NoChange
@@ -124,10 +126,8 @@ impl PlacementTable {
 
     /// The node assigned to this instance, if any.
     #[must_use]
-    pub fn owner(&self, kind: &str, id: &str) -> Option<NodeId> {
-        self.assignments
-            .get(&(kind.to_owned(), id.to_owned()))
-            .map(|a| a.node)
+    pub fn owner(&self, path: &str) -> Option<NodeId> {
+        self.assignments.get(path).map(|a| a.node)
     }
 
     /// Live members.
@@ -153,7 +153,7 @@ impl PlacementTable {
     /// losing a member only moves the instances that were on it. Returns `None`
     /// when nothing is alive.
     #[must_use]
-    pub fn candidate(&self, kind: &str, id: &str) -> Option<NodeId> {
+    pub fn candidate(&self, path: &str) -> Option<NodeId> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -161,8 +161,7 @@ impl PlacementTable {
             .iter()
             .max_by_key(|node| {
                 let mut h = DefaultHasher::new();
-                kind.hash(&mut h);
-                id.hash(&mut h);
+                path.hash(&mut h);
                 node.hash(&mut h);
                 h.finish()
             })
@@ -188,10 +187,15 @@ mod tests {
         t
     }
 
+    /// Instances live at `/counter/<id>` throughout, so a test reads as the
+    /// addresses the rest of the system uses.
+    fn at(id: &str) -> String {
+        format!("/counter/{id}")
+    }
+
     fn assign(t: &mut PlacementTable, id: &str, node: u64) -> PlacementEffect {
         t.apply(PlacementCommand::Assign {
-            kind: "counter".into(),
-            id: id.into(),
+            path: at(id),
             node: NodeId(node),
         })
     }
@@ -203,7 +207,7 @@ mod tests {
             assign(&mut t, "c1", 1),
             PlacementEffect::Assigned(NodeId(1))
         );
-        assert_eq!(t.owner("counter", "c1"), Some(NodeId(1)));
+        assert_eq!(t.owner(&at("c1")), Some(NodeId(1)));
     }
 
     /// An instance already held by a live node stays put. Reassigning it would
@@ -218,7 +222,7 @@ mod tests {
             assign(&mut t, "c1", 2),
             PlacementEffect::AlreadyAssigned(NodeId(1))
         );
-        assert_eq!(t.owner("counter", "c1"), Some(NodeId(1)));
+        assert_eq!(t.owner(&at("c1")), Some(NodeId(1)));
     }
 
     /// An instance stranded on a node nobody has declared down yet is still
@@ -246,10 +250,10 @@ mod tests {
             t.apply(PlacementCommand::NodeDown { node: NodeId(1) }),
             PlacementEffect::Released(2)
         );
-        assert_eq!(t.owner("counter", "c1"), None);
-        assert_eq!(t.owner("counter", "c2"), None);
+        assert_eq!(t.owner(&at("c1")), None);
+        assert_eq!(t.owner(&at("c2")), None);
         // Untouched: it was somebody else's.
-        assert_eq!(t.owner("counter", "c3"), Some(NodeId(2)));
+        assert_eq!(t.owner(&at("c3")), Some(NodeId(2)));
         assert!(!t.members().contains(&NodeId(1)));
     }
 
@@ -258,13 +262,10 @@ mod tests {
         let mut t = table_with(&[1]);
         assign(&mut t, "c1", 1);
         assert_eq!(
-            t.apply(PlacementCommand::Release {
-                kind: "counter".into(),
-                id: "c1".into()
-            }),
+            t.apply(PlacementCommand::Release { path: at("c1") }),
             PlacementEffect::Released(1)
         );
-        assert_eq!(t.owner("counter", "c1"), None);
+        assert_eq!(t.owner(&at("c1")), None);
     }
 
     /// Determinism is the whole contract: replicating this type means replaying
@@ -275,13 +276,11 @@ mod tests {
             PlacementCommand::NodeUp { node: NodeId(1) },
             PlacementCommand::NodeUp { node: NodeId(2) },
             PlacementCommand::Assign {
-                kind: "counter".into(),
-                id: "c1".into(),
+                path: at("c1"),
                 node: NodeId(1),
             },
             PlacementCommand::Assign {
-                kind: "counter".into(),
-                id: "c2".into(),
+                path: at("c2"),
                 node: NodeId(2),
             },
             PlacementCommand::NodeDown { node: NodeId(1) },
@@ -303,7 +302,7 @@ mod tests {
         let a = table_with(&[1, 2, 3]);
         let b = table_with(&[3, 1, 2]); // same members, different insert order
         for id in ["c1", "c2", "c3", "c4", "c5"] {
-            assert_eq!(a.candidate("counter", id), b.candidate("counter", id));
+            assert_eq!(a.candidate(&at(id)), b.candidate(&at(id)));
         }
     }
 
@@ -312,17 +311,17 @@ mod tests {
     #[tokio::test]
     async fn losing_a_member_only_moves_its_own_instances() {
         let mut before = table_with(&[1, 2, 3]);
-        let ids: Vec<String> = (0..200).map(|i| format!("c{i}")).collect();
-        let placed: Vec<_> = ids
+        let paths: Vec<String> = (0..200).map(|i| at(&format!("c{i}"))).collect();
+        let placed: Vec<_> = paths
             .iter()
-            .map(|id| (id, before.candidate("counter", id).unwrap()))
+            .map(|path| (path, before.candidate(path).unwrap()))
             .collect();
 
         before.apply(PlacementCommand::NodeDown { node: NodeId(3) });
 
         let moved = placed
             .iter()
-            .filter(|(id, was)| before.candidate("counter", id) != Some(*was))
+            .filter(|(path, was)| before.candidate(path) != Some(*was))
             .count();
         let were_on_three = placed.iter().filter(|(_, was)| *was == NodeId(3)).count();
         assert_eq!(
@@ -334,6 +333,6 @@ mod tests {
     #[tokio::test]
     async fn candidate_is_none_with_no_members() {
         let t = PlacementTable::new();
-        assert_eq!(t.candidate("counter", "c1"), None);
+        assert_eq!(t.candidate(&at("c1")), None);
     }
 }

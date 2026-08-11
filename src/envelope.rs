@@ -39,10 +39,11 @@ pub enum Message {
 /// One addressed message between nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
-    /// Registered actor type — `ClusterActor::KIND`.
-    pub kind: String,
-    /// Instance id within that type.
-    pub id: String,
+    /// Who it is for, as an [`ActorPath`] in its display form. Text because an
+    /// envelope is a wire type, and every reader parses it straight back.
+    ///
+    /// [`ActorPath`]: crate::ActorPath
+    pub path: String,
     /// Deduplication key. The receiver remembers these, so a redelivery after a
     /// retry is dropped rather than applied a second time — which is what turns
     /// at-least-once delivery into effectively-once processing.

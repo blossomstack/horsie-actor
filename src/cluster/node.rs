@@ -234,24 +234,24 @@ impl ClusterNode {
         &self.raft
     }
 
-    /// Which node should host `(kind, id)`.
+    /// Which node should host the actor at `path`.
     ///
     /// Prefers a standing assignment, and falls back to the rendezvous
     /// candidate. `None` when no member is live — including this one, which is
     /// the state a stood-down node is in.
     #[must_use]
-    pub fn owner_of(&self, kind: &str, id: &str) -> Option<NodeId> {
+    pub fn owner_of(&self, path: &str) -> Option<NodeId> {
         let table = self.table.lock();
         table
-            .owner(kind, id)
+            .owner(path)
             .filter(|n| table.members().contains(n))
-            .or_else(|| table.candidate(kind, id))
+            .or_else(|| table.candidate(path))
     }
 
-    /// Whether this node should host `(kind, id)`.
+    /// Whether this node should host the actor at `path`.
     #[must_use]
-    pub fn owns(&self, kind: &str, id: &str) -> bool {
-        self.serving() && self.owner_of(kind, id) == Some(self.local)
+    pub fn owns(&self, path: &str) -> bool {
+        self.serving() && self.owner_of(path) == Some(self.local)
     }
 
     /// The nodes placement is currently using.
@@ -264,11 +264,10 @@ impl ClusterNode {
         self.table.lock().members().iter().copied().collect()
     }
 
-    /// Record that this node is hosting `(kind, id)`.
-    pub fn record_local_assignment(&self, kind: &str, id: &str) {
+    /// Record that this node is hosting the actor at `path`.
+    pub fn record_local_assignment(&self, path: &str) {
         self.table.lock().apply(PlacementCommand::Assign {
-            kind: kind.to_owned(),
-            id: id.to_owned(),
+            path: path.to_owned(),
             node: self.local,
         });
     }
@@ -292,7 +291,7 @@ impl ClusterNode {
         }
     }
 
-    /// Send an already-encoded command to whichever node hosts `(kind, id)`.
+    /// Send an already-encoded command to whichever node hosts `path`.
     ///
     /// Retries, because a caller cannot usefully do it: each attempt re-resolves
     /// the owner, so a send racing a failover lands on the new host rather than
@@ -300,21 +299,19 @@ impl ClusterNode {
     /// promise — an undeliverable command is dropped and its caller told.
     pub async fn send(
         &self,
-        kind: &str,
-        id: &str,
+        path: &str,
         payload: Vec<u8>,
         message_id: u128,
     ) -> Result<(), TransportError> {
         let mut last = None;
         for attempt in 0..SEND_ATTEMPTS {
-            let Some(owner) = self.owner_of(kind, id) else {
+            let Some(owner) = self.owner_of(path) else {
                 return Err(TransportError::Io(format!(
-                    "no live member can host {kind}/{id}"
+                    "no live member can host {path}"
                 )));
             };
             let env = Envelope {
-                kind: kind.to_owned(),
-                id: id.to_owned(),
+                path: path.to_owned(),
                 message_id,
                 payload: payload.clone(),
             };
@@ -329,8 +326,7 @@ impl ClusterNode {
                 }
             }
         }
-        Err(last
-            .unwrap_or_else(|| TransportError::Io(format!("gave up delivering to {kind}/{id}"))))
+        Err(last.unwrap_or_else(|| TransportError::Io(format!("gave up delivering to {path}"))))
     }
 
     /// The stream of messages arriving here, taken once.

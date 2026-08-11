@@ -15,8 +15,15 @@
 //! holder knowing anything happened. A path is created by its parent and never
 //! by resolution: a reference cannot wake an actor nobody asked for.
 //!
+//! Which addresses are cluster singletons is *configuration*, matched on the
+//! path — see [`SettingsTable`]. Matched on the path rather than the actor's
+//! type because resolution happens before the actor exists, and because one type
+//! can sit in two places in the tree with only one of them clustered. The
+//! default is local, so a single-node deployment configures none of this and the
+//! same binary serves both.
+//!
 //! [`ActorSystem`] owns the journal, every actor currently running (keyed by
-//! path) and the registry of actor types that can be
+//! path), that configuration, and the registry of actor types that can be
 //! reached by id. Registered types can be
 //! hosted across several nodes: membership is agreed by Raft, placement hashes
 //! over the members the leader reports as live, replies route back to whoever
@@ -28,6 +35,7 @@
 //! Neither agent nor workflow concepts appear here.
 
 mod actor;
+mod address;
 mod behaviour;
 mod cluster;
 mod envelope;
@@ -45,6 +53,9 @@ mod transport;
 mod transport_tcp;
 
 pub use actor::{CommandEffect, EventSourcedActor};
+pub use address::{
+    ActorSettings, AddressPattern, Decided, DuplicatePattern, PatternError, Settings, SettingsTable,
+};
 pub use behaviour::{Actor, Flow, Root, StartError};
 pub use cluster::{
     Assignment, ClusterConfig, ClusterNode, Dedup, InstanceKey, LiveSet, Membership, NodeIdx,
@@ -56,7 +67,7 @@ pub use journal::{InMemoryJournal, Journal, JournalResult};
 // Re-exported so a caller can read `ClusterNode::raft().metrics()` without
 // taking its own dependency on openraft.
 pub use openraft::type_config::async_runtime::watch::WatchReceiver;
-pub use path::{ActorPath, is_valid_name};
+pub use path::{ActorPath, InvalidPath, is_valid_name};
 pub use persistence_id::PersistenceId;
 pub use persistent::Persistent;
 pub use reply::{ReplyDropped, ReplyRouter, ReplyTo};
