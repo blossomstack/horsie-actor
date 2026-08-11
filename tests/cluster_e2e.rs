@@ -30,6 +30,13 @@ enum CounterCmd {
     /// channel round-trips like any other field — which is the whole point of
     /// reply routing, and was impossible before it.
     Get(ReplyTo<i64>),
+    /// Pass it on: resolve another counter *by id* from inside this one and
+    /// increment that. An actor knows ids, not references — and a host that
+    /// built this instance may never have seen whoever holds the other.
+    IncOther {
+        id: String,
+        by: i64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -66,6 +73,12 @@ impl EventSourcedActor for Counter {
             CounterCmd::Inc(n) => CommandEffect::persist(vec![Incremented(n)]),
             CounterCmd::Get(reply) => {
                 let _ = reply.send(state.value);
+                CommandEffect::none()
+            }
+            CounterCmd::IncOther { id, by } => {
+                if let Ok(peer) = _ctx.actor_of::<Counter>(&id).await {
+                    let _ = peer.tell(CounterCmd::Inc(by)).await;
+                }
                 CommandEffect::none()
             }
         }
@@ -808,6 +821,47 @@ async fn a_partitioned_leader_stands_down() {
 /// is nothing to stop. Seeding it from "not serving yet" instead would make
 /// every actor spawned during an election exit on its first poll, silently and
 /// with no error anywhere.
+/// An actor reaches another instance by id, from inside itself — including one
+/// the cluster placed on a different host.
+///
+/// This is how a parent, a sibling or a service is reached once instances move:
+/// handing a reference down at construction cannot survive clustering, because
+/// the host that builds an instance may never have seen whoever would have
+/// handed it one.
+#[tokio::test]
+async fn an_actor_reaches_another_instance_by_id() {
+    let cluster = TestCluster::of_size(3).await;
+
+    // Two ids the cluster places on different hosts, so the hop is a real one
+    // rather than a local lookup dressed up as one.
+    let (from, to) = (0..200)
+        .map(|n| format!("peer-{n}"))
+        .flat_map(|a| (0..200).map(move |n| (a.clone(), format!("other-{n}"))))
+        .find(|(a, b)| cluster.host_of(a) != cluster.host_of(b))
+        .expect("three nodes place some pair apart");
+
+    let caller = cluster
+        .system(cluster.host_of(&from))
+        .actor_of::<Counter>(&from)
+        .await
+        .unwrap();
+    caller
+        .tell(CounterCmd::IncOther {
+            id: to.clone(),
+            by: 7,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    settle().await;
+
+    assert_eq!(
+        value_at_host(&cluster, &to).await,
+        7,
+        "the increment must reach the instance the id names, on whatever host holds it"
+    );
+}
+
 #[tokio::test]
 async fn an_actor_spawned_before_the_first_election_survives() {
     let net = horsie_actor::InProcessNetwork::new();

@@ -156,6 +156,23 @@ impl<C: Send + 'static> ActorContext<C> {
         ActorRef::new(self.self_tx.clone())
     }
 
+    /// The instance of `A` registered under `id`, wherever the cluster puts it.
+    ///
+    /// The same resolution [`ActorSystem::actor_of`] does, reached from inside
+    /// an actor — which is where most of it happens: an actor that needs a
+    /// sibling, a parent, or a service knows the id, not the reference. Handing
+    /// references down at construction cannot survive clustering, because the
+    /// host that builds an instance may never have seen whoever would have
+    /// handed it one.
+    pub async fn actor_of<A: crate::ClusterActor>(
+        &self,
+        id: &str,
+    ) -> Result<ActorRef<A::Command>, crate::ActorOfError> {
+        crate::ActorSystem::from_inner(self.inner.clone())
+            .actor_of::<A>(id)
+            .await
+    }
+
     /// Spawn a child actor in the same system.
     pub fn spawn<B: Actor>(&self, actor: B) -> ActorRef<B::Command> {
         crate::system::spawn_in(actor, self.inner.clone())

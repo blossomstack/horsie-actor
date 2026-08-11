@@ -158,6 +158,14 @@ pub struct ActorSystem {
 }
 
 impl ActorSystem {
+    /// The system an actor is running in, from inside that actor.
+    ///
+    /// Cheap — the system *is* this handle — and the reason `ActorContext` can
+    /// offer everything the system does without carrying a second copy of it.
+    pub(crate) fn from_inner(inner: Arc<SystemInner>) -> Self {
+        Self { inner }
+    }
+
     /// A system backed by `journal`.
     #[must_use]
     pub fn new(journal: Arc<dyn Journal>) -> Self {
