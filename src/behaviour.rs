@@ -8,12 +8,17 @@ use thiserror::Error;
 pub enum Flow {
     /// Keep processing the mailbox.
     Continue,
-    /// Stop the actor. Its mailbox is dropped, so an [`ActorRef`] to it fails
-    /// with [`TellError::MailboxClosed`] — until somebody creates an actor at
-    /// the same path again, at which point the same reference reaches the new
-    /// one. A reference names a path, not an instance.
+    /// Stop the actor, and everything under it. Its mailbox is dropped, so an
+    /// [`ActorRef`] to it fails with [`TellError::MailboxClosed`] — until
+    /// somebody creates an actor at the same path again, at which point the same
+    /// reference reaches the new one. A reference names a path, not an instance.
+    ///
+    /// Identical to being stopped from outside with [`ActorRef::stop`], and
+    /// deliberately: a holder cannot tell which happened, so the two must not
+    /// differ.
     ///
     /// [`ActorRef`]: crate::ActorRef
+    /// [`ActorRef::stop`]: crate::ActorRef::stop
     /// [`TellError::MailboxClosed`]: crate::TellError::MailboxClosed
     Stop,
 }
@@ -78,11 +83,15 @@ pub trait Actor: Send + Sized + 'static {
 /// What the root of the tree accepts: nothing.
 ///
 /// `/` exists so that every actor has a parent and a path has somewhere to
-/// start. It is not a guardian, it does not supervise, and it holds no
-/// behaviour — so an actor at the top declares `type ParentCommand = Root` and
-/// gets a reference from [`ActorContext::parent`] it can hold and never send
-/// through. This type has no values; the type system is what says root takes no
-/// messages, rather than a runtime error on the first attempt.
+/// start. No actor is there and it holds no behaviour — so an actor at the top
+/// declares `type ParentCommand = Root` and gets a reference from
+/// [`ActorContext::parent`] it can hold and never send through. This type has no
+/// values; the type system is what says root takes no messages, rather than a
+/// runtime error on the first attempt.
+///
+/// Note what this does *not* mean: every actor below root does own its children
+/// and takes them with it when it stops. Root is the one place the chain ends,
+/// because there is nothing there to end it.
 ///
 /// [`ActorContext::parent`]: crate::ActorContext::parent
 pub enum Root {}

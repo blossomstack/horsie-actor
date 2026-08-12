@@ -15,6 +15,11 @@
 //! holder knowing anything happened. A path is created by its parent and never
 //! by resolution: a reference cannot wake an actor nobody asked for.
 //!
+//! An actor owns the actors below it: stopping one stops its whole subtree,
+//! children first, whether it was stopped from outside, stopped itself, or lost
+//! its node. So a branch is unloaded in one call, and no actor outlives the one
+//! that created it.
+//!
 //! An actor tree is node-local: a parent and its children are always on the same
 //! machine, and clustering happens only at the roots. A [`Shard`] type is
 //! registered once per node with that node's own wiring, and everything below a
