@@ -8,7 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
-use horsie_actor::{Actor, ActorContext, ActorSystem, Flow, ReplyTo, Root, TellError};
+use horsie_actor::{Actor, ActorContext, ActorSystem, Flow, ReplyTo, TellError};
 use std::time::Duration;
 
 enum Ask {
@@ -28,7 +28,6 @@ struct Oracle {
 #[async_trait]
 impl Actor for Oracle {
     type Command = Ask;
-    type ParentCommand = Root;
 
     async fn handle(&mut self, cmd: Ask, _ctx: &mut ActorContext<Ask>) -> Flow {
         match cmd {

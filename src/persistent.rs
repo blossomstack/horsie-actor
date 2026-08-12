@@ -50,12 +50,8 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
     // Carried through verbatim, which is what keeps the context type identical
     // for the adapter and the actor it wraps — the reason the context is
     // parameterized by command types rather than by actor types.
-    type ParentCommand = A::ParentCommand;
 
-    async fn on_start(
-        &mut self,
-        ctx: &mut ActorContext<Self::Command, Self::ParentCommand>,
-    ) -> Result<(), StartError> {
+    async fn on_start(&mut self, ctx: &mut ActorContext<Self::Command>) -> Result<(), StartError> {
         let (state, seq_nr) = recover::<A>(&self.pid, &self.journal).await?;
         self.state = state;
         self.seq_nr = seq_nr;
@@ -63,11 +59,7 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
         Ok(())
     }
 
-    async fn handle(
-        &mut self,
-        cmd: Self::Command,
-        ctx: &mut ActorContext<Self::Command, Self::ParentCommand>,
-    ) -> Flow {
+    async fn handle(&mut self, cmd: Self::Command, ctx: &mut ActorContext<Self::Command>) -> Flow {
         let effect = self.inner.handle_command(&self.state, cmd, ctx).await;
         let CommandEffect {
             events,
@@ -234,7 +226,6 @@ async fn snapshot_state<A: EventSourcedActor>(
 )]
 mod tests {
     use super::*;
-    use crate::behaviour::Root;
     use crate::journal::InMemoryJournal;
     use crate::reply::ReplyTo;
     use crate::runtime::ActorRef;
@@ -302,7 +293,6 @@ mod tests {
         type State = CounterState;
         // Counter is created both at the top of the tree and as a child of the
         // parent below, so it names what its parent accepts, not who it is.
-        type ParentCommand = ParentCmd;
 
         fn persistence_id(&self) -> PersistenceId {
             PersistenceId::new("counter", self.id.clone())
@@ -323,7 +313,7 @@ mod tests {
             &mut self,
             state: &CounterState,
             cmd: CounterCmd,
-            _ctx: &mut ActorContext<CounterCmd, ParentCmd>,
+            _ctx: &mut ActorContext<CounterCmd>,
         ) -> CommandEffect<CounterEvent> {
             match cmd {
                 CounterCmd::Inc(n) => CommandEffect::persist(vec![CounterEvent::Incremented(n)]),
@@ -342,7 +332,7 @@ mod tests {
         async fn on_recovery_complete(
             &mut self,
             state: &CounterState,
-            _ctx: &mut ActorContext<CounterCmd, ParentCmd>,
+            _ctx: &mut ActorContext<CounterCmd>,
         ) {
             if let Some(tx) = self.report.take() {
                 let _ = tx.send(state.value);
@@ -522,7 +512,6 @@ mod tests {
             type Command = ParentCmd;
             type Event = ();
             type State = Empty;
-            type ParentCommand = Root;
             fn persistence_id(&self) -> PersistenceId {
                 PersistenceId::new("parent", "parent")
             }

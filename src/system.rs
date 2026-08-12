@@ -801,7 +801,7 @@ impl<S: Shard> ShardOf<'_, S> {
 mod tests {
     use super::*;
     use crate::actor::CommandEffect;
-    use crate::behaviour::{Flow, Root};
+    use crate::behaviour::Flow;
     use crate::persistence_id::PersistenceId;
     use crate::reply::ReplyTo;
     use crate::runtime::ActorContext;
@@ -841,7 +841,6 @@ mod tests {
         type Command = CounterCmd;
         type Event = Incremented;
         type State = CounterState;
-        type ParentCommand = Root;
 
         fn persistence_id(&self) -> PersistenceId {
             PersistenceId::new("counter", self.id.clone())
@@ -998,7 +997,6 @@ mod tests {
         #[async_trait]
         impl Actor for Impostor {
             type Command = CounterCmd;
-            type ParentCommand = Root;
             async fn handle(
                 &mut self,
                 _cmd: CounterCmd,
