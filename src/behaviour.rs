@@ -138,7 +138,7 @@ mod tests {
 
     /// A plain `Actor` has no `persistence_id` and never reads or writes a
     /// journal. That is what makes a non-event-sourced actor possible at all —
-    /// and later, what lets a cluster singleton be either kind.
+    /// and what lets a shard actor be either kind.
     #[tokio::test]
     async fn plain_actor_needs_no_journal() {
         let system = ActorSystem::in_memory();

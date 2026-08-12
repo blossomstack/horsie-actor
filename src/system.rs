@@ -64,12 +64,13 @@ pub enum DispatchError {
     #[error(transparent)]
     BadAddress(#[from] crate::path::InvalidPath),
 
-    /// The actor is here, but its address is not clustered, so it has no wire
-    /// format and nothing off this node was ever meant to reach it.
+    /// The actor is here, but its commands have no wire format, so nothing off
+    /// this node was ever meant to reach it. Only a shard type's commands are
+    /// registered to cross a host; an ordinary child is local by construction.
     ///
     /// Named separately from "nothing is there" because the two call for
-    /// different fixes: this one is a configuration that does not match what the
-    /// code is doing.
+    /// different fixes: this one is a sender addressing an actor that was never
+    /// meant to be reachable from where it sits.
     #[error("the actor at '{0}' is local to this node and takes nothing from elsewhere")]
     LocalOnly(ActorPath),
 
@@ -111,19 +112,6 @@ pub enum ActorOfError {
     /// would give it a reference of the wrong type.
     #[error("an actor of another type already lives at '{0}'")]
     PathTaken(ActorPath),
-
-    /// The address is configured as clustered, but this actor's commands cannot
-    /// cross a host — so no node but this one could ever be told anything.
-    ///
-    /// Config chooses what is clustered; it cannot grant it. Paths appear at
-    /// runtime, so this cannot be caught at boot, and being caught at creation
-    /// is the next best thing: it names the path and the type, and it happens
-    /// the first time rather than on some later send.
-    #[error("'{path}' is configured as clustered, but {actor}'s commands do not round-trip")]
-    NotClusterable {
-        path: ActorPath,
-        actor: &'static str,
-    },
 
     /// This node cannot see a quorum, so it is not hosting anything.
     ///
@@ -170,9 +158,9 @@ type DeliverHere = Arc<
 ///
 /// Both halves, kept together and looked up by the command's [`TypeId`]: an
 /// encoder for a send that leaves, and a decoder for one that arrives. Recorded
-/// by registration, which is where the round-trip bound is already proved —
-/// which is why creating a clustered actor can *check* that its commands encode
-/// without demanding serde bounds from every caller that merely names the type.
+/// by registration, which is where the round-trip bound is already proved — so
+/// a send that has to leave this node can encode without demanding serde bounds
+/// from every caller that merely names the command type.
 struct Wire<C> {
     encode: Encode<C>,
     decode: Decode<C>,
@@ -241,8 +229,9 @@ pub(crate) struct SystemInner {
     /// what generated the ownership bugs this design set out to remove.
     live: Mutex<HashMap<ActorPath, Entry>>,
     /// Command types that have been proved to round-trip, by the command's
-    /// [`TypeId`]. Config *chooses* what is clustered; this is what says whether
-    /// it *can* be.
+    /// [`TypeId`]. Written by shard registration, which is the one place the
+    /// bound is stated — so this is what says whether an actor can be reached
+    /// from another node at all.
     wires: Mutex<HashMap<TypeId, ErasedWire>>,
     /// Raised when this node stops serving. Every actor watches it and stops.
     ///
