@@ -294,9 +294,10 @@ impl ClusterNode {
 
     /// Send an already-encoded command to whichever node hosts `route`.
     ///
-    /// `route` and `address` differ whenever the target is an ordinary child of
-    /// a clustered actor: placement knows the ancestor, and the envelope carries
-    /// the full path so the receiving node can walk the rest locally.
+    /// `route` is the shard the target belongs to, which is what placement
+    /// decides over, and `address` is the actor itself. They differ because many
+    /// entities share one shard, so the envelope has to carry the full path for
+    /// the receiving node to know which of them it is for.
     ///
     /// Retries, because a caller cannot usefully do it: each attempt re-resolves
     /// the owner, so a send racing a failover lands on the new host rather than

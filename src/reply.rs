@@ -206,7 +206,7 @@ impl<R> ReplyTo<R> {
 /// spread to every local-only reply type in every consumer — including error
 /// types that have no business being serialisable. Here it applies exactly when
 /// a reply handle is actually about to cross a host, which the compiler already
-/// checks at registration: `ClusterActor` requires its command to round-trip,
+/// checks at registration: a `Shard` type requires its command to round-trip,
 /// and a command containing a `ReplyTo<R>` only does if `R` does.
 impl<R: DeserializeOwned + Send + 'static> Serialize for ReplyTo<R> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

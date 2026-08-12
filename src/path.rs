@@ -104,8 +104,7 @@ impl ActorPath {
 
     /// Whether `prefix` is this path or one of its ancestors.
     ///
-    /// What "stop everything under `/acct-7/session-3`" is a scan for, and what
-    /// finding the deepest clustered ancestor of a path will be.
+    /// What "stop everything under `/acct-7/session-3`" is a scan for.
     #[must_use]
     pub fn starts_with(&self, prefix: &Self) -> bool {
         prefix.segments.len() <= self.segments.len()
