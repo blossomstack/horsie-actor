@@ -7,7 +7,7 @@ use crate::journal::{InMemoryJournal, Journal};
 use crate::path::ActorPath;
 use crate::persistent::Persistent;
 use crate::runtime::{ActorRef, Link, check_name, spawn_at};
-use crate::shard::{EntityContext, Shard, address_for, region_of, type_in};
+use crate::shard::{EntityContext, Shard, context_of, region_of, type_in};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -623,8 +623,7 @@ impl ActorSystem {
         let route: crate::runtime::RemoteSend<S::Command> = Arc::new(move |cmd: S::Command| {
             let system = system.clone();
             Box::pin(async move {
-                let (entity, shard) = address_for::<S>(&cmd);
-                system.deliver_to_shard(entity, shard, cmd).await
+                system.deliver_to_shard(context_of::<S>(&cmd), cmd).await
             })
         });
         self.reference(region_of(S::TYPE), Some(Link::Remote(route)))
@@ -634,9 +633,9 @@ impl ActorSystem {
     async fn deliver_to_shard<S: Shard>(
         &self,
         entity: EntityContext<S>,
-        shard: ActorPath,
         cmd: S::Command,
     ) -> Result<(), TellError> {
+        let shard = entity.shard_path();
         let ours = match &self.inner.cluster {
             Some(cluster) => cluster.owns(&shard.to_string()),
             // No cluster: this node owns everything, which is the single-node
@@ -850,7 +849,7 @@ impl<S: Shard> ShardOf<'_, S> {
                         // said all it has to say. Where the actor goes is the
                         // extractors' answer, so a send that starts here and one
                         // that arrives cannot place the same command differently.
-                        let (entity, _) = address_for::<S>(&cmd);
+                        let entity = context_of::<S>(&cmd);
                         if system.inner.resolve::<S::Command>(&entity.path).is_none() {
                             // Failing here drops `cmd`, which is deliberate: a
                             // reply handle inside it tells its caller that no

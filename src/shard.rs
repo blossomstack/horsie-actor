@@ -133,26 +133,33 @@ pub struct EntityContext<S: Shard> {
     pub path: ActorPath,
 }
 
-/// Which actor `cmd` is for, and which shard placement is decided over.
+impl<S: Shard> EntityContext<S> {
+    /// The shard this actor sits in — what placement is decided over.
+    ///
+    /// Derived rather than carried. It is the address above with its last
+    /// segment removed, only the cluster ever asks for it, and a value holding
+    /// two paths that differ by one segment tells them apart by position alone.
+    pub(crate) fn shard_path(&self) -> ActorPath {
+        shard_of(S::TYPE, &self.shard_id)
+    }
+}
+
+/// Which actor `cmd` is for.
 ///
 /// The single source of identity, in both directions: a send that starts here
 /// calls it with the command in hand, and one that arrives from another node
 /// calls it with the command it has just decoded. The address falls out of the
 /// ids rather than the ids out of the address, so there is no second encoding
 /// of who an actor is and nothing to disagree about.
-pub(crate) fn address_for<S: Shard>(cmd: &S::Command) -> (EntityContext<S>, ActorPath) {
+pub(crate) fn context_of<S: Shard>(cmd: &S::Command) -> EntityContext<S> {
     let entity_id = S::entity_id(cmd);
     let shard_id = S::shard_id(cmd);
-    let shard = shard_of(S::TYPE, &shard_id);
     let path = entity_of(S::TYPE, &shard_id, &entity_id);
-    (
-        EntityContext {
-            entity_id,
-            shard_id,
-            path,
-        },
-        shard,
-    )
+    EntityContext {
+        entity_id,
+        shard_id,
+        path,
+    }
 }
 
 #[cfg(test)]
@@ -261,13 +268,13 @@ mod tests {
                 session: "sess-3".into(),
             },
         };
-        let (entity, shard) = address_for::<Session>(&cmd);
+        let entity = context_of::<Session>(&cmd);
 
         assert_eq!(
             entity.path.to_string(),
             "/system/shard/session/17/acct-7|sess-3"
         );
-        assert_eq!(shard.to_string(), "/system/shard/session/17");
+        assert_eq!(entity.shard_path().to_string(), "/system/shard/session/17");
         assert_eq!(entity.shard_id, Bucket(17));
         assert_eq!(entity.entity_id.account, "acct-7");
     }
@@ -284,9 +291,9 @@ mod tests {
                 session: "sess-3".into(),
             },
         };
-        let (first, _) = address_for::<Session>(&open("acct-7"));
-        let (again, _) = address_for::<Session>(&open("acct-7"));
-        let (other, _) = address_for::<Session>(&open("acct-9"));
+        let first = context_of::<Session>(&open("acct-7"));
+        let again = context_of::<Session>(&open("acct-7"));
+        let other = context_of::<Session>(&open("acct-9"));
 
         assert_eq!(first.path, again.path);
         assert_ne!(first.path, other.path);
