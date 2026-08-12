@@ -119,7 +119,7 @@ async fn main() {
     // `/c1` — a top-level actor, created by the system under the root. The name
     // is the actor's identity for as long as it exists.
     let counter = system
-        .actor_of_persistent("c1", Counter { id: "c1".into() })
+        .actor_of("c1", system.persistent(Counter { id: "c1".into() }))
         .unwrap();
 
     counter.tell(Cmd::Inc(3)).await.unwrap();
@@ -133,7 +133,7 @@ async fn main() {
     // incarnation replays what the first one wrote.
     let restarted = ActorSystem::new(journal);
     let revived = restarted
-        .actor_of_persistent("c1", Counter { id: "c1".into() })
+        .actor_of("c1", restarted.persistent(Counter { id: "c1".into() }))
         .unwrap();
     let (tx, rx) = oneshot::channel();
     revived.tell(Cmd::Get(tx)).await.unwrap();
@@ -155,6 +155,8 @@ held.tell(Ping).await?;              // still delivers — to the new one
 ```
 
 Resolution never *creates*. A path with nothing at it fails the send, so a reference cannot wake an actor that nobody asked for.
+
+An event-sourced actor is adapted into an ordinary one first — `system.persistent(actor)`, or `ctx.persistent(actor)` inside an actor — so there is one way to create an actor rather than one per kind of actor. That is what `Persistent<A>` has always been; it just wasn't reachable from user code.
 
 `ctx.actor_of(name, actor)` creates a child under the current actor; `ctx.parent()` is an ordinary reference to the parent's path, typed by the actor's `ParentCommand`, so a child reaches upwards without having been handed anything at construction. Both are get-or-create: two callers naming one path get one actor, and the loser's actor value is dropped without ever being started.
 

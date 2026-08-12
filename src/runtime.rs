@@ -316,22 +316,18 @@ impl<C: Send + 'static, PC: Send + 'static> ActorContext<C, PC> {
         self.system().get_or_create(&self.path, name, actor)
     }
 
-    /// The event-sourced child named `name`, creating it from `actor` if it is
-    /// not there. It recovers from its own `persistence_id` before accepting
-    /// commands.
-    pub fn actor_of_persistent<B>(
-        &self,
-        name: &str,
-        actor: B,
-    ) -> Result<ActorRef<B::Command>, ActorOfError>
-    where
-        B: EventSourcedActor<ParentCommand = C>,
-    {
-        self.system().get_or_create(
-            &self.path,
-            name,
-            crate::Persistent::new(actor, self.journal().clone()),
-        )
+    /// Adapt an event-sourced actor into an ordinary one, over this actor's
+    /// journal — the same adapter [`ActorSystem::persistent`] applies, reached
+    /// from inside an actor.
+    ///
+    /// ```ignore
+    /// ctx.actor_of("agent-main", ctx.persistent(AgentActor::new(..)))?;
+    /// ```
+    ///
+    /// [`ActorSystem::persistent`]: crate::ActorSystem::persistent
+    #[must_use]
+    pub fn persistent<B: EventSourcedActor>(&self, actor: B) -> crate::Persistent<B> {
+        crate::Persistent::new(actor, self.journal().clone())
     }
 
     /// The instance of a registered type `A` under `id`, wherever the cluster

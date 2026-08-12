@@ -365,7 +365,7 @@ mod tests {
     async fn persists_and_applies_events() {
         let system = ActorSystem::in_memory();
         let actor = system
-            .actor_of_persistent("c1", Counter::new("c1"))
+            .actor_of("c1", system.persistent(Counter::new("c1")))
             .unwrap();
         actor.tell(CounterCmd::Inc(3)).await.unwrap();
         actor.tell(CounterCmd::Inc(4)).await.unwrap();
@@ -376,7 +376,7 @@ mod tests {
     async fn ask_with_persist_and_ack_returns_after_durable_write() {
         let system = ActorSystem::in_memory();
         let actor = system
-            .actor_of_persistent("ack", Counter::new("ack"))
+            .actor_of("ack", system.persistent(Counter::new("ack")))
             .unwrap();
         // `ask` resolves only when the actor replies, and `and_ack` replies
         // *after* the event is persisted and folded — so the new value is already
@@ -397,7 +397,7 @@ mod tests {
         );
         let system = ActorSystem::new(journal);
         let actor = system
-            .actor_of_persistent("fail", Counter::new("fail"))
+            .actor_of("fail", system.persistent(Counter::new("fail")))
             .unwrap();
         let durable = actor.ask(|ack| CounterCmd::IncAck(5, ack)).await.unwrap();
         assert!(durable.is_err(), "failed journal write must report Err");
@@ -410,7 +410,7 @@ mod tests {
         let system = ActorSystem::in_memory();
         let counter = Counter::new("hook");
         let seen = counter.persisted.clone();
-        let actor = system.actor_of_persistent("hook", counter).unwrap();
+        let actor = system.actor_of("hook", system.persistent(counter)).unwrap();
         actor.tell(CounterCmd::Inc(3)).await.unwrap();
         actor.tell(CounterCmd::Inc(4)).await.unwrap();
         // Forces both commands through the mailbox before we assert.
@@ -428,7 +428,9 @@ mod tests {
         let system = ActorSystem::new(journal);
         let counter = Counter::new("hookfail");
         let seen = counter.persisted.clone();
-        let actor = system.actor_of_persistent("hookfail", counter).unwrap();
+        let actor = system
+            .actor_of("hookfail", system.persistent(counter))
+            .unwrap();
         let durable = actor.ask(|ack| CounterCmd::IncAck(5, ack)).await.unwrap();
         assert!(durable.is_err(), "the faulty journal must reject the write");
         // Nothing was journaled, so nothing may be published — otherwise an
@@ -443,7 +445,7 @@ mod tests {
 
         // First incarnation persists some events, then stops.
         let a1 = system
-            .actor_of_persistent("c2", Counter::new("c2"))
+            .actor_of("c2", system.persistent(Counter::new("c2")))
             .unwrap();
         a1.tell(CounterCmd::Inc(5)).await.unwrap();
         a1.tell(CounterCmd::Inc(10)).await.unwrap();
@@ -455,7 +457,10 @@ mod tests {
         let (report_tx, report_rx) = oneshot::channel();
         let revived = ActorSystem::new(journal);
         let _a2 = revived
-            .actor_of_persistent("c2", Counter::reporting("c2", report_tx))
+            .actor_of(
+                "c2",
+                revived.persistent(Counter::reporting("c2", report_tx)),
+            )
             .unwrap();
         // Recovery folds the two events back to 15.
         assert_eq!(report_rx.await.unwrap(), 15);
@@ -467,7 +472,7 @@ mod tests {
         let system = ActorSystem::new(journal.clone());
 
         let a1 = system
-            .actor_of_persistent("c3", Counter::new("c3"))
+            .actor_of("c3", system.persistent(Counter::new("c3")))
             .unwrap();
         a1.tell(CounterCmd::Inc(2)).await.unwrap();
         a1.tell(CounterCmd::Inc(2)).await.unwrap();
@@ -494,7 +499,10 @@ mod tests {
         let (report_tx, report_rx) = oneshot::channel();
         let revived = ActorSystem::new(journal);
         let _a2 = revived
-            .actor_of_persistent("c3", Counter::reporting("c3", report_tx))
+            .actor_of(
+                "c3",
+                revived.persistent(Counter::reporting("c3", report_tx)),
+            )
             .unwrap();
         // snapshot (4) + replayed post-snapshot event (1) == 5.
         assert_eq!(report_rx.await.unwrap(), 5);
@@ -533,7 +541,7 @@ mod tests {
                 match cmd {
                     ParentCmd::Start => {
                         let child = ctx
-                            .actor_of_persistent("child", Counter::new("child"))
+                            .actor_of("child", ctx.persistent(Counter::new("child")))
                             .unwrap();
                         child.tell(CounterCmd::Inc(42)).await.unwrap();
                         self.child = Some(child);
@@ -552,7 +560,7 @@ mod tests {
 
         let system = ActorSystem::in_memory();
         let parent = system
-            .actor_of_persistent("parent", Parent { child: None })
+            .actor_of("parent", system.persistent(Parent { child: None }))
             .unwrap();
         parent.tell(ParentCmd::Start).await.unwrap();
         // Give the child a moment to process the increment.

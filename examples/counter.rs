@@ -82,7 +82,7 @@ async fn main() {
     // `/c1` — a top-level actor, created by the system under the root. The name
     // is the actor's identity for as long as it exists.
     let counter = system
-        .actor_of_persistent("c1", Counter { id: "c1".into() })
+        .actor_of("c1", system.persistent(Counter { id: "c1".into() }))
         .unwrap();
 
     counter.tell(Cmd::Inc(3)).await.unwrap();
@@ -96,7 +96,7 @@ async fn main() {
     // incarnation replays what the first one wrote.
     let restarted = ActorSystem::new(journal);
     let revived = restarted
-        .actor_of_persistent("c1", Counter { id: "c1".into() })
+        .actor_of("c1", restarted.persistent(Counter { id: "c1".into() }))
         .unwrap();
     let (tx, rx) = oneshot::channel();
     revived.tell(Cmd::Get(tx)).await.unwrap();
