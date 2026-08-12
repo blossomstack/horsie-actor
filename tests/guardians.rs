@@ -8,7 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
-use horsie_actor::{Actor, ActorContext, ActorPath, ActorRef, ActorSystem, Flow, ReplyTo, Root};
+use horsie_actor::{Actor, ActorContext, ActorPath, ActorRef, ActorSystem, Flow, ReplyTo};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -34,9 +34,8 @@ enum Grow {
 impl Actor for Link {
     type Command = Grow;
     // Every level takes the same commands, so a child's parent does too.
-    type ParentCommand = Grow;
 
-    async fn handle(&mut self, cmd: Grow, ctx: &mut ActorContext<Grow, Grow>) -> Flow {
+    async fn handle(&mut self, cmd: Grow, ctx: &mut ActorContext<Grow>) -> Flow {
         match cmd {
             Grow::Child(reply) => {
                 let child = ctx
@@ -259,7 +258,6 @@ async fn stopping_a_shard_reference_drains_what_this_node_hosts() {
     #[async_trait]
     impl Actor for Entity {
         type Command = Ping;
-        type ParentCommand = Root;
         async fn handle(&mut self, _cmd: Ping, _ctx: &mut ActorContext<Ping>) -> Flow {
             Flow::Continue
         }
@@ -303,7 +301,6 @@ async fn the_tree_is_the_paths_not_the_types() {
     #[async_trait]
     impl Actor for Loner {
         type Command = ();
-        type ParentCommand = Root;
         async fn handle(&mut self, _cmd: (), _ctx: &mut ActorContext<()>) -> Flow {
             Flow::Continue
         }

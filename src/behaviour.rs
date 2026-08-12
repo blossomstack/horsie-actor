@@ -47,54 +47,18 @@ pub trait Actor: Send + Sized + 'static {
     /// Messages the actor accepts.
     type Command: Send + 'static;
 
-    /// What this actor's parent accepts — and so what
-    /// [`ActorContext::parent`] hands back a reference to. [`Root`] for a
-    /// top-level actor, whose parent takes no messages at all.
-    ///
-    /// An associated type rather than a lookup by name, so a child reaching
-    /// upwards is checked by the compiler. The parent's *commands* rather than
-    /// the parent's type, because that is all a child depends on — and because
-    /// it is what lets a test put a double at the parent's path without the
-    /// child knowing or the parent's implementation being nameable.
-    ///
-    /// [`ActorContext::parent`]: crate::ActorContext::parent
-    type ParentCommand: Send + 'static;
-
     /// Handle one command, then say whether to keep going.
-    async fn handle(
-        &mut self,
-        cmd: Self::Command,
-        ctx: &mut ActorContext<Self::Command, Self::ParentCommand>,
-    ) -> Flow;
+    async fn handle(&mut self, cmd: Self::Command, ctx: &mut ActorContext<Self::Command>) -> Flow;
 
     /// Runs once before the first command is handled.
     ///
     /// Returning `Err` aborts startup: the actor processes nothing and its
     /// mailbox closes. That is the honest outcome for a failed recovery — an
     /// actor that cannot rebuild its state has nothing to serve.
-    async fn on_start(
-        &mut self,
-        _ctx: &mut ActorContext<Self::Command, Self::ParentCommand>,
-    ) -> Result<(), StartError> {
+    async fn on_start(&mut self, _ctx: &mut ActorContext<Self::Command>) -> Result<(), StartError> {
         Ok(())
     }
 }
-
-/// What the root of the tree accepts: nothing.
-///
-/// `/` exists so that every actor has a parent and a path has somewhere to
-/// start. No actor is there and it holds no behaviour — so an actor at the top
-/// declares `type ParentCommand = Root` and gets a reference from
-/// [`ActorContext::parent`] it can hold and never send through. This type has no
-/// values; the type system is what says root takes no messages, rather than a
-/// runtime error on the first attempt.
-///
-/// Note what this does *not* mean: every actor below root does own its children
-/// and takes them with it when it stops. Root is the one place the chain ends,
-/// because there is nothing there to end it.
-///
-/// [`ActorContext::parent`]: crate::ActorContext::parent
-pub enum Root {}
 
 #[cfg(test)]
 #[allow(
@@ -120,7 +84,6 @@ mod tests {
     #[async_trait]
     impl Actor for Adder {
         type Command = Cmd;
-        type ParentCommand = Root;
 
         async fn handle(&mut self, cmd: Cmd, _ctx: &mut ActorContext<Cmd>) -> Flow {
             match cmd {
@@ -158,7 +121,6 @@ mod tests {
         #[async_trait]
         impl Actor for Stopper {
             type Command = ();
-            type ParentCommand = Root;
             async fn handle(&mut self, _cmd: (), _ctx: &mut ActorContext<()>) -> Flow {
                 Flow::Stop
             }

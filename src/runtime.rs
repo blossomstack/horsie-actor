@@ -1,12 +1,12 @@
 use crate::actor::EventSourcedActor;
-use crate::behaviour::{Actor, Flow, Root};
+use crate::behaviour::{Actor, Flow};
 use crate::error::TellError;
 use crate::journal::Journal;
 use crate::path::{ActorPath, is_valid_name};
 use crate::reply::ReplyTo;
 use crate::system::{ActorOfError, SystemInner};
 use parking_lot::Mutex;
-use std::marker::PhantomData;
+
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
 
@@ -299,31 +299,31 @@ impl<C> Link<C> {
     }
 }
 
-/// Handle to the runtime from inside an actor: its own path, its parent, its
-/// children, and the journal for actors that manage persistence themselves.
+/// Handle to the runtime from inside an actor: its own path, its children, and
+/// the journal for actors that manage persistence themselves.
 ///
-/// Parameterized by the **command** types rather than the actor types, so an
-/// actor and an adapter wrapping it (see [`Persistent`]) hand out the same
-/// context. Parameterized by actor type they would be two incompatible types for
-/// one mailbox.
+/// Parameterized by the **command** type rather than the actor type, so an actor
+/// and an adapter wrapping it (see [`Persistent`]) hand out the same context.
+/// Parameterized by actor type they would be two incompatible types for one
+/// mailbox.
 ///
-/// `PC` is the parent's command type, which is what makes [`parent`](Self::parent)
-/// a typed reference rather than a lookup by string. It defaults to [`Root`], so
-/// an actor at the top of the tree writes `ActorContext<MyCommand>` and never
-/// mentions it.
+/// There is deliberately no `parent()`. A reference to a parent is *given* to a
+/// child — by the parent at `actor_of`, or by a shard recipe that closed over
+/// one — so it is typed at the point it is made and never asserted. A typed
+/// `parent()` would have to carry the parent's command type through every
+/// signature that touches a context, to serve the few actors that reach upwards,
+/// and the check it bought would not survive the parent moving to another host:
+/// a remote command is typed by its registered decoder at delivery, not by the
+/// caller. Akka Typed removed the same method for the same reason.
 ///
 /// [`Persistent`]: crate::Persistent
-/// [`Root`]: crate::Root
-pub struct ActorContext<C, PC = Root> {
+pub struct ActorContext<C> {
     pub(crate) inner: Arc<SystemInner>,
     pub(crate) self_tx: mpsc::Sender<C>,
     pub(crate) path: ActorPath,
-    /// `fn() -> PC` rather than `PC`, so the context is `Send`/`Sync` on its own
-    /// merits and does not inherit the parent command type's.
-    pub(crate) parent: PhantomData<fn() -> PC>,
 }
 
-impl<C: Send + 'static, PC: Send + 'static> ActorContext<C, PC> {
+impl<C: Send + 'static> ActorContext<C> {
     /// Where this actor is, which is what it is.
     #[must_use]
     pub fn path(&self) -> &ActorPath {
@@ -340,28 +340,6 @@ impl<C: Send + 'static, PC: Send + 'static> ActorContext<C, PC> {
         )
     }
 
-    /// A reference to this actor's parent.
-    ///
-    /// An ordinary reference to an ordinary path — nothing was handed down at
-    /// construction, which is what an actor built on a host that never saw its
-    /// parent needs. An actor at the top of the tree gets a reference it can
-    /// hold and never send through, because [`Root`] has no values: the type
-    /// system says root takes no messages.
-    ///
-    /// A plain read, and safe as one, because a parent that stops takes its
-    /// children with it. There is no state in which this addresses an actor that
-    /// has gone while the one holding it is still running.
-    ///
-    /// [`Root`]: crate::Root
-    #[must_use]
-    pub fn parent(&self) -> ActorRef<PC> {
-        ActorRef::at(
-            self.path.parent().unwrap_or_else(ActorPath::root),
-            None,
-            Arc::downgrade(&self.inner),
-        )
-    }
-
     /// The child named `name`, creating it from `actor` if it is not there.
     ///
     /// Get-or-create: two callers naming one path get one actor, and the loser's
@@ -369,13 +347,15 @@ impl<C: Send + 'static, PC: Send + 'static> ActorContext<C, PC> {
     /// event-sourced children, where two instances at one name means two actors
     /// writing one journal.
     ///
-    /// The bound is what makes the tree honest — a child may only be created
-    /// under a parent whose commands it declared as its
-    /// [`ParentCommand`](Actor::ParentCommand).
-    pub fn actor_of<B>(&self, name: &str, actor: B) -> Result<ActorRef<B::Command>, ActorOfError>
-    where
-        B: Actor<ParentCommand = C>,
-    {
+    /// A child that needs to reach back is *given* the reference — `ctx.self_ref()`
+    /// at this call, or a shard reference closed over by a recipe. There is no
+    /// `parent()` to read one from, on purpose: see the type-level note on
+    /// [`ActorSystem`](crate::ActorSystem).
+    pub fn actor_of<B: Actor>(
+        &self,
+        name: &str,
+        actor: B,
+    ) -> Result<ActorRef<B::Command>, ActorOfError> {
         self.system().get_or_create(&self.path, name, actor)
     }
 
@@ -447,7 +427,6 @@ pub(crate) fn spawn_at<A: Actor>(
         inner,
         self_tx: tx.clone(),
         path,
-        parent: PhantomData,
     };
     tokio::spawn(run_actor(actor, rx, ctx, stop_rx, ended));
     Spawned {
@@ -476,7 +455,7 @@ pub(crate) fn check_name(name: &str) -> Result<(), ActorOfError> {
 pub(crate) async fn run_actor<A: Actor>(
     mut actor: A,
     mut rx: mpsc::Receiver<A::Command>,
-    mut ctx: ActorContext<A::Command, A::ParentCommand>,
+    mut ctx: ActorContext<A::Command>,
     mut stop: tokio::sync::watch::Receiver<bool>,
     ended: tokio::sync::watch::Sender<()>,
 ) {
@@ -505,7 +484,7 @@ pub(crate) async fn run_actor<A: Actor>(
 async fn serve<A: Actor>(
     actor: &mut A,
     rx: &mut mpsc::Receiver<A::Command>,
-    ctx: &mut ActorContext<A::Command, A::ParentCommand>,
+    ctx: &mut ActorContext<A::Command>,
     stand_down: &mut tokio::sync::watch::Receiver<bool>,
     stop: &mut tokio::sync::watch::Receiver<bool>,
 ) {

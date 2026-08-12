@@ -9,7 +9,7 @@ same identity recovers exactly where the previous one left off.
 
 ```toml
 [dependencies]
-horsie-actor = "0.10"
+horsie-actor = "0.11"
 ```
 
 ## Two traits
@@ -47,7 +47,6 @@ and runs it — if the API moves, this stops building.
 use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, ActorSystem, CommandEffect, EventSourcedActor, InMemoryJournal, PersistenceId,
-    Root,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -77,8 +76,6 @@ impl EventSourcedActor for Counter {
     type Command = Cmd;
     type Event = Event;
     type State = State;
-    // A top-level actor is a child of the root, which takes no messages.
-    type ParentCommand = Root;
 
     fn persistence_id(&self) -> PersistenceId {
         PersistenceId::new("counter", self.id.clone())
@@ -158,7 +155,9 @@ Resolution never *creates*. A path with nothing at it fails the send, so a refer
 
 An event-sourced actor is adapted into an ordinary one first — `system.persistent(actor)`, or `ctx.persistent(actor)` inside an actor — so there is one way to create an actor rather than one per kind of actor. That is what `Persistent<A>` has always been; it just wasn't reachable from user code.
 
-`ctx.actor_of(name, actor)` creates a child under the current actor; `ctx.parent()` is an ordinary reference to the parent's path, typed by the actor's `ParentCommand`, so a child reaches upwards without having been handed anything at construction. Both are get-or-create: two callers naming one path get one actor, and the loser's actor value is dropped without ever being started.
+`ctx.actor_of(name, actor)` creates a child under the current actor, get-or-create: two callers naming one path get one actor, and the loser's actor value is dropped without ever being started.
+
+There is no `parent()`. A child that needs to reach back is *given* a reference — `ctx.self_ref()` where it is created, or a shard reference a recipe closed over — so the reference is typed where it is made and nothing is ever asserted about it. That costs nothing a lookup would have bought, because what a child holds is a name with a warm cache: hand it down, stop the parent, recreate it, and the same reference reaches the new instance.
 
 An actor owns the actors below it. `held.stop()` — or `system.stop(&path)` — stops it and everything under it, children first, and returns once the subtree is quiet:
 
@@ -166,7 +165,7 @@ An actor owns the actors below it. `held.stop()` — or `system.stop(&path)` —
 sessions.stop().await;   // and every session under it, and their agents
 ```
 
-Stopping from the inside is the same operation: an actor that returns `Flow::Stop`, or one whose node stands down, takes its children with it too. So "unload this account" is one call rather than a walk, a stopped actor leaves the registry rather than sitting in it, and `ctx.parent()` is safe as a plain read — a child cannot outlive the actor it reaches up to.
+Stopping from the inside is the same operation: an actor that returns `Flow::Stop`, or one whose node stands down, takes its children with it too. So "unload this account" is one call rather than a walk, a stopped actor leaves the registry rather than sitting in it, and a child cannot outlive the actor it reaches up to.
 
 ## Durability you can wait on
 
@@ -218,7 +217,7 @@ fence — so a new backend can be held to it.
 
 ## Clustering
 
-An actor tree is **node-local**: a parent and its children are always on the same machine. Clustering happens only at the roots, so supervision stays local, `ctx.parent()` is always a live local link, and "stop everything under here" is a prefix scan over one map rather than a cluster-wide operation.
+An actor tree is **node-local**: a parent and its children are always on the same machine. Clustering happens only at the roots, so supervision stays local, a reference upwards is always a live local link, and "stop everything under here" is a prefix scan over one map rather than a cluster-wide operation.
 
 A shard type is registered once per node, with that node's own wiring:
 

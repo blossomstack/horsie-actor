@@ -10,8 +10,7 @@
 use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, ActorPath, ActorSystem, ClusterConfig, ClusterNode, CommandEffect, Envelope,
-    EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, RaftStore, ReplyTo, Root,
-    Shard,
+    EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, RaftStore, ReplyTo, Shard,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -99,7 +98,6 @@ impl EventSourcedActor for Counter {
     type Command = CounterCmd;
     type Event = Incremented;
     type State = CounterState;
-    type ParentCommand = Root;
 
     fn persistence_id(&self) -> PersistenceId {
         PersistenceId::new("counter", self.id.clone())

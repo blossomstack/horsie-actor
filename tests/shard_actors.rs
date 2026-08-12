@@ -16,7 +16,7 @@
 use async_trait::async_trait;
 use horsie_actor::{
     Actor, ActorContext, ActorSystem, ClusterConfig, ClusterNode, Flow, InMemoryJournal, Journal,
-    NodeId, RaftStore, ReplyTo, Root, Shard,
+    NodeId, RaftStore, ReplyTo, Shard,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -55,7 +55,6 @@ impl SessionCmd {
 #[async_trait]
 impl Actor for Session {
     type Command = SessionCmd;
-    type ParentCommand = Root;
 
     async fn handle(&mut self, cmd: SessionCmd, _ctx: &mut ActorContext<SessionCmd>) -> Flow {
         match cmd {
@@ -99,7 +98,6 @@ struct Knock;
 #[async_trait]
 impl Actor for Stranger {
     type Command = Knock;
-    type ParentCommand = Root;
     async fn handle(&mut self, _cmd: Knock, _ctx: &mut ActorContext<Knock>) -> Flow {
         Flow::Continue
     }

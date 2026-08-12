@@ -8,7 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
-use horsie_actor::{Actor, ActorContext, ActorOfError, ActorRef, ActorSystem, Flow, ReplyTo, Root};
+use horsie_actor::{Actor, ActorContext, ActorOfError, ActorRef, ActorSystem, Flow, ReplyTo};
 use tokio::sync::oneshot;
 
 /// Answers which instance it is, and reports when it is gone.
@@ -51,7 +51,6 @@ impl Drop for Instance {
 #[async_trait]
 impl Actor for Instance {
     type Command = Which;
-    type ParentCommand = Root;
 
     async fn handle(&mut self, cmd: Which, ctx: &mut ActorContext<Which>) -> Flow {
         match cmd {
@@ -60,8 +59,11 @@ impl Actor for Instance {
                 Flow::Continue
             }
             Which::MakeHelper(reply) => {
-                // A child is created by its parent, under its parent's path.
-                match ctx.actor_of("helper", Helper { parent: None }) {
+                // A child is created by its parent, under its parent's path —
+                // and is given the reference it needs to reach back, typed at
+                // the point it is made rather than asserted later.
+                let parent = ctx.self_ref();
+                match ctx.actor_of("helper", Helper { parent }) {
                     Ok(helper) => {
                         let _ = reply.send(helper);
                     }
@@ -74,14 +76,16 @@ impl Actor for Instance {
     }
 }
 
-/// A child that reaches its parent by name, having been handed nothing at
-/// construction — which is what an actor built on a host that never saw its
-/// parent has to be able to do.
+/// A child that reaches its parent through a reference it was given.
 struct Helper {
-    /// Resolved once and then held, so a later send goes through a cached link
-    /// rather than resolving afresh. Holding it is the realistic case, and the
-    /// only one that exercises a link going stale under its holder.
-    parent: Option<ActorRef<Which>>,
+    /// Held from construction, so a send goes through a cached link rather than
+    /// resolving afresh. Holding it is the realistic case, and the only one that
+    /// exercises a link going stale under its holder.
+    ///
+    /// A *name* with a warm cache, not a handle to one mailbox — which is why
+    /// being handed this at construction costs nothing that reading it back from
+    /// the tree would have bought.
+    parent: ActorRef<Which>,
 }
 
 enum HelperCmd {
@@ -91,13 +95,12 @@ enum HelperCmd {
 #[async_trait]
 impl Actor for Helper {
     type Command = HelperCmd;
-    type ParentCommand = Which;
 
-    async fn handle(&mut self, cmd: HelperCmd, ctx: &mut ActorContext<HelperCmd, Which>) -> Flow {
+    async fn handle(&mut self, cmd: HelperCmd, ctx: &mut ActorContext<HelperCmd>) -> Flow {
         match cmd {
             HelperCmd::AskUpwards(reply) => {
-                let parent = self.parent.get_or_insert_with(|| ctx.parent());
-                let generation = parent.ask(Which::Ask).await.unwrap_or(0);
+                let _ = ctx;
+                let generation = self.parent.ask(Which::Ask).await.unwrap_or(0);
                 let _ = reply.send(generation);
                 Flow::Continue
             }
@@ -196,10 +199,10 @@ async fn a_path_held_by_another_type_is_reported() {
     let system = ActorSystem::in_memory();
 
     let (instance, _gone) = Instance::new(1);
-    system.actor_of("worker", instance).unwrap();
+    let taken = system.actor_of("worker", instance).unwrap();
 
     let err = system
-        .actor_of("worker", Helper { parent: None })
+        .actor_of("worker", Helper { parent: taken })
         .unwrap_err();
     assert!(matches!(err, ActorOfError::PathTaken(path) if path.to_string() == "/worker"));
 }
@@ -223,10 +226,10 @@ async fn a_child_lives_under_its_parent() {
     assert_ne!(helper_a.path(), helper_b.path());
 }
 
-/// `ctx.parent()` is an ordinary ref to the parent's path — resolved by name,
-/// not handed down.
+/// A child reaches upwards through a reference its parent gave it, which is
+/// typed where it is made — no lookup, and nothing to assert.
 #[tokio::test]
-async fn a_child_names_its_parent() {
+async fn a_child_reaches_the_parent_it_was_given() {
     let system = ActorSystem::in_memory();
 
     let (parent, _parent_gone) = Instance::new(3);
@@ -241,8 +244,10 @@ async fn a_child_names_its_parent() {
 /// Stopping the parent takes the child with it, so both references point at
 /// nothing for a moment; recreating the pair makes both live again, and neither
 /// holder was told anything. The child's own reference survives, and so does the
-/// reference it holds *upwards* — which is the one that would be a dangling
-/// handle in any design where a parent were passed down at construction.
+/// reference it holds *upwards* — even though that one was handed to it at
+/// construction, because what it was handed is a name with a warm cache rather
+/// than a handle to one mailbox. That is the whole difference between this
+/// design and the one where an `ActorRef` was an `mpsc::Sender`.
 #[tokio::test]
 async fn refs_into_a_branch_survive_the_branch_being_rebuilt() {
     let system = ActorSystem::in_memory();

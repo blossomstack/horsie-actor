@@ -10,7 +10,6 @@
 use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, ActorSystem, CommandEffect, EventSourcedActor, InMemoryJournal, PersistenceId,
-    Root,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -40,8 +39,6 @@ impl EventSourcedActor for Counter {
     type Command = Cmd;
     type Event = Event;
     type State = State;
-    // A top-level actor is a child of the root, which takes no messages.
-    type ParentCommand = Root;
 
     fn persistence_id(&self) -> PersistenceId {
         PersistenceId::new("counter", self.id.clone())
