@@ -7,9 +7,7 @@ use crate::journal::{InMemoryJournal, Journal};
 use crate::path::ActorPath;
 use crate::persistent::Persistent;
 use crate::runtime::{ActorRef, Link, check_name, spawn_at};
-use crate::shard::{
-    EntityContext, Shard, UnreadableAddress, address_for, entity_in, region_of, shard_in, type_in,
-};
+use crate::shard::{EntityContext, Shard, address_for, region_of, type_in};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -33,18 +31,9 @@ fn deliver_to<C: Send + 'static>(path: ActorPath, link: Link<C>, wire: Wire<C>) 
         let link = link.clone();
         let wire = wire.clone();
         Box::pin(async move {
-            // Decoded inside the router context so a `ReplyTo` in the command
-            // comes back knowing how to answer whoever asked. Out of context it
-            // decodes to an error instead, which is the difference between a
-            // failed request and a caller that waits forever.
-            let cmd = match system.cluster() {
-                Some(cluster) => {
-                    let router: Arc<dyn crate::reply::ReplyRouter> = cluster.clone();
-                    crate::reply::with_router(router, || (wire.decode)(&payload))
-                }
-                None => (wire.decode)(&payload),
-            }
-            .ok_or_else(|| DispatchError::Decode(path.to_string()))?;
+            let cmd = system
+                .decode_arrival(&wire, &payload)
+                .ok_or_else(|| DispatchError::Decode(path.to_string()))?;
             link.send(cmd)
                 .await
                 .map_err(|_| DispatchError::MailboxClosed)
@@ -104,14 +93,6 @@ pub enum ActorOfError {
     #[error("two shard types are registered as '{0}'")]
     TypeCollision(&'static str),
 
-    /// A registered type claims this address and cannot read an id in it.
-    ///
-    /// Separate from "nothing claims it" because the fix is different: this one
-    /// is a node being handed an id in a shape it does not know, which is what
-    /// a half-finished rollout looks like from the new side.
-    #[error(transparent)]
-    Unreadable(#[from] UnreadableAddress),
-
     /// The name could not be one path segment — it was empty, or it contained
     /// the separator, which would make one actor's path ambiguous with another's.
     #[error("'{0}' is not a usable actor name")]
@@ -142,13 +123,39 @@ const DEDUP_WINDOW: usize = 4096;
 /// different kinds can share one registry.
 type ErasedRef = Arc<dyn Any + Send + Sync>;
 
-/// Builds and starts whatever belongs at a shard address, on the node that owns
-/// it.
+/// What this node knows about one registered shard type.
+struct Registered {
+    /// Take a payload that arrived from another node all the way to its actor.
+    ///
+    /// Type-erased, because a node handling an envelope has bytes and a path
+    /// rather than a Rust type. It knows `S` from the inside, which is what
+    /// lets it decode first and take the ids off the command — so identity
+    /// arrives the same way here as on a send that started locally.
+    receive: Receive,
+    /// The same recipe, kept typed behind [`Any`] for a send that starts here
+    /// and so already holds the command.
+    ///
+    /// Downcast by a caller that names `S`, exactly as a [`Wire`] is.
+    build: Arc<dyn Any + Send + Sync>,
+}
+
+/// Builds and starts one actor of a known type, on the node that owns it.
 ///
-/// Type-erased because a node that has to build has a path, not a Rust type.
 /// Closes over that node's own wiring, which is why it is registered on every
 /// node rather than sent to one.
-type Recipe = Arc<dyn Fn(&ActorSystem, &ActorPath) -> Result<(), ActorOfError> + Send + Sync>;
+type Build<S> =
+    Arc<dyn Fn(&ActorSystem, &EntityContext<S>) -> Result<(), ActorOfError> + Send + Sync>;
+
+/// Decodes an inbound payload for one shard type, builds if it has to, delivers.
+type Receive = Arc<
+    dyn Fn(
+            ActorSystem,
+            ActorPath,
+            Vec<u8>,
+        ) -> futures_util::future::BoxFuture<'static, Result<(), DispatchError>>
+        + Send
+        + Sync,
+>;
 
 /// Hands an inbound payload to the actor at one specific path.
 ///
@@ -216,10 +223,10 @@ struct Entry {
 /// Process-wide state shared by every actor in a system.
 pub(crate) struct SystemInner {
     pub(crate) journal: Arc<dyn Journal>,
-    /// How to build each registered shard type, by `Shard::TYPE` — which is the
-    /// third segment of every shard address, so a node holding only a path can
-    /// find the recipe for what belongs there.
-    shards: Mutex<HashMap<&'static str, Recipe>>,
+    /// What is known about each registered shard type, by `Shard::TYPE` — which
+    /// is the third segment of every shard address, and the only part of one
+    /// this node ever reads.
+    shards: Mutex<HashMap<&'static str, Registered>>,
     cluster: Option<Arc<ClusterNode>>,
     /// Message ids this node has already handled.
     ///
@@ -283,6 +290,15 @@ impl SystemInner {
     ///
     /// The outer `Option` is whether anything is there at all; the inner one is
     /// whether it can be reached from another node.
+    /// How a shard type takes delivery of an inbound payload, if it is
+    /// registered here.
+    fn receiver(&self, type_name: &str) -> Option<Receive> {
+        self.shards
+            .lock()
+            .get(type_name)
+            .map(|registered| registered.receive.clone())
+    }
+
     fn deliver_here(&self, path: &ActorPath) -> Option<Option<DeliverHere>> {
         Some(self.live.lock().get(path)?.deliver.clone())
     }
@@ -608,16 +624,16 @@ impl ActorSystem {
             let system = system.clone();
             Box::pin(async move {
                 let (entity, shard) = address_for::<S>(&cmd);
-                system.deliver_to_shard::<S>(entity, shard, cmd).await
+                system.deliver_to_shard(entity, shard, cmd).await
             })
         });
         self.reference(region_of(S::TYPE), Some(Link::Remote(route)))
     }
 
-    /// Hand `cmd` to the actor at `entity`, wherever the cluster puts it.
+    /// Hand `cmd` to the actor it names, wherever the cluster puts it.
     async fn deliver_to_shard<S: Shard>(
         &self,
-        entity: ActorPath,
+        entity: EntityContext<S>,
         shard: ActorPath,
         cmd: S::Command,
     ) -> Result<(), TellError> {
@@ -650,7 +666,7 @@ impl ActorSystem {
         cluster
             .send(
                 &shard.to_string(),
-                &entity.to_string(),
+                &entity.path.to_string(),
                 payload,
                 cluster.next_message_id(),
             )
@@ -658,33 +674,53 @@ impl ActorSystem {
             .map_err(|_| TellError::Undeliverable)
     }
 
-    /// The actor at a shard address on this node, building it from the
+    /// The actor this context names on this node, building it from the
     /// registered recipe if it is not running yet.
     fn start_shard_actor<S: Shard>(
         &self,
-        entity: &ActorPath,
+        entity: &EntityContext<S>,
     ) -> Result<Link<S::Command>, ActorOfError> {
-        if let Some(link) = self.inner.resolve::<S::Command>(entity) {
+        if let Some(link) = self.inner.resolve::<S::Command>(&entity.path) {
             return Ok(link);
         }
-        self.build_at(entity)?;
+        self.build_shard_actor(entity)?;
         self.inner
-            .resolve::<S::Command>(entity)
-            .ok_or_else(|| ActorOfError::Unclaimed(entity.clone()))
+            .resolve::<S::Command>(&entity.path)
+            .ok_or_else(|| ActorOfError::Unclaimed(entity.path.clone()))
     }
 
-    /// Run the registered recipe for whatever belongs at `path`.
-    fn build_at(&self, path: &ActorPath) -> Result<(), ActorOfError> {
-        let type_name = type_in(path).ok_or_else(|| ActorOfError::Unclaimed(path.clone()))?;
-        let recipe = self
+    /// Run the registered recipe for the actor this context names.
+    fn build_shard_actor<S: Shard>(&self, entity: &EntityContext<S>) -> Result<(), ActorOfError> {
+        let erased = self
             .inner
             .shards
             .lock()
-            .get(type_name)
-            .cloned()
-            .ok_or_else(|| ActorOfError::Unclaimed(path.clone()))?;
-        recipe(self, path)?;
-        Ok(())
+            .get(S::TYPE)
+            .map(|registered| registered.build.clone())
+            .ok_or_else(|| ActorOfError::Unclaimed(entity.path.clone()))?;
+        // A hit under this name that is not this type's recipe means two types
+        // answer to one `TYPE`, which registration refuses — so reaching here
+        // is that refusal having been bypassed rather than a runtime condition.
+        let build = erased
+            .downcast_ref::<Build<S>>()
+            .ok_or(ActorOfError::TypeCollision(S::TYPE))?;
+        build(self, entity)
+    }
+
+    /// Decode a command that arrived from another node.
+    ///
+    /// Inside the router context so a `ReplyTo` in the command comes back
+    /// knowing how to answer whoever asked. Out of context it decodes to an
+    /// error instead, which is the difference between a failed request and a
+    /// caller that waits forever.
+    fn decode_arrival<C: Send + 'static>(&self, wire: &Wire<C>, payload: &[u8]) -> Option<C> {
+        match self.cluster() {
+            Some(cluster) => {
+                let router: Arc<dyn crate::reply::ReplyRouter> = cluster.clone();
+                crate::reply::with_router(router, || (wire.decode)(payload))
+            }
+            None => (wire.decode)(payload),
+        }
     }
 
     /// Refuse everything while this node has no quorum.
@@ -739,17 +775,12 @@ impl ActorSystem {
         }
 
         // A shard actor this node owns but has not started yet. The one case
-        // where an inbound message creates an actor — and it can, because the
-        // address names the type and every node registered a recipe for it.
-        if type_in(&path).is_some() {
-            // Carried out rather than flattened into "nothing is there": the
-            // address named a type this node knows, so a failure here says
-            // something about the sender — an unreadable id, an unregistered
-            // type — that the receiving side is the only one placed to report.
-            self.build_at(&path)?;
-            if let Some(Some(deliver)) = self.inner.deliver_here(&path) {
-                return deliver(env.payload, self.clone()).await;
-            }
+        // where an inbound message creates an actor, and the address is read
+        // only for the type — which is the whole of what it has to say. Which
+        // actor and which shard come off the command, once the type's own
+        // receiver has decoded it.
+        if let Some(receive) = type_in(&path).and_then(|type_name| self.inner.receiver(type_name)) {
+            return receive(self.clone(), path, env.payload).await;
         }
 
         Err(DispatchError::NoActor(path))
@@ -786,30 +817,70 @@ impl<S: Shard> ShardOf<'_, S> {
         let system = self.system;
         system.record_wire::<S::Command>(std::any::type_name::<S>());
 
-        // The one place an address is read back into an identity. Building is
-        // reached from a send, which had the command and so both extractors, and
-        // from an inbound envelope, which had only text; putting the parse here
-        // rather than at either of those means the two cannot come to different
-        // conclusions about who lives at an address.
-        let built: Recipe = Arc::new(move |system: &ActorSystem, path: &ActorPath| {
-            let entity = EntityContext::<S> {
-                entity_id: entity_in::<S>(path)?,
-                shard_id: shard_in::<S>(path)?,
-                path: path.clone(),
-            };
-            let (Some(parent), Some(name)) = (path.parent(), path.name()) else {
-                return Err(ActorOfError::Unclaimed(path.clone()));
+        let build: Build<S> = Arc::new(move |system: &ActorSystem, entity: &EntityContext<S>| {
+            let (Some(parent), Some(name)) = (entity.path.parent(), entity.path.name()) else {
+                return Err(ActorOfError::Unclaimed(entity.path.clone()));
             };
             system
-                .get_or_create(&parent, name, recipe(system, &entity))
+                .get_or_create(&parent, name, recipe(system, entity))
                 .map(|_| ())
         });
+
+        // Everything a payload from another node has to go through, in the one
+        // place that still knows `S`. Decoding first is what breaks the
+        // circularity the old shape had: a decoder used to be reachable only
+        // through the actor already sitting at the address, so the actor had to
+        // exist before the command could be read, so identity had to come out
+        // of the address instead of out of the command.
+        let receive: Receive = {
+            let build = Arc::clone(&build);
+            Arc::new(
+                move |system: ActorSystem, arrived_at: ActorPath, payload: Vec<u8>| {
+                    let build = Arc::clone(&build);
+                    Box::pin(async move {
+                        let wire = system
+                            .inner
+                            .wire::<S::Command>()
+                            .ok_or_else(|| DispatchError::NoActor(arrived_at.clone()))?;
+                        let cmd = system
+                            .decode_arrival(&wire, &payload)
+                            .ok_or_else(|| DispatchError::Decode(arrived_at.to_string()))?;
+
+                        // The address it arrived at named the type and has now
+                        // said all it has to say. Where the actor goes is the
+                        // extractors' answer, so a send that starts here and one
+                        // that arrives cannot place the same command differently.
+                        let (entity, _) = address_for::<S>(&cmd);
+                        if system.inner.resolve::<S::Command>(&entity.path).is_none() {
+                            // Failing here drops `cmd`, which is deliberate: a
+                            // reply handle inside it tells its caller that no
+                            // answer is coming exactly when it is dropped, and
+                            // a caller left waiting is the worse outcome.
+                            build(&system, &entity)?;
+                        }
+                        let link = system
+                            .inner
+                            .resolve::<S::Command>(&entity.path)
+                            .ok_or_else(|| DispatchError::NoActor(entity.path.clone()))?;
+                        link.send(cmd)
+                            .await
+                            .map_err(|_| DispatchError::MailboxClosed)
+                    })
+                },
+            )
+        };
 
         let mut shards = system.inner.shards.lock();
         if shards.contains_key(S::TYPE) {
             return Err(ActorOfError::TypeCollision(S::TYPE));
         }
-        shards.insert(S::TYPE, built);
+        shards.insert(
+            S::TYPE,
+            Registered {
+                receive,
+                build: Arc::new(build) as Arc<dyn Any + Send + Sync>,
+            },
+        );
         Ok(())
     }
 }
@@ -828,7 +899,6 @@ mod tests {
     use crate::persistence_id::PersistenceId;
     use crate::reply::ReplyTo;
     use crate::runtime::ActorContext;
-    use crate::shard::AddressPart;
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
 
@@ -1107,6 +1177,71 @@ mod tests {
     struct Announce {
         at: Bucket,
         id: Tenanted,
+        /// What makes decoding and letting go observable from outside — see
+        /// [`Counted`].
+        counted: Counted,
+    }
+
+    fn tenanted(account: &str, session: &str) -> Tenanted {
+        Tenanted {
+            account: account.to_owned(),
+            session: session.to_owned(),
+        }
+    }
+
+    fn announce(at: u8, account: &str, session: &str) -> Announce {
+        Announce {
+            at: Bucket(at),
+            id: tenanted(account, session),
+            counted: Counted,
+        }
+    }
+
+    thread_local! {
+        /// Commands decoded on this thread, and commands dropped on it.
+        ///
+        /// Thread-local rather than static because tests run in parallel and
+        /// these count one test's own work. A `#[tokio::test]` is a
+        /// current-thread runtime, so everything a test drives stays here; a
+        /// multi-threaded flavour would read zero rather than read wrong.
+        static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static DROPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn decoded() -> usize {
+        DECODED.with(std::cell::Cell::get)
+    }
+
+    fn dropped() -> usize {
+        DROPPED.with(std::cell::Cell::get)
+    }
+
+    /// A field that counts the two moments this file's ordering depends on:
+    /// when a payload becomes a command, and when that command is let go of.
+    ///
+    /// Neither is visible any other way. A command whose build fails never
+    /// reaches an actor, and a duplicate that is refused early never becomes a
+    /// command at all.
+    struct Counted;
+
+    impl Serialize for Counted {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_unit()
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Counted {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            <()>::deserialize(d)?;
+            DECODED.with(|n| n.set(n.get() + 1));
+            Ok(Self)
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            DROPPED.with(|n| n.set(n.get() + 1));
+        }
     }
 
     #[async_trait]
@@ -1147,65 +1282,143 @@ mod tests {
         system
     }
 
-    /// A recipe is handed both ids, parsed, and never sees a segment. The
-    /// entity half is what an event-sourced actor derives its persistence id
-    /// from, before a byte of its history has been read.
+    /// A recipe is handed both ids as the extractors returned them. The entity
+    /// half is what an event-sourced actor derives its persistence id from,
+    /// before a byte of its history has been read.
     #[tokio::test]
-    async fn a_recipe_is_given_the_ids_the_address_holds() {
+    async fn a_recipe_is_given_the_ids_off_the_command() {
         let told: Told = Arc::new(Mutex::new(None));
         let system = tenants(&told);
 
-        let id = Tenanted {
-            account: "acct-7".into(),
-            session: "sess-3".into(),
-        };
         system
             .shard_actor_of::<Tenant>()
-            .tell(Announce {
-                at: Bucket(9),
-                id: id.clone(),
-            })
+            .tell(announce(9, "acct-7", "sess-3"))
             .await
             .unwrap();
 
-        assert_eq!(told.lock().as_ref(), Some(&(Bucket(9), id)));
+        assert_eq!(
+            told.lock().as_ref(),
+            Some(&(Bucket(9), tenanted("acct-7", "sess-3")))
+        );
     }
 
-    /// An address whose entity this type cannot read builds nothing, and says
-    /// which half it was. The alternative — an actor under a substituted id —
-    /// is a second writer on somebody else's journal.
+    /// **The headline.** A command that arrives from another node says which
+    /// actor it is for, in its own bytes. The address it came in on is read for
+    /// the type and nothing else — here it names a shard and an entity that are
+    /// both wrong, and the actor is still built where the command says.
+    ///
+    /// That is what stops an address from being a second, weaker encoding of an
+    /// identity the command already carries.
     #[tokio::test]
-    async fn an_unreadable_entity_builds_nothing() {
+    async fn an_arriving_command_names_its_own_actor() {
         let told: Told = Arc::new(Mutex::new(None));
         let system = tenants(&told);
 
-        let path = crate::shard::entity_of("tenant", Bucket(9), "no-account-here");
-        let err = system.build_at(&path).unwrap_err();
+        let payload = serde_json::to_vec(&announce(9, "acct-7", "sess-3")).unwrap();
+        system
+            .dispatch(envelope("/system/shard/tenant/0/somebody-else", payload, 1))
+            .await
+            .unwrap();
 
-        assert!(
-            matches!(&err, ActorOfError::Unreadable(bad)
-                if bad.type_name == "tenant" && bad.part == AddressPart::Entity),
-            "built from an address it cannot read: {err}"
+        assert_eq!(
+            told.lock().as_ref(),
+            Some(&(Bucket(9), tenanted("acct-7", "sess-3")))
         );
-        assert_eq!(system.hosted(), 0);
+        let built = crate::shard::entity_of("tenant", Bucket(9), "acct-7|sess-3");
+        assert!(
+            system.inner.resolve::<Announce>(&built).is_some(),
+            "the actor was not built where its command said"
+        );
     }
 
-    /// And an unreadable *shard* is refused just as hard, even though the
-    /// entity beside it reads cleanly — a bucket out of range means this
-    /// address was minted by something that does not agree with us about
-    /// placement.
+    /// A repeat is dropped before it is decoded. The order is the point rather
+    /// than the saving: decoding materialises a reply handle, and applying a
+    /// command twice is the thing the window exists to prevent.
     #[tokio::test]
-    async fn an_out_of_range_shard_builds_nothing() {
+    async fn a_duplicate_is_dropped_before_it_is_decoded() {
         let told: Told = Arc::new(Mutex::new(None));
         let system = tenants(&told);
 
-        let path = ActorPath::parse("/system/shard/tenant/999/acct-7|sess-3").unwrap();
-        let err = system.build_at(&path).unwrap_err();
+        let payload = serde_json::to_vec(&announce(9, "acct-7", "sess-3")).unwrap();
+        let at = "/system/shard/tenant/9/acct-7|sess-3";
+
+        system
+            .dispatch(envelope(at, payload.clone(), 7))
+            .await
+            .unwrap();
+        let once = decoded();
+
+        system.dispatch(envelope(at, payload, 7)).await.unwrap();
+
+        assert_eq!(
+            decoded(),
+            once,
+            "the repeat was decoded, so the dedup window is no longer ahead of it"
+        );
+    }
+
+    /// A decode that succeeds followed by a build that fails is reported, and
+    /// the command is let go of rather than parked somewhere.
+    ///
+    /// The drop is the half that matters. A reply handle that has crossed a host
+    /// fails its caller from its own `Drop` and in no other way, so a command
+    /// held on to here is a caller waiting forever.
+    #[tokio::test]
+    async fn a_failed_build_reports_and_lets_go_of_the_command() {
+        let told: Told = Arc::new(Mutex::new(None));
+        let system = tenants(&told);
+
+        // Stand something of another command type exactly where the command
+        // below says its actor belongs, so the recipe cannot have that name.
+        let taken = crate::shard::entity_of("tenant", Bucket(9), "acct-7|sess-3");
+        system
+            .get_or_create(&taken.parent().unwrap(), taken.name().unwrap(), Squatter)
+            .unwrap();
+
+        let payload = serde_json::to_vec(&announce(9, "acct-7", "sess-3")).unwrap();
+        let before = dropped();
+
+        // Addressed away from the squatter, so this is the receiver reaching
+        // the taken name through the command rather than tripping over it on
+        // the way in.
+        let outcome = system
+            .dispatch(envelope("/system/shard/tenant/0/anywhere", payload, 3))
+            .await;
 
         assert!(
-            matches!(&err, ActorOfError::Unreadable(bad) if bad.part == AddressPart::Shard),
-            "built from an address it cannot read: {err}"
+            matches!(
+                outcome,
+                Err(DispatchError::Resolve(ActorOfError::PathTaken(_)))
+            ),
+            "a build failure was swallowed: {outcome:?}"
         );
-        assert_eq!(system.hosted(), 0);
+        assert_eq!(
+            dropped(),
+            before + 1,
+            "the decoded command was held on to after the build failed"
+        );
+        // The recipe did run — `get_or_create` takes the actor by value, so it
+        // is built and then refused — but nothing of this type was started.
+        assert_eq!(system.hosted(), 1, "a tenant was started over the squatter");
+    }
+
+    /// An actor of a command type nothing else uses, so standing it at a
+    /// tenant's address is a name that recipe cannot have.
+    struct Squatter;
+
+    #[async_trait]
+    impl Actor for Squatter {
+        type Command = ();
+        async fn handle(&mut self, _cmd: (), _ctx: &mut ActorContext<()>) -> Flow {
+            Flow::Continue
+        }
+    }
+
+    fn envelope(at: &str, payload: Vec<u8>, message_id: u128) -> Message {
+        Message::Command(crate::envelope::Envelope {
+            path: at.to_owned(),
+            message_id,
+            payload,
+        })
     }
 }

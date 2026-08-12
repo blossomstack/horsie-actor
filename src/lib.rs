@@ -72,7 +72,7 @@ pub use persistence_id::PersistenceId;
 pub use persistent::Persistent;
 pub use reply::{ReplyDropped, ReplyRouter, ReplyTo};
 pub use runtime::{ActorContext, ActorRef};
-pub use shard::{AddressPart, EntityContext, Shard, UnreadableAddress};
+pub use shard::{EntityContext, Shard};
 pub use system::{ActorOfError, ActorSystem, DispatchError, ShardOf};
 pub use transport::{InProcessNetwork, InProcessTransport, RpcRequest, Transport, TransportError};
 pub use transport_tcp::{TcpConfig, TcpTransport};

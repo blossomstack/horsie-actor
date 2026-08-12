@@ -16,8 +16,6 @@ use crate::path::ActorPath;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt::Display;
-use std::str::FromStr;
-use thiserror::Error;
 
 /// The first segment of every shard address, keeping them out of the way of the
 /// tree an application builds for itself.
@@ -25,7 +23,7 @@ const SYSTEM: &str = "system";
 /// The second. `/system/shard/...` reads as what it is.
 const SHARD: &str = "shard";
 
-/// An actor type the cluster places, and can build from an address alone.
+/// An actor type the cluster places, and can build from a command alone.
 ///
 /// A node can only run an actor it can construct, and an actor is live state — a
 /// pool, a client, an open connection — so it cannot be shipped from whoever
@@ -46,24 +44,19 @@ pub trait Shard: Send + Sized + 'static {
 
     /// How one actor of this type is named.
     ///
-    /// A value in the program and a string in an address: [`Display`] writes the
-    /// last segment, [`FromStr`] recovers it on a node that was handed only a
-    /// path. The two have to agree, because an id that does not survive that
-    /// round trip names a different actor after a failover than it did before.
-    ///
-    /// A type rather than a `String` so that an id carrying structure — a tenant
-    /// alongside a name, which is how a multi-tenant deployment keeps the tenant
-    /// derivable from the address — is taken apart here, once, instead of by
-    /// every recipe doing surgery on a path.
-    type EntityId: FromStr + Display + Send + 'static;
+    /// A value everywhere it matters. [`Display`] is only how it is spelled into
+    /// an address, and an address is a registry key — every node that needs this
+    /// id gets it from the command, so nothing ever reads one back out of a
+    /// path. That is what lets it carry structure a segment could not: a tenant
+    /// alongside a name, say, which is how a multi-tenant deployment reaches an
+    /// account's services before the actor has recovered a byte of its history.
+    type EntityId: Display + Send + 'static;
 
     /// How one shard of this type is named.
     ///
-    /// Written into the address and read back out of it the same way an
-    /// [`EntityId`](Self::EntityId) is. A hash bucket is the usual choice, and
-    /// a `Bucket(u16)` whose [`FromStr`] refuses anything outside the range is
-    /// a better thing to hand a recipe than a segment it has to take on trust.
-    type ShardId: FromStr + Display + Send + 'static;
+    /// A hash bucket is the usual choice, and a `Bucket(u16)` is a better thing
+    /// to hand a recipe than the segment it is spelled as.
+    type ShardId: Display + Send + 'static;
 
     /// Stable name for this type, and the third segment of every instance's
     /// address. Unique across the cluster, and the same in every build — it
@@ -116,101 +109,11 @@ pub fn type_in(path: &ActorPath) -> Option<&str> {
     }
 }
 
-/// The shard id in an address of type `S`, read back as an id.
-///
-/// # Errors
-/// If `path` is not an address of this type, or its shard segment is not
-/// something [`Shard::ShardId`] can be read from.
-pub fn shard_in<S: Shard>(path: &ActorPath) -> Result<S::ShardId, UnreadableAddress> {
-    read_id(path, S::TYPE, AddressPart::Shard)
-}
-
-/// The entity id in an address of type `S`, read back as an id.
-///
-/// The counterpart of [`type_in`]: that one tells a node holding only a path
-/// which recipe to run, and this one tells the recipe which actor it is being
-/// asked for. Both directions of the address exist because a path is all a node
-/// gets when a message arrives from somewhere else.
-///
-/// # Errors
-/// If `path` is not an address of this type, or its last segment is not
-/// something [`Shard::EntityId`] can be read from. Refused rather than
-/// substituted: an actor standing at an address under some other id would
-/// answer for whoever the address named, and — event-sourced — write to their
-/// journal.
-pub fn entity_in<S: Shard>(path: &ActorPath) -> Result<S::EntityId, UnreadableAddress> {
-    read_id(path, S::TYPE, AddressPart::Entity)
-}
-
-/// One id out of an address of `type_name`.
-///
-/// Both halves come out through here, so the grammar is matched once and the
-/// two cannot drift into disagreeing about which segment is which.
-fn read_id<T: FromStr>(
-    path: &ActorPath,
-    type_name: &'static str,
-    part: AddressPart,
-) -> Result<T, UnreadableAddress> {
-    let refuse = || UnreadableAddress {
-        path: path.clone(),
-        type_name,
-        part,
-    };
-    match path.segments() {
-        [system, shard, claimed, shard_id, entity]
-            if system == SYSTEM && shard == SHARD && claimed == type_name =>
-        {
-            match part {
-                AddressPart::Shard => shard_id,
-                AddressPart::Entity => entity,
-            }
-            .parse()
-            .map_err(|_| refuse())
-        }
-        _ => Err(refuse()),
-    }
-}
-
-/// An address a shard type was asked to claim and cannot read.
-///
-/// Two nodes on different builds, disagreeing about the shape of an id, is the
-/// cause worth suspecting: the address was written by whoever sent the command
-/// and read by whoever came to own it. Which half failed narrows that down,
-/// since the two are usually minted by different code.
-#[derive(Debug, Error, PartialEq, Eq)]
-#[error("'{path}' does not name {part} of shard type '{type_name}'")]
-pub struct UnreadableAddress {
-    /// The address as it arrived.
-    pub path: ActorPath,
-    /// The type that was asked to read it.
-    pub type_name: &'static str,
-    /// Which of the two ids it could not read.
-    pub part: AddressPart,
-}
-
-/// One of the two ids an address carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AddressPart {
-    /// Where the actor was placed.
-    Shard,
-    /// Which actor it is.
-    Entity,
-}
-
-impl Display for AddressPart {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Shard => "a shard",
-            Self::Entity => "an entity",
-        })
-    }
-}
-
 /// Which actor a recipe is being asked to build.
 ///
-/// Everything the address holds, taken apart once — so a recipe reads fields
-/// rather than segments, and a change to the address grammar is a change here
-/// instead of in every application that has ever registered a type.
+/// Both ids as the extractors returned them, off the command that is about to
+/// be delivered. A recipe therefore reads fields rather than segments, and the
+/// address grammar stays the framework's business.
 pub struct EntityContext<S: Shard> {
     /// Which actor of this type. What an event-sourced one derives its
     /// persistence id from, since that id is asked for at construction and is
@@ -220,7 +123,7 @@ pub struct EntityContext<S: Shard> {
     pub shard_id: S::ShardId,
     /// Its full address.
     ///
-    /// Derivable from the two ids above, and here because a recipe runs before
+    /// Spelled from the two ids above, and here because a recipe runs before
     /// the actor exists and so before there is an [`ActorContext`] to ask —
     /// which is where a running actor gets its own path from. Reassembling it
     /// would mean knowing the address grammar, which is the one thing an
@@ -230,11 +133,26 @@ pub struct EntityContext<S: Shard> {
     pub path: ActorPath,
 }
 
-/// Where an actor of type `S` handling `cmd` lives, and which shard it is in.
-pub(crate) fn address_for<S: Shard>(cmd: &S::Command) -> (ActorPath, ActorPath) {
-    let shard_id = S::shard_id(cmd).to_string();
-    let entity = entity_of(S::TYPE, &shard_id, S::entity_id(cmd));
-    (entity, shard_of(S::TYPE, &shard_id))
+/// Which actor `cmd` is for, and which shard placement is decided over.
+///
+/// The single source of identity, in both directions: a send that starts here
+/// calls it with the command in hand, and one that arrives from another node
+/// calls it with the command it has just decoded. The address falls out of the
+/// ids rather than the ids out of the address, so there is no second encoding
+/// of who an actor is and nothing to disagree about.
+pub(crate) fn address_for<S: Shard>(cmd: &S::Command) -> (EntityContext<S>, ActorPath) {
+    let entity_id = S::entity_id(cmd);
+    let shard_id = S::shard_id(cmd);
+    let shard = shard_of(S::TYPE, &shard_id);
+    let path = entity_of(S::TYPE, &shard_id, &entity_id);
+    (
+        EntityContext {
+            entity_id,
+            shard_id,
+            path,
+        },
+        shard,
+    )
 }
 
 #[cfg(test)]
@@ -242,9 +160,8 @@ pub(crate) fn address_for<S: Shard>(cmd: &S::Command) -> (ActorPath, ActorPath) 
 mod tests {
     use super::*;
 
-    /// A session of an account, which is the shape [`Shard::EntityId`] exists
-    /// for: the account has to come back out of the address, because a session
-    /// cannot be built without it.
+    /// A session of an account: the shape [`Shard::EntityId`] exists for, since
+    /// a session cannot be built without knowing whose it is.
     #[derive(Debug, PartialEq, Eq)]
     struct Tenanted {
         account: String,
@@ -257,21 +174,7 @@ mod tests {
         }
     }
 
-    impl FromStr for Tenanted {
-        type Err = ();
-
-        fn from_str(text: &str) -> Result<Self, ()> {
-            let (account, session) = text.split_once('|').ok_or(())?;
-            Ok(Self {
-                account: account.to_owned(),
-                session: session.to_owned(),
-            })
-        }
-    }
-
-    /// A placement bucket, which is the shard id a hashed policy produces: a
-    /// number spelled as a segment. `u8` is doing the work here — a bucket out
-    /// of range is exactly what a segment cannot express and a type can.
+    /// The placement bucket a hashed policy produces.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct Bucket(u8);
 
@@ -281,45 +184,41 @@ mod tests {
         }
     }
 
-    impl FromStr for Bucket {
-        type Err = ();
+    /// Both ids come off the command, so a test can state exactly what the
+    /// extractors return and check where that puts the actor.
+    struct Session;
 
-        fn from_str(text: &str) -> Result<Self, ()> {
-            text.parse().map(Bucket).map_err(|_| ())
+    struct Open {
+        at: Bucket,
+        id: Tenanted,
+    }
+
+    impl serde::Serialize for Open {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_unit()
         }
     }
 
-    struct Session;
+    impl<'de> serde::Deserialize<'de> for Open {
+        fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+            unreachable!("these tests never put a command on a wire")
+        }
+    }
 
     impl Shard for Session {
-        type Command = ();
+        type Command = Open;
         type EntityId = Tenanted;
         type ShardId = Bucket;
         const TYPE: &'static str = "session";
 
-        fn entity_id(_cmd: &()) -> Tenanted {
-            unreachable!("these tests address a session by path, never by command")
+        fn entity_id(cmd: &Open) -> Tenanted {
+            Tenanted {
+                account: cmd.id.account.clone(),
+                session: cmd.id.session.clone(),
+            }
         }
-        fn shard_id(_cmd: &()) -> Bucket {
-            unreachable!("these tests address a session by path, never by command")
-        }
-    }
-
-    /// A different type, to prove an address is read by the type that claims it
-    /// rather than by its shape alone.
-    struct Supervisor;
-
-    impl Shard for Supervisor {
-        type Command = ();
-        type EntityId = String;
-        type ShardId = String;
-        const TYPE: &'static str = "supervisor";
-
-        fn entity_id(_cmd: &()) -> String {
-            unreachable!("these tests address a supervisor by path, never by command")
-        }
-        fn shard_id(_cmd: &()) -> String {
-            unreachable!("these tests address a supervisor by path, never by command")
+        fn shard_id(cmd: &Open) -> Bucket {
+            cmd.at
         }
     }
 
@@ -349,62 +248,47 @@ mod tests {
     fn a_child_of_a_shard_actor_is_not_a_shard_address() {
         let child = entity_of("session", "17", "sess-abc").child("agent-main");
         assert_eq!(type_in(&child), None);
-        assert!(shard_in::<Session>(&child).is_err());
     }
 
-    /// The round trip the whole design rests on: both ids written into an
-    /// address on one node come back out of it, whole, on another.
+    /// The extractors decide both halves of the address, and the entity sits
+    /// under the shard placement is decided over rather than beside it.
     #[test]
-    fn both_ids_survive_their_address() {
-        let id = Tenanted {
-            account: "acct-7".into(),
-            session: "sess-3".into(),
-        };
-        let path = entity_of(Session::TYPE, Bucket(17), &id);
-
-        assert_eq!(path.to_string(), "/system/shard/session/17/acct-7|sess-3");
-        assert_eq!(entity_in::<Session>(&path), Ok(id));
-        assert_eq!(shard_in::<Session>(&path), Ok(Bucket(17)));
-    }
-
-    /// A segment that is not an id is refused, and the error says which half of
-    /// the address failed — the two are minted by different code, so which one
-    /// it was is most of the diagnosis.
-    #[test]
-    fn an_unreadable_entity_segment_is_refused() {
-        let path = entity_of(Session::TYPE, Bucket(17), "no-account-here");
-        let refused = entity_in::<Session>(&path).unwrap_err();
-        assert_eq!(refused.type_name, "session");
-        assert_eq!(refused.part, AddressPart::Entity);
-        assert_eq!(refused.path, path);
-    }
-
-    /// A bucket outside the range is unreadable in a way a segment could not
-    /// have been, which is the whole argument for typing this one too.
-    #[test]
-    fn a_shard_segment_out_of_range_is_refused() {
-        let path = ActorPath::parse("/system/shard/session/999/acct-7|sess-3").unwrap();
-        let refused = shard_in::<Session>(&path).unwrap_err();
-        assert_eq!(refused.part, AddressPart::Shard);
-        assert_eq!(
-            entity_in::<Session>(&path),
-            Ok(Tenanted {
+    fn a_command_decides_where_its_actor_lives() {
+        let cmd = Open {
+            at: Bucket(17),
+            id: Tenanted {
                 account: "acct-7".into(),
                 session: "sess-3".into(),
-            }),
-            "the entity half of the same address is still readable"
+            },
+        };
+        let (entity, shard) = address_for::<Session>(&cmd);
+
+        assert_eq!(
+            entity.path.to_string(),
+            "/system/shard/session/17/acct-7|sess-3"
         );
+        assert_eq!(shard.to_string(), "/system/shard/session/17");
+        assert_eq!(entity.shard_id, Bucket(17));
+        assert_eq!(entity.entity_id.account, "acct-7");
     }
 
-    /// An address is read by the type that claims it. Two types whose ids
-    /// happen to look alike still cannot answer for each other's actors.
+    /// Two commands naming one entity land on one address, and the ids the
+    /// context carries are the extractors' own values — not something spelled
+    /// out and read back, which is what would let the two disagree.
     #[test]
-    fn one_types_address_is_not_anothers() {
-        let path = entity_of(Supervisor::TYPE, "17", "acct-7|sess-3");
-        assert!(entity_in::<Session>(&path).is_err());
-        assert_eq!(
-            entity_in::<Supervisor>(&path),
-            Ok("acct-7|sess-3".to_owned())
-        );
+    fn one_entity_is_one_address() {
+        let open = |account: &str| Open {
+            at: Bucket(3),
+            id: Tenanted {
+                account: account.into(),
+                session: "sess-3".into(),
+            },
+        };
+        let (first, _) = address_for::<Session>(&open("acct-7"));
+        let (again, _) = address_for::<Session>(&open("acct-7"));
+        let (other, _) = address_for::<Session>(&open("acct-9"));
+
+        assert_eq!(first.path, again.path);
+        assert_ne!(first.path, other.path);
     }
 }
