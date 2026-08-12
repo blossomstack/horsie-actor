@@ -23,8 +23,14 @@ impl std::fmt::Display for NodeId {
 pub struct Reply {
     /// Minted by the origin node when the reply handle was encoded.
     pub correlation: u128,
-    /// The encoded answer.
-    pub payload: Vec<u8>,
+    /// The encoded answer, or `None` for "no answer is coming".
+    ///
+    /// A handle dropped without being answered has to say so. In one process
+    /// dropping it wakes the caller by itself, because the caller is holding the
+    /// other end of the channel; once the handle has crossed a host, nothing is
+    /// left to notice — so the drop is sent back explicitly, and the caller
+    /// fails exactly as it would have locally.
+    pub payload: Option<Vec<u8>>,
 }
 
 /// Anything one node sends another.

@@ -607,18 +607,22 @@ impl ActorSystem {
 
     /// Feed one inbound message to whoever it is for.
     pub async fn dispatch(&self, message: Message) -> Result<(), DispatchError> {
-        self.require_serving()?;
         let env = match message {
             Message::Command(env) => env,
             Message::Reply(reply) => {
                 // An answer is for a caller, not an actor, so it never goes
-                // near the registry, the dedup window or placement.
+                // near the registry, the dedup window or placement — and, for
+                // the same reason, not near the quorum check either. That check
+                // asks whether an *instance* still belongs to this node, and a
+                // future waiting on this node is nobody else's to take.
+                // Refusing here would only mean the caller waits forever.
                 if let Some(cluster) = &self.inner.cluster {
                     cluster.deliver_reply(reply);
                 }
                 return Ok(());
             }
         };
+        self.require_serving()?;
         // A repeat is a success, not a failure: the sender retried because it
         // could not tell "lost" from "slow", and the answer to both is that the
         // command has already been applied.

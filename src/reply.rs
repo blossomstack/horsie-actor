@@ -34,6 +34,20 @@ pub trait ReplyRouter: Send + Sync + 'static {
 
     /// Send an encoded answer back to the node waiting for it.
     fn answer(&self, origin: NodeId, correlation: u128, payload: Vec<u8>);
+
+    /// Tell `origin` that no answer is coming, so it can stop waiting.
+    ///
+    /// The remote half of dropping a reply handle. Locally that needs no
+    /// message — the caller holds the other end of the channel and the drop
+    /// wakes it — so this exists to make the two behave the same.
+    fn abandon(&self, origin: NodeId, correlation: u128);
+
+    /// Forget a caller on *this* node that has stopped waiting.
+    ///
+    /// Called when an `ask` is cancelled or times out. Without it the entry sits
+    /// in the waiting table holding a channel nobody will read, until capacity
+    /// evicts it.
+    fn forget(&self, correlation: u128);
 }
 
 thread_local! {
@@ -73,7 +87,17 @@ fn router() -> Option<Arc<dyn ReplyRouter>> {
 /// [`ActorRef::ask`]: crate::ActorRef::ask
 pub struct ReplyTo<R> {
     inner: Inner<R>,
+    /// How to tell this node's waiting table that the caller has given up.
+    ///
+    /// Filled in when a local handle is encoded, because that is the moment a
+    /// caller stops being a channel in this process and becomes a row in a
+    /// table. Shared with whoever is awaiting the answer, which is what lets a
+    /// cancelled `ask` clean up after itself.
+    deregister: Deregister,
 }
+
+/// Set when a local handle is encoded — see [`ReplyTo::deregister`].
+pub(crate) type Deregister = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 enum Inner<R> {
     /// The caller is in this process.
@@ -86,10 +110,40 @@ enum Inner<R> {
     Remote {
         origin: NodeId,
         correlation: u128,
-        /// How to reach the origin, and how to encode the answer. Captured when
-        /// the handle was decoded, where the reply type was still known.
-        answer: Box<dyn FnOnce(R) + Send>,
+        /// What this handle can still do, or `None` once it has done it.
+        ///
+        /// Answering, being forwarded on, and being dropped are the three ways a
+        /// handle ends, and exactly one of them may happen. Taking the pair is
+        /// how that is enforced — and how the drop knows it is a drop rather
+        /// than the tail of an answer.
+        armed: Mutex<Option<Armed<R>>>,
     },
+}
+
+/// The two things a handle to a caller on another node can do.
+struct Armed<R> {
+    /// Encode the answer and route it to the origin. Captured when the handle
+    /// was decoded, where the reply type was still known.
+    answer: Box<dyn FnOnce(R) + Send>,
+    /// Tell the origin that no answer is coming.
+    abandon: Box<dyn FnOnce() + Send>,
+}
+
+/// Dropping a handle that has neither answered nor been passed on fails the
+/// caller, wherever the caller is.
+///
+/// In one process that is free: the caller holds the other end of the channel.
+/// Across a host it takes a message, and without one the caller waits forever —
+/// the same actor failing in two different ways depending on where it happens to
+/// be hosted, which is the distinction this crate exists to remove.
+impl<R> Drop for ReplyTo<R> {
+    fn drop(&mut self) {
+        if let Inner::Remote { armed, .. } = &self.inner
+            && let Some(armed) = armed.lock().take()
+        {
+            (armed.abandon)();
+        }
+    }
 }
 
 impl<R> ReplyTo<R> {
@@ -106,24 +160,35 @@ impl<R> ReplyTo<R> {
     pub fn from_sender(tx: oneshot::Sender<R>) -> Self {
         Self {
             inner: Inner::Local(Mutex::new(Some(tx))),
+            deregister: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The shared slot that says how to stop waiting — see [`Self::deregister`].
+    pub(crate) fn deregister(&self) -> Deregister {
+        self.deregister.clone()
     }
 
     /// Answer the request.
     ///
     /// # Errors
-    /// If the caller has gone away, or — for a caller on another node — if the
-    /// handle has already been answered.
+    /// If the caller has gone away, or if this handle has already been answered
+    /// or passed on.
     pub fn send(self, value: R) -> Result<(), ReplyDropped> {
-        match self.inner {
+        // Everything is taken through a lock rather than moved out of `self`,
+        // because `Drop` above means `self` cannot be destructured. It ends up
+        // reading better: answering is "take the right to answer", which is the
+        // same operation forwarding and dropping perform.
+        match &self.inner {
             Inner::Local(tx) => tx
                 .lock()
                 .take()
                 .ok_or(ReplyDropped)?
                 .send(value)
                 .map_err(|_| ReplyDropped),
-            Inner::Remote { answer, .. } => {
-                answer(value);
+            Inner::Remote { armed, .. } => {
+                let armed = armed.lock().take().ok_or(ReplyDropped)?;
+                (armed.answer)(value);
                 // The answer has been handed to the transport. Whether it
                 // arrives is not knowable from here, and a caller that has gone
                 // away looks identical to one that has not — so this reports
@@ -172,6 +237,8 @@ impl<R: DeserializeOwned + Send + 'static> Serialize for ReplyTo<R> {
                         Err(e) => tracing::warn!(error = %e, "could not decode a reply"),
                     }
                 }));
+                let waiting = router.clone();
+                *self.deregister.lock() = Some(Box::new(move || waiting.forget(correlation)));
                 Wire {
                     origin: router.local(),
                     correlation,
@@ -188,7 +255,15 @@ impl<R: DeserializeOwned + Send + 'static> Serialize for ReplyTo<R> {
                 correlation: *correlation,
             },
         };
-        wire.serialize(serializer)
+        let encoded = wire.serialize(serializer)?;
+
+        // Only now, once the handle is genuinely on its way, does this one stop
+        // being responsible for the caller. Disarming before the encode
+        // succeeded would strand the caller on a command that never left.
+        if let Inner::Remote { armed, .. } = &self.inner {
+            drop(armed.lock().take());
+        }
+        Ok(encoded)
     }
 }
 
@@ -207,15 +282,27 @@ impl<'de, R: Serialize + Send + 'static> Deserialize<'de> for ReplyTo<R> {
         };
         let origin = wire.origin;
         let correlation = wire.correlation;
+        let dropped = router.clone();
+        let undeliverable = router.clone();
         Ok(Self {
             inner: Inner::Remote {
                 origin,
                 correlation,
-                answer: Box::new(move |value: R| match serde_json::to_vec(&value) {
-                    Ok(payload) => router.answer(origin, correlation, payload),
-                    Err(e) => tracing::warn!(error = %e, "could not encode a reply"),
-                }),
+                armed: Mutex::new(Some(Armed {
+                    answer: Box::new(move |value: R| match serde_json::to_vec(&value) {
+                        Ok(payload) => router.answer(origin, correlation, payload),
+                        // An answer that will not encode is an answer that is
+                        // never arriving, so the caller is told rather than left
+                        // waiting on it.
+                        Err(e) => {
+                            tracing::warn!(error = %e, "could not encode a reply");
+                            undeliverable.abandon(origin, correlation);
+                        }
+                    }),
+                    abandon: Box::new(move || dropped.abandon(origin, correlation)),
+                })),
             },
+            deregister: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -254,6 +341,8 @@ mod tests {
         local: NodeId,
         waiting: Mutex<Vec<(u128, Deliver)>>,
         answered: Mutex<Vec<(NodeId, u128, Vec<u8>)>>,
+        abandoned: Mutex<Vec<(NodeId, u128)>>,
+        forgotten: Mutex<Vec<u128>>,
     }
 
     impl FakeRouter {
@@ -262,6 +351,8 @@ mod tests {
                 local: NodeId(local),
                 waiting: Mutex::new(Vec::new()),
                 answered: Mutex::new(Vec::new()),
+                abandoned: Mutex::new(Vec::new()),
+                forgotten: Mutex::new(Vec::new()),
             })
         }
     }
@@ -278,6 +369,12 @@ mod tests {
         }
         fn answer(&self, origin: NodeId, correlation: u128, payload: Vec<u8>) {
             self.answered.lock().push((origin, correlation, payload));
+        }
+        fn abandon(&self, origin: NodeId, correlation: u128) {
+            self.abandoned.lock().push((origin, correlation));
+        }
+        fn forget(&self, correlation: u128) {
+            self.forgotten.lock().push(correlation);
         }
     }
 
@@ -355,6 +452,92 @@ mod tests {
 
     fn middle_registered_nothing(asking: &Arc<FakeRouter>) -> bool {
         asking.waiting.lock().len() == 1
+    }
+
+    /// The headline: an actor on another node that takes a request and then
+    /// drops the handle fails its caller, exactly as it would have in-process.
+    /// Without this the caller waits forever, and which of the two happens
+    /// depends only on where the actor was hosted.
+    #[tokio::test]
+    async fn dropping_a_handle_that_crossed_a_host_fails_the_caller() {
+        let asking = FakeRouter::new(1);
+        let hosting = FakeRouter::new(2);
+
+        let (reply, rx) = ReplyTo::<i32>::channel();
+        let bytes = with_router(asking.clone(), || serde_json::to_vec(&reply)).unwrap();
+        let decoded: ReplyTo<i32> =
+            with_router(hosting.clone(), || serde_json::from_slice(&bytes)).unwrap();
+
+        drop(decoded);
+
+        assert_eq!(
+            hosting.abandoned.lock().as_slice(),
+            [(NodeId(1), 1)],
+            "the hosting node did not tell the origin that no answer was coming"
+        );
+        // And the origin, told, drops the entry — which is what wakes the
+        // caller.
+        let (_, deliver) = asking.waiting.lock().pop().unwrap();
+        drop(deliver);
+        assert!(rx.await.is_err());
+    }
+
+    /// Answering is not abandoning. A handle that did its job must not also
+    /// report itself dropped, or the answer would race a "never coming" for the
+    /// same caller.
+    #[tokio::test]
+    async fn answering_from_another_host_does_not_also_abandon() {
+        let asking = FakeRouter::new(1);
+        let hosting = FakeRouter::new(2);
+
+        let (reply, _rx) = ReplyTo::<i32>::channel();
+        let bytes = with_router(asking, || serde_json::to_vec(&reply)).unwrap();
+        let decoded: ReplyTo<i32> =
+            with_router(hosting.clone(), || serde_json::from_slice(&bytes)).unwrap();
+        decoded.send(42).unwrap();
+
+        assert!(hosting.abandoned.lock().is_empty());
+    }
+
+    /// Nor is forwarding. Passing a handle on hands over the duty to answer, so
+    /// the node that let go of it must not report the caller abandoned — the
+    /// third node is about to answer them.
+    #[tokio::test]
+    async fn forwarding_a_handle_does_not_abandon_the_caller() {
+        let asking = FakeRouter::new(1);
+        let middle = FakeRouter::new(2);
+
+        let (reply, _rx) = ReplyTo::<i32>::channel();
+        let first = with_router(asking, || serde_json::to_vec(&reply)).unwrap();
+        let decoded: ReplyTo<i32> =
+            with_router(middle.clone(), || serde_json::from_slice(&first)).unwrap();
+
+        let _forwarded = with_router(middle.clone(), || serde_json::to_vec(&decoded)).unwrap();
+        drop(decoded);
+
+        assert!(
+            middle.abandoned.lock().is_empty(),
+            "the forwarding node reported a caller it had handed on"
+        );
+    }
+
+    /// Encoding a handle is the moment a caller becomes a row in a table, so it
+    /// is also the moment there is something to undo — which is what a
+    /// cancelled `ask` calls.
+    #[tokio::test]
+    async fn encoding_a_handle_records_how_to_stop_waiting() {
+        let asking = FakeRouter::new(1);
+        let (reply, _rx) = ReplyTo::<i32>::channel();
+        let deregister = reply.deregister();
+        assert!(
+            deregister.lock().is_none(),
+            "nothing to undo before it left"
+        );
+
+        with_router(asking.clone(), || serde_json::to_vec(&reply)).unwrap();
+        (deregister.lock().take().unwrap())();
+
+        assert_eq!(asking.forgotten.lock().as_slice(), [1]);
     }
 
     /// Encoding the same handle twice would leave two callers waiting on one

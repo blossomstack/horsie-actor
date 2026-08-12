@@ -49,6 +49,12 @@ pub enum TellError {
     /// the host is unreachable, or the command would not encode.
     #[error("the command could not be delivered to the host")]
     Undeliverable,
+
+    /// The command was delivered, and the deadline passed before an answer came
+    /// back. Only [`ask_within`](crate::ActorRef::ask_within) produces this; an
+    /// `ask` with no deadline waits.
+    #[error("no answer arrived in time")]
+    NoAnswer,
 }
 
 #[cfg(test)]

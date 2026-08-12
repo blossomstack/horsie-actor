@@ -27,11 +27,12 @@ const LIVENESS_TICK: Duration = Duration::from_millis(200);
 /// How many callers may be waiting on an answer at once.
 ///
 /// A bound rather than a timeout, because there is no right timeout: an actor
-/// may legitimately take a long time to answer. A caller that gives up leaves
-/// its entry behind — nothing tells the table the far end stopped caring — so
-/// without this the table grows for the life of the process. Overflowing evicts
-/// the oldest, whose caller has almost certainly gone; it fails rather than
-/// hangs, which is the failure worth having.
+/// may legitimately take a long time to answer. Entries normally leave on their
+/// own — the far end answers, drops its handle, or the caller is cancelled and
+/// deregisters — so this is the backstop for the case none of those reach: a
+/// host that went away mid-request. Overflowing evicts the oldest, whose caller
+/// has waited longest; it fails rather than hangs, which is the failure worth
+/// having.
 const WAITING_CAPACITY: usize = 8192;
 
 /// How this node participates in a cluster.
@@ -344,6 +345,11 @@ impl ClusterNode {
     /// An answer with nobody waiting is dropped and logged, not an error: the
     /// caller may have timed out, been cancelled, or gone away with the actor
     /// that asked. It is the ordinary end of a request nobody needed any more.
+    ///
+    /// A reply with no payload is the far end saying it will never answer.
+    /// Dropping the entry drops the channel behind it, so the caller fails now
+    /// rather than waiting on nothing — which is what dropping the handle would
+    /// have done had the actor been in this process.
     pub fn deliver_reply(&self, reply: Reply) {
         let Some(deliver) = self.waiting.lock().remove(&reply.correlation) else {
             tracing::debug!(
@@ -352,7 +358,38 @@ impl ClusterNode {
             );
             return;
         };
-        deliver(reply.payload);
+        match reply.payload {
+            Some(payload) => deliver(payload),
+            None => drop(deliver),
+        }
+    }
+
+    /// How many callers on this node are waiting for an answer from elsewhere.
+    ///
+    /// A number that should sit near zero and come back down: every request that
+    /// ends — answered, refused, dropped, cancelled — takes its entry with it.
+    /// One that climbs is a leak, and one at [`WAITING_CAPACITY`] is failing the
+    /// oldest caller for every new one.
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.waiting.lock().len()
+    }
+
+    /// Fail every caller on this node that is still waiting for an answer.
+    ///
+    /// Called when the node stands down. Its instances may already belong to
+    /// somebody else and its peers have stopped talking to it, so no answer it
+    /// is waiting on is still coming. Failing them here is the same loss the
+    /// stand-down already imposes on actors, extended to the callers that are
+    /// not actors.
+    pub fn abandon_waiting(&self) {
+        let waiting = std::mem::take(&mut *self.waiting.lock());
+        if !waiting.is_empty() {
+            tracing::debug!(
+                count = waiting.len(),
+                "standing down; failing every caller still waiting for an answer"
+            );
+        }
     }
 }
 
@@ -381,10 +418,33 @@ impl ReplyRouter for ClusterNode {
     }
 
     fn answer(&self, origin: NodeId, correlation: u128, payload: Vec<u8>) {
-        let reply = Reply {
-            correlation,
-            payload,
-        };
+        self.route_reply(
+            origin,
+            Reply {
+                correlation,
+                payload: Some(payload),
+            },
+        );
+    }
+
+    fn abandon(&self, origin: NodeId, correlation: u128) {
+        self.route_reply(
+            origin,
+            Reply {
+                correlation,
+                payload: None,
+            },
+        );
+    }
+
+    fn forget(&self, correlation: u128) {
+        self.waiting.lock().remove(&correlation);
+    }
+}
+
+impl ClusterNode {
+    /// Get a reply — an answer or the absence of one — back to `origin`.
+    fn route_reply(&self, origin: NodeId, reply: Reply) {
         // The caller is on this node: hand it over directly rather than
         // sending a message to ourselves. This is the common case once an
         // instance has been reached locally after all.
@@ -443,11 +503,18 @@ async fn watch_cluster(node: Arc<ClusterNode>, liveness_window: Duration) {
             | ServerState::Shutdown => current.current_leader.is_some(),
         };
         node.serving.store(serving, Ordering::Relaxed);
-        node.serving_tx.send_if_modified(|current| {
+        let changed = node.serving_tx.send_if_modified(|current| {
             let changed = *current != serving;
             *current = serving;
             changed
         });
+        // On the transition only. Clearing on every tick while in a minority
+        // would also throw away asks issued after standing down, whose answers
+        // can still arrive — inbound replies are delivered whatever this node's
+        // serving state.
+        if changed && !serving {
+            node.abandon_waiting();
+        }
 
         // Placement follows what was *agreed*, not what this node believes.
         let (live, voters) = node.store.live_and_voters();

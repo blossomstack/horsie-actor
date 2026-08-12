@@ -21,6 +21,18 @@ use std::time::Duration;
 
 struct Counter {
     id: String,
+    /// Reply handles this counter was asked to sit on, kept alive so the caller
+    /// is left waiting rather than failed.
+    held: Vec<ReplyTo<i64>>,
+}
+
+impl Counter {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            held: Vec::new(),
+        }
+    }
 }
 
 /// Every command names its own target. The extractors are the only thing that
@@ -47,6 +59,19 @@ enum CounterCmd {
         other: String,
         by: i64,
     },
+    /// Take the request and drop the handle without answering. Standing in for
+    /// every way a real handler ends without a reply — an error path, a stop, a
+    /// branch that forgot.
+    Ignore {
+        id: String,
+        reply: ReplyTo<i64>,
+    },
+    /// Take the request and keep the handle, so the caller is genuinely left
+    /// waiting on an answer that is still, as far as anyone knows, coming.
+    Hold {
+        id: String,
+        reply: ReplyTo<i64>,
+    },
 }
 
 impl CounterCmd {
@@ -54,7 +79,9 @@ impl CounterCmd {
         match self {
             CounterCmd::Inc { id, .. }
             | CounterCmd::Get { id, .. }
-            | CounterCmd::IncOther { id, .. } => id,
+            | CounterCmd::IncOther { id, .. }
+            | CounterCmd::Ignore { id, .. }
+            | CounterCmd::Hold { id, .. } => id,
         }
     }
 }
@@ -101,6 +128,14 @@ impl EventSourcedActor for Counter {
                     .shard_actor_of::<Counter>()
                     .tell(CounterCmd::Inc { id: other, by })
                     .await;
+                CommandEffect::none()
+            }
+            CounterCmd::Ignore { reply, .. } => {
+                drop(reply);
+                CommandEffect::none()
+            }
+            CounterCmd::Hold { reply, .. } => {
+                self.held.push(reply);
                 CommandEffect::none()
             }
         }
@@ -188,11 +223,7 @@ impl TestCluster {
             let system = ActorSystem::clustered(journal.clone(), node.clone());
             system
                 .shard::<Counter>()
-                .register(|sys, path| {
-                    sys.persistent(Counter {
-                        id: path.name().unwrap_or_default().to_owned(),
-                    })
-                })
+                .register(|sys, path| sys.persistent(Counter::new(path.name().unwrap_or_default())))
                 .expect("counter should register");
             spawn_dispatch_loop(&system, &node);
             systems.push(system);
@@ -474,7 +505,7 @@ async fn a_displaced_host_stops_writing() {
     let elsewhere = cluster.system(elsewhere);
     let fresh = elsewhere.spawn_at(
         ActorPath::root().child("fresh"),
-        elsewhere.persistent(Counter { id: id.to_owned() }),
+        elsewhere.persistent(Counter::new(id)),
     );
     let value = fresh.ask(get(id)).await.unwrap();
     assert_eq!(
@@ -573,6 +604,124 @@ async fn an_ask_to_an_unreachable_host_fails_rather_than_hanging() {
         .await
         .expect("ask must return rather than hang");
     assert!(outcome.is_err());
+}
+
+/// An actor that takes a request and never answers fails its caller, wherever
+/// it is hosted.
+///
+/// The distinction this crate exists to remove, in its nastiest form: in one
+/// process the dropped handle wakes the caller, and across a host it used to
+/// wake nobody — so the same handler failed cleanly or hung forever depending
+/// only on where placement happened to put it.
+#[tokio::test]
+async fn an_unanswered_request_fails_the_caller_across_a_host_too() {
+    let cluster = TestCluster::of_size(3).await;
+    let id = "unanswered";
+    let host = cluster.host_of(id);
+    let elsewhere = (host + 1) % 3;
+
+    let remote = cluster.system(elsewhere).shard_actor_of::<Counter>();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        remote.ask(|reply| CounterCmd::Ignore {
+            id: id.to_owned(),
+            reply,
+        }),
+    )
+    .await
+    .expect("a dropped handle must not leave a caller on another node waiting");
+    assert!(outcome.is_err());
+}
+
+/// A node that stands down fails the callers still waiting on it.
+///
+/// It has lost touch with the cluster, so nothing it is waiting for is still
+/// coming. Actors already lose their in-flight work when this happens; a caller
+/// that is not an actor had nothing telling it, and simply waited.
+#[tokio::test]
+async fn standing_down_fails_the_callers_still_waiting() {
+    let cluster = TestCluster::of_size(3).await;
+    let id = "held";
+    let host = cluster.host_of(id);
+    let elsewhere = (host + 1) % 3;
+
+    // The hosting counter takes the request and keeps the handle, so nothing
+    // about the request itself will ever end the wait.
+    let remote = cluster.system(elsewhere).shard_actor_of::<Counter>();
+    let pending = tokio::spawn(async move {
+        remote
+            .ask(|reply| CounterCmd::Hold {
+                id: id.to_owned(),
+                reply,
+            })
+            .await
+    });
+    settle().await;
+
+    cluster.net.remove(cluster.nodes[elsewhere].local());
+    await_not_serving(&cluster, elsewhere).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .expect("standing down must end the wait")
+        .expect("the ask task should not panic");
+    assert!(outcome.is_err());
+}
+
+/// A caller that gives up takes its entry in the waiting table with it.
+///
+/// The table is what makes a reply routable at all — one row per caller, minted
+/// when the handle is encoded. Nothing on the far end knows the caller lost
+/// interest, so if giving up did not clean up, every cancelled request would
+/// leave a row holding a channel nobody will read, until capacity evicted it and
+/// failed somebody else's request instead.
+#[tokio::test]
+async fn a_caller_that_gives_up_stops_being_waited_for() {
+    let cluster = TestCluster::of_size(3).await;
+    let id = "abandoned";
+    let host = cluster.host_of(id);
+    let elsewhere = (host + 1) % 3;
+
+    let remote = cluster.system(elsewhere).shard_actor_of::<Counter>();
+    let outcome = remote
+        .ask_within(Duration::from_millis(100), |reply| CounterCmd::Hold {
+            id: id.to_owned(),
+            reply,
+        })
+        .await;
+    assert!(outcome.is_err());
+
+    assert_eq!(
+        cluster.nodes[elsewhere].waiting(),
+        0,
+        "the caller gave up and its row stayed behind"
+    );
+}
+
+/// An answer is delivered whatever this node's serving state.
+///
+/// The quorum check asks whether an *instance* still belongs to this node. A
+/// future waiting here is nobody else's to take, so refusing its answer would
+/// only mean the caller waits forever — and the check sat above the reply branch
+/// rather than below it.
+#[tokio::test]
+async fn a_node_with_no_quorum_still_takes_its_own_answers() {
+    let cluster = TestCluster::of_size(3).await;
+    let cut_off = 0;
+
+    cluster.net.remove(cluster.nodes[cut_off].local());
+    await_not_serving(&cluster, cut_off).await;
+
+    // Nobody is waiting for this one, which is not the point: the point is that
+    // it reaches the reply path at all rather than being refused above it.
+    let taken = cluster
+        .system(cut_off)
+        .dispatch(horsie_actor::Message::Reply(horsie_actor::Reply {
+            correlation: 1,
+            payload: None,
+        }))
+        .await;
+    assert!(taken.is_ok(), "{taken:?}");
 }
 
 /// A redelivered command is applied once.
@@ -909,7 +1058,7 @@ async fn an_actor_spawned_before_the_first_election_survives() {
     let system = ActorSystem::clustered(journal, node);
     let actor = system.spawn_at(
         ActorPath::root().child("early"),
-        system.persistent(Counter { id: "early".into() }),
+        system.persistent(Counter::new("early")),
     );
     settle().await;
     assert!(

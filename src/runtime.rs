@@ -181,12 +181,47 @@ impl<C: Send + 'static> ActorRef<C> {
         R: Send + 'static,
     {
         let (reply, rx) = ReplyTo::channel();
+        // Dropped when this future is, however it ends. Cancelling an `ask`
+        // whose handle has already crossed a host would otherwise leave a row in
+        // this node's waiting table holding a channel nobody will ever read.
+        let _waiting = Cancelled(reply.deregister());
         self.tell(make(reply)).await?;
         // A remote actor that stops mid-request, a host that goes away, or an
         // answer that will not decode all end here: the sender is dropped and
         // the caller is told, rather than waiting on something that is not
         // coming.
         rx.await.map_err(|_| TellError::MailboxClosed)
+    }
+
+    /// [`ask`](Self::ask), giving up after `within`.
+    ///
+    /// Opt-in rather than the default, and deliberately so: asks range from
+    /// reading a field to waiting on a model, and one number cannot serve both.
+    /// A default high enough for the slow ones is no backstop for the fast ones.
+    ///
+    /// Reach for it when the answer stops being useful after a while — an
+    /// interactive read, a health probe — and not otherwise. The cases where
+    /// nobody *can* answer already fail on their own: a mailbox that closes, a
+    /// handle dropped without an answer, a node that stands down. What is left
+    /// is a host that vanished mid-request, which only a deadline ends.
+    ///
+    /// # Errors
+    /// [`TellError::NoAnswer`] if the deadline passes first, plus anything
+    /// [`ask`](Self::ask) can fail with.
+    pub async fn ask_within<F, R>(
+        &self,
+        within: std::time::Duration,
+        make: F,
+    ) -> Result<R, TellError>
+    where
+        F: FnOnce(ReplyTo<R>) -> C,
+        R: Send + 'static,
+    {
+        // Dropping the inner future is what deregisters, so this needs nothing
+        // of its own.
+        tokio::time::timeout(within, self.ask(make))
+            .await
+            .unwrap_or(Err(TellError::NoAnswer))
     }
 
     pub(crate) fn cached(&self) -> Option<Link<C>> {
@@ -211,6 +246,22 @@ impl<C: Send + 'static> ActorRef<C> {
         let found = system.resolve::<C>(&self.path)?;
         *self.link.lock() = Some(found.clone());
         Some(found)
+    }
+}
+
+/// Deregisters a waiting caller when the `ask` awaiting it goes away.
+///
+/// Held inside the future, so it fires on a timeout, a `select!` that lost, a
+/// dropped request — every way a caller can stop caring. It also fires on
+/// success, where forgetting a correlation the answer already removed costs a
+/// lookup and keeps the rule to one line.
+struct Cancelled(crate::reply::Deregister);
+
+impl Drop for Cancelled {
+    fn drop(&mut self) {
+        if let Some(deregister) = self.0.lock().take() {
+            deregister();
+        }
     }
 }
 
