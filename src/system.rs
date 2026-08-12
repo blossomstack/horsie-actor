@@ -622,9 +622,7 @@ impl ActorSystem {
         let system = self.clone();
         let route: crate::runtime::RemoteSend<S::Command> = Arc::new(move |cmd: S::Command| {
             let system = system.clone();
-            Box::pin(async move {
-                system.deliver_to_shard(context_of::<S>(&cmd), cmd).await
-            })
+            Box::pin(async move { system.deliver_to_shard(context_of::<S>(&cmd), cmd).await })
         });
         self.reference(region_of(S::TYPE), Some(Link::Remote(route)))
     }
