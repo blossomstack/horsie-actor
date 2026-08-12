@@ -207,6 +207,12 @@ struct Entry {
     /// for a local-only actor, which is what makes a send from another host fail
     /// cleanly and say why.
     deliver: Option<DeliverHere>,
+    /// Raise to stop this actor. Held here rather than in the reference,
+    /// because a reference is a name that anyone may hold and stopping is
+    /// something the tree does.
+    stop: tokio::sync::watch::Sender<bool>,
+    /// Closed once the actor's task has ended and its children with it.
+    terminated: tokio::sync::watch::Receiver<()>,
 }
 
 /// Process-wide state shared by every actor in a system.
@@ -280,6 +286,77 @@ impl SystemInner {
     /// whether it can be reached from another node.
     fn deliver_here(&self, path: &ActorPath) -> Option<Option<DeliverHere>> {
         Some(self.live.lock().get(path)?.deliver.clone())
+    }
+
+    /// How many actors are registered here.
+    pub(crate) fn hosted(&self) -> usize {
+        self.live.lock().len()
+    }
+
+    /// Stop the actor at `path` and everything under it, and wait for it.
+    ///
+    /// Stopping the actor is enough on its own — its own shutdown takes its
+    /// children — so the sweep afterwards is for the paths that hold no actor
+    /// but do hold descendants, which is what a shard address looks like on the
+    /// way down to an entity.
+    pub(crate) async fn stop_at(&self, path: &ActorPath) -> bool {
+        let stopped = self.halt(path).await;
+        self.stop_descendants(path).await;
+        stopped
+    }
+
+    /// Stop everything strictly under `path`.
+    ///
+    /// Children end before their parent does, so a parent's last act sees a
+    /// quiet subtree — which is what makes `ctx.parent()` safe to treat as a
+    /// plain read, since a child cannot outlive the actor it reaches up to.
+    /// That order comes out of the recursion rather than out of this loop:
+    /// halting an actor runs its own shutdown, which stops *its* children and
+    /// waits, before it is reported stopped. Sorting these by depth would only
+    /// change how many of them are already gone by the time they come up.
+    pub(crate) async fn stop_descendants(&self, path: &ActorPath) {
+        let doomed: Vec<ActorPath> = {
+            let live = self.live.lock();
+            live.keys()
+                .filter(|p| p.starts_with(path) && *p != path)
+                .cloned()
+                .collect()
+        };
+        for path in doomed {
+            self.halt(&path).await;
+        }
+    }
+
+    /// Take one actor out of the registry, ask it to stop, and wait for it.
+    async fn halt(&self, path: &ActorPath) -> bool {
+        let Some(entry) = self.live.lock().remove(path) else {
+            return false;
+        };
+        // Removed first: an actor being stopped must not be handed to anybody
+        // resolving the path in the meantime.
+        let _ = entry.stop.send(true);
+        let mut terminated = entry.terminated;
+        // `Err` is the task ending without a clean close — a panic — which is
+        // still the actor being gone.
+        let _ = terminated.changed().await;
+        true
+    }
+
+    /// Drop the entry for `path` if it is still the instance behind `link`.
+    ///
+    /// Called by an actor on its own way out, which is what keeps the registry
+    /// from growing a row per actor that ever ran. Checking the link is what
+    /// stops a slow shutdown from evicting the instance that replaced it.
+    pub(crate) fn retire<C: Send + 'static>(&self, path: &ActorPath, link: &Link<C>) {
+        let mut live = self.live.lock();
+        let ours = live
+            .get(path)
+            .and_then(|entry| entry.reference.downcast_ref::<ActorRef<C>>())
+            .and_then(ActorRef::cached)
+            .is_some_and(|current| current.is_same(link));
+        if ours {
+            live.remove(path);
+        }
     }
 }
 
@@ -438,13 +515,16 @@ impl ActorSystem {
             live.remove(&path);
         }
 
-        let link = spawn_at(actor, self.inner.clone(), path.clone());
+        let spawned = spawn_at(actor, self.inner.clone(), path.clone());
+        let link = spawned.link;
         let reference = self.reference(path.clone(), Some(link.clone()));
         live.insert(
             path.clone(),
             Entry {
                 deliver: wire.map(|wire| deliver_to(path.clone(), link.clone(), wire)),
                 reference: Arc::new(reference) as ErasedRef,
+                stop: spawned.stop,
+                terminated: spawned.terminated,
             },
         );
         drop(live);
@@ -467,20 +547,41 @@ impl ActorSystem {
         ActorRef::at(path, link, Arc::downgrade(&self.inner))
     }
 
+    /// Stop the actor at `path` and everything under it.
+    ///
+    /// Returns once the subtree is quiet, deepest first, and `false` if nothing
+    /// was there. The same operation [`ActorRef::stop`] performs, for a caller
+    /// holding a path rather than a reference — including a path that holds no
+    /// actor of its own, which is how a whole branch is cleared.
+    pub async fn stop(&self, path: &ActorPath) -> bool {
+        self.inner.stop_at(path).await
+    }
+
+    /// How many actors this node is running.
+    ///
+    /// Rises with what is being hosted and falls as things stop, because an
+    /// actor leaves the registry on its way out. A number that only ever climbs
+    /// would mean the tree is leaking rows — and, for event-sourced actors, the
+    /// journal handles behind them.
+    #[must_use]
+    pub fn hosted(&self) -> usize {
+        self.inner.hosted()
+    }
+
     /// Start an actor at `path` without registering it.
     ///
-    /// The escape hatch a [`ClusterActor::spawn`] implementation uses: the
-    /// registry decides what lives at a path, so a spawn that also registered
-    /// would give that fact a second owner.
+    /// The escape hatch for the two things registration would otherwise make
+    /// impossible: standing a second instance up at an address something already
+    /// holds, and starting one on a node that is refusing to host. Both are
+    /// things a test needs and a deployment does not.
     ///
-    /// Nothing else should reach for this. An unregistered actor is not at its
-    /// path as far as resolution is concerned, so the returned reference is the
-    /// only way to it and dies with it, and a second actor started at a path
-    /// something is already registered at is invisible to everyone but its
-    /// creator. [`actor_of`](Self::actor_of) is what an ordinary caller wants.
+    /// An unregistered actor is not at its path as far as resolution is
+    /// concerned, so the returned reference is the only way to it, nothing can
+    /// stop it, and it is not taken down with the tree above it.
+    /// [`actor_of`](Self::actor_of) is what an ordinary caller wants.
     pub fn spawn_at<A: Actor>(&self, path: ActorPath, actor: A) -> ActorRef<A::Command> {
-        let link = spawn_at(actor, self.inner.clone(), path.clone());
-        self.reference(path, Some(link))
+        let spawned = spawn_at(actor, self.inner.clone(), path.clone());
+        self.reference(path, Some(spawned.link))
     }
 
     /// Registration for one shard type.

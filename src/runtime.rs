@@ -224,6 +224,28 @@ impl<C: Send + 'static> ActorRef<C> {
             .unwrap_or(Err(TellError::NoAnswer))
     }
 
+    /// Stop the actor at this path, and everything under it.
+    ///
+    /// Returns once the subtree is quiet, deepest first, so a caller that
+    /// stopped a supervisor knows its sessions are gone rather than going. `false`
+    /// if nothing was there — stopping a path twice is not an error.
+    ///
+    /// The path outlives this, like every other way an actor ends: create one at
+    /// the same path again and every reference held across the gap reaches the
+    /// new instance.
+    ///
+    /// An actor stops *itself* by returning [`Flow::Stop`]. Calling this on its
+    /// own reference from inside a handler would wait for a task that is waiting
+    /// for the handler to return.
+    ///
+    /// [`Flow::Stop`]: crate::Flow::Stop
+    pub async fn stop(&self) -> bool {
+        let Some(system) = self.system.upgrade() else {
+            return false;
+        };
+        system.stop_at(&self.path).await
+    }
+
     pub(crate) fn cached(&self) -> Option<Link<C>> {
         self.link.lock().clone()
     }
@@ -268,7 +290,7 @@ impl Drop for Cancelled {
 impl<C> Link<C> {
     /// Whether two links reach the same place, so that dropping a stale one
     /// cannot discard a fresh one a concurrent send just resolved.
-    fn is_same(&self, other: &Self) -> bool {
+    pub(crate) fn is_same(&self, other: &Self) -> bool {
         match (self, other) {
             (Link::Local(a), Link::Local(b)) => a.same_channel(b),
             (Link::Remote(a), Link::Remote(b)) => Arc::ptr_eq(a, b),
@@ -325,6 +347,10 @@ impl<C: Send + 'static, PC: Send + 'static> ActorContext<C, PC> {
     /// parent needs. An actor at the top of the tree gets a reference it can
     /// hold and never send through, because [`Root`] has no values: the type
     /// system says root takes no messages.
+    ///
+    /// A plain read, and safe as one, because a parent that stops takes its
+    /// children with it. There is no state in which this addresses an actor that
+    /// has gone while the one holding it is still running.
     ///
     /// [`Root`]: crate::Root
     #[must_use]
@@ -391,7 +417,20 @@ impl<C: Send + 'static, PC: Send + 'static> ActorContext<C, PC> {
     }
 }
 
-/// Start an actor at `path` and return the link to its mailbox.
+/// A running actor, as the registry holds it: how to reach it, how to ask it to
+/// stop, and how to tell when it has.
+pub(crate) struct Spawned<C> {
+    pub(crate) link: Link<C>,
+    /// Raised to stop this one actor. Held by the registry entry, so an actor
+    /// started outside the registry simply has nobody who can raise it.
+    pub(crate) stop: tokio::sync::watch::Sender<bool>,
+    /// Closed by the actor's own task when it has ended — after its children
+    /// have, which is what makes "stop everything under here" a thing that can
+    /// be waited on.
+    pub(crate) terminated: tokio::sync::watch::Receiver<()>,
+}
+
+/// Start an actor at `path`.
 ///
 /// Registration is deliberately not here: the registry is the one thing that
 /// decides what lives at a path, and a spawn that also registered would give it
@@ -400,16 +439,22 @@ pub(crate) fn spawn_at<A: Actor>(
     actor: A,
     inner: Arc<SystemInner>,
     path: ActorPath,
-) -> Link<A::Command> {
+) -> Spawned<A::Command> {
     let (tx, rx) = tokio::sync::mpsc::channel(MAILBOX_CAPACITY);
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let (ended, terminated) = tokio::sync::watch::channel(());
     let ctx = ActorContext {
         inner,
         self_tx: tx.clone(),
         path,
         parent: PhantomData,
     };
-    tokio::spawn(run_actor(actor, rx, ctx));
-    Link::Local(tx)
+    tokio::spawn(run_actor(actor, rx, ctx, stop_rx, ended));
+    Spawned {
+        link: Link::Local(tx),
+        stop,
+        terminated,
+    }
 }
 
 /// Reject a name that could not be one path segment.
@@ -421,8 +466,8 @@ pub(crate) fn check_name(name: &str) -> Result<(), ActorOfError> {
     }
 }
 
-/// The lifecycle of a single actor: start, then process commands until the
-/// mailbox closes or the actor asks to stop.
+/// The lifecycle of a single actor: start, process commands, then take its
+/// children with it.
 ///
 /// Everything about persistence used to live here. It now lives in
 /// [`Persistent`], so this loop is the same for every kind of actor.
@@ -432,36 +477,62 @@ pub(crate) async fn run_actor<A: Actor>(
     mut actor: A,
     mut rx: mpsc::Receiver<A::Command>,
     mut ctx: ActorContext<A::Command, A::ParentCommand>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    ended: tokio::sync::watch::Sender<()>,
 ) {
     let mut stand_down = ctx.inner.stand_down.clone();
     stand_down.mark_unchanged();
 
     if let Err(e) = actor.on_start(&mut ctx).await {
         tracing::error!(path = %ctx.path, error = %e, "actor failed to start; shutting down");
-        return;
+    } else {
+        serve(&mut actor, &mut rx, &mut ctx, &mut stand_down, &mut stop).await;
     }
 
+    // The guardian half, and the whole of it: an actor takes its children with
+    // it. Its own entry goes first, so nothing new resolves to an actor that is
+    // on its way out, and the actor value is dropped last of all — after the
+    // subtree below it is quiet, which is what lets a parent's final act assume
+    // its children are gone.
+    ctx.inner
+        .retire(&ctx.path, &Link::Local(ctx.self_tx.clone()));
+    ctx.inner.stop_descendants(&ctx.path).await;
+    drop(actor);
+    drop(ended);
+}
+
+/// Handle commands until something says to stop.
+async fn serve<A: Actor>(
+    actor: &mut A,
+    rx: &mut mpsc::Receiver<A::Command>,
+    ctx: &mut ActorContext<A::Command, A::ParentCommand>,
+    stand_down: &mut tokio::sync::watch::Receiver<bool>,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+) {
     loop {
         let cmd = tokio::select! {
             cmd = rx.recv() => match cmd {
                 Some(cmd) => cmd,
-                None => break,
+                None => return,
             },
-            () = stood_down(&mut stand_down) => break,
+            () = stood_down(stand_down) => return,
+            () = asked_to_stop(stop) => return,
         };
 
-        // The handler is raced against the same signal, so an instance loses
+        // The handler is raced against the same signals, so an instance loses
         // its in-flight work rather than finishing it. That is the point: a
         // node without quorum cannot know whether this instance now belongs to
         // somebody else, and a half-finished turn is a smaller loss than one
-        // completed against a history that has moved on.
+        // completed against a history that has moved on. A stop is treated the
+        // same way rather than given a rule of its own.
         let flow = tokio::select! {
-            flow = actor.handle(cmd, &mut ctx) => flow,
-            () = stood_down(&mut stand_down) => break,
+            flow = actor.handle(cmd, ctx) => flow,
+            () = stood_down(stand_down) => return,
+            () = asked_to_stop(stop) => return,
         };
         match flow {
             Flow::Continue => {}
-            Flow::Stop => break,
+            Flow::Stop => return,
         }
     }
 }
@@ -476,6 +547,24 @@ async fn stood_down(watch: &mut tokio::sync::watch::Receiver<bool>) {
             // The sender is gone, which means the system is being torn down.
             // Standing down is the right reading of that.
             return;
+        }
+        if *watch.borrow_and_update() {
+            return;
+        }
+    }
+}
+
+/// Resolve once this actor in particular has been asked to stop.
+///
+/// The sender lives in the registry entry, so it going away means only that
+/// nobody is in a position to ask — an actor started outside the registry, which
+/// runs until it stops itself. That is the opposite reading to the one above,
+/// and deliberately: one signal is the system ending, the other is a request
+/// that can no longer be made.
+async fn asked_to_stop(watch: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if watch.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
         if *watch.borrow_and_update() {
             return;

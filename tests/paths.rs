@@ -236,10 +236,15 @@ async fn a_child_names_its_parent() {
     assert_eq!(helper.ask(HelperCmd::AskUpwards).await.unwrap(), 3);
 }
 
-/// A child's ref survives its parent being recreated too — the child is
-/// addressed by its own path, and the parent it names is resolved per send.
+/// A whole branch is rebuilt and every reference into it still works.
+///
+/// Stopping the parent takes the child with it, so both references point at
+/// nothing for a moment; recreating the pair makes both live again, and neither
+/// holder was told anything. The child's own reference survives, and so does the
+/// reference it holds *upwards* — which is the one that would be a dangling
+/// handle in any design where a parent were passed down at construction.
 #[tokio::test]
-async fn a_parent_ref_survives_the_parent_being_recreated() {
+async fn refs_into_a_branch_survive_the_branch_being_rebuilt() {
     let system = ActorSystem::in_memory();
 
     let (first, first_gone) = Instance::new(1);
@@ -249,9 +254,15 @@ async fn a_parent_ref_survives_the_parent_being_recreated() {
 
     parent.tell(Which::Stop).await.unwrap();
     first_gone.await.expect("the first parent should be gone");
+    assert!(
+        helper.ask(HelperCmd::AskUpwards).await.is_err(),
+        "the child outlived the parent that owned it"
+    );
 
     let (second, _second_gone) = Instance::new(2);
-    let _fresh = system.actor_of("worker", second).unwrap();
+    let fresh = system.actor_of("worker", second).unwrap();
+    let _rebuilt = fresh.ask(Which::MakeHelper).await.unwrap();
 
+    // The reference from before the rebuild, used unchanged.
     assert_eq!(helper.ask(HelperCmd::AskUpwards).await.unwrap(), 2);
 }

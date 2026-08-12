@@ -160,6 +160,14 @@ An event-sourced actor is adapted into an ordinary one first — `system.persist
 
 `ctx.actor_of(name, actor)` creates a child under the current actor; `ctx.parent()` is an ordinary reference to the parent's path, typed by the actor's `ParentCommand`, so a child reaches upwards without having been handed anything at construction. Both are get-or-create: two callers naming one path get one actor, and the loser's actor value is dropped without ever being started.
 
+An actor owns the actors below it. `held.stop()` — or `system.stop(&path)` — stops it and everything under it, children first, and returns once the subtree is quiet:
+
+```rust
+sessions.stop().await;   // and every session under it, and their agents
+```
+
+Stopping from the inside is the same operation: an actor that returns `Flow::Stop`, or one whose node stands down, takes its children with it too. So "unload this account" is one call rather than a walk, a stopped actor leaves the registry rather than sitting in it, and `ctx.parent()` is safe as a plain read — a child cannot outlive the actor it reaches up to.
+
 ## Durability you can wait on
 
 `CommandEffect` composes one persist step with an ordered set of post-persist
