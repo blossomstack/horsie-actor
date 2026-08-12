@@ -1,5 +1,5 @@
 use crate::cluster::network::ConsensusNetwork;
-use crate::cluster::placement::{PlacementCommand, PlacementTable};
+use crate::cluster::placement::PlacementTable;
 use crate::cluster::store::RaftStore;
 use crate::cluster::types::{LiveSet, Membership, NodeIdx};
 use crate::envelope::{Envelope, Message, NodeId, Reply};
@@ -237,16 +237,12 @@ impl ClusterNode {
 
     /// Which node should host the actor at `path`.
     ///
-    /// Prefers a standing assignment, and falls back to the rendezvous
-    /// candidate. `None` when no member is live — including this one, which is
-    /// the state a stood-down node is in.
+    /// Hashed over the agreed live set, so every node answers this identically
+    /// without asking anyone. `None` when no member is live — including this
+    /// one, which is the state a stood-down node is in.
     #[must_use]
     pub fn owner_of(&self, path: &str) -> Option<NodeId> {
-        let table = self.table.lock();
-        table
-            .owner(path)
-            .filter(|n| table.members().contains(n))
-            .or_else(|| table.candidate(path))
+        self.table.lock().owner_of(path)
     }
 
     /// Whether this node should host the actor at `path`.
@@ -265,14 +261,6 @@ impl ClusterNode {
         self.table.lock().members().iter().copied().collect()
     }
 
-    /// Record that this node is hosting the actor at `path`.
-    pub fn record_local_assignment(&self, path: &str) {
-        self.table.lock().apply(PlacementCommand::Assign {
-            path: path.to_owned(),
-            node: self.local,
-        });
-    }
-
     /// Replace the set of nodes placement may use.
     ///
     /// Driven only by the agreed live set. There is deliberately no way for a
@@ -280,16 +268,7 @@ impl ClusterNode {
     /// letting it rewrite placement is precisely how a partitioned node used to
     /// elect itself host of everything.
     fn set_live(&self, live: &[NodeId]) {
-        let mut table = self.table.lock();
-        let known: Vec<NodeId> = table.members().iter().copied().collect();
-        for node in known {
-            if !live.contains(&node) {
-                table.apply(PlacementCommand::NodeDown { node });
-            }
-        }
-        for node in live {
-            table.apply(PlacementCommand::NodeUp { node: *node });
-        }
+        self.table.lock().set_members(live.iter().copied());
     }
 
     /// Send an already-encoded command to whichever node hosts `route`.

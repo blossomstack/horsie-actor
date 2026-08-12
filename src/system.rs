@@ -674,11 +674,6 @@ impl ActorSystem {
             .cloned()
             .ok_or_else(|| ActorOfError::Unclaimed(path.clone()))?;
         recipe(self, path)?;
-        if let Some(cluster) = &self.inner.cluster
-            && let Some(shard) = crate::shard::shard_in(path)
-        {
-            cluster.record_local_assignment(&shard.to_string());
-        }
         Ok(())
     }
 
