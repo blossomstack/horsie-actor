@@ -1,5 +1,4 @@
 use crate::actor::EventSourcedActor;
-use crate::address::SettingsTable;
 use crate::behaviour::Actor;
 use crate::cluster::{ClusterNode, Dedup};
 use crate::envelope::Message;
@@ -8,6 +7,7 @@ use crate::journal::{InMemoryJournal, Journal};
 use crate::path::ActorPath;
 use crate::persistent::Persistent;
 use crate::runtime::{ActorRef, Link, check_name, spawn_at};
+use crate::shard::{Shard, address_for, region_of, type_in};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -15,73 +15,6 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
-
-/// A registered actor type, hostable by id.
-///
-/// This is a *registration descriptor*, not a behaviour — deliberately not a
-/// subtrait of [`Actor`]. Keeping it separate is what lets a registered type
-/// choose its own hosting: [`ClusterActor::spawn`] may call
-/// [`ActorSystem::spawn_at`] for a plain actor or
-/// [`ActorSystem::spawn_persistent_at`] for an event-sourced one, so being
-/// cluster-hostable and being event-sourced stay independent.
-///
-/// Nothing here mentions persistence, and that is deliberate. A singleton with
-/// no event log is an ordinary member of this trait; an earlier version required
-/// every registered type to declare a `persistence_id` so the system could claim
-/// a log before hosting, which forced a journal on types that had no state to
-/// keep. The write fence now lives entirely inside the event-sourcing layer, so
-/// the cluster layer no longer has to know that journals exist.
-///
-/// The `Command` bounds are the compile-time guarantee: a type whose commands
-/// cannot round-trip through serde cannot be registered at all, so a command
-/// that could not survive a hop between hosts is a type error rather than a
-/// runtime surprise on the first send.
-pub trait ClusterActor: Send + 'static {
-    /// Stable name for this actor type, and half of every instance's identity.
-    /// Changing it orphans existing journals.
-    const KIND: &'static str;
-
-    /// Messages instances of this type accept.
-    type Command: Send + Serialize + DeserializeOwned + 'static;
-
-    /// Node-local wiring — pools, clients, registries. Never serialized and
-    /// never sent anywhere; each host supplies its own.
-    type Deps: Clone + Send + Sync + 'static;
-
-    /// Build and spawn the instance for `id`, at `path`.
-    ///
-    /// This is what a host that never executed the original request calls, which
-    /// is why it takes an id and deps rather than a constructed actor.
-    ///
-    /// Registering the result is the registry's job, not this one's — spawn with
-    /// [`ActorSystem::spawn_at`] or [`ActorSystem::spawn_persistent_at`] and hand
-    /// the reference back.
-    fn spawn(
-        id: &str,
-        deps: Self::Deps,
-        system: &ActorSystem,
-        path: ActorPath,
-    ) -> ActorRef<Self::Command>;
-}
-
-/// Where a registered singleton sits while the cluster layer still addresses by
-/// `(kind, id)`.
-///
-/// A bridge, and a short-lived one: clustering becomes a property of a path
-/// rather than of a registration, at which point instances live wherever their
-/// parents put them and this disappears along with `KIND`.
-fn singleton_path<A: ClusterActor>(id: &str) -> ActorPath {
-    ActorPath::root().child(A::KIND).child(id)
-}
-
-/// Read a bridge path back as the `(kind, id)` it stands for, or `None` if it is
-/// an ordinary address that no factory could ever build.
-fn singleton_parts(path: &ActorPath) -> Option<(&str, &str)> {
-    match path.segments() {
-        [kind, id] => Some((kind.as_str(), id.as_str())),
-        _ => None,
-    }
-}
 
 /// Build the closure that decodes for one actor and hands it the command.
 ///
@@ -157,15 +90,16 @@ pub enum DispatchError {
 /// Why [`ActorSystem::actor_of`] could not produce a reference.
 #[derive(Debug, Error)]
 pub enum ActorOfError {
-    /// No factory was registered for this kind. `register` is called once at
-    /// startup, so this is a wiring mistake, not a runtime condition.
-    #[error("no actor type is registered under the kind '{0}'")]
-    NotRegistered(&'static str),
+    /// No registered shard type claims this address. `register` is called once
+    /// per type at startup, so this is a wiring mistake, not a runtime
+    /// condition — or two nodes running different builds.
+    #[error("no registered shard type claims '{0}'")]
+    Unclaimed(ActorPath),
 
-    /// Two actor types declared the same `KIND`. Their instances would share a
-    /// registry slot and hand each other's callers the wrong `ActorRef`.
-    #[error("two actor types are registered under the kind '{0}'")]
-    KindCollision(&'static str),
+    /// Two types declared the same `Shard::TYPE`. Their actors would share
+    /// addresses and each other's recipes.
+    #[error("two shard types are registered as '{0}'")]
+    TypeCollision(&'static str),
 
     /// The name could not be one path segment — it was empty, or it contained
     /// the separator, which would make one actor's path ambiguous with another's.
@@ -210,22 +144,13 @@ const DEDUP_WINDOW: usize = 4096;
 /// different kinds can share one registry.
 type ErasedRef = Arc<dyn Any + Send + Sync>;
 
-/// Builds an instance of some registered kind and returns a type-erased ref.
-type Factory = Arc<dyn Fn(&str, &ActorSystem, ActorPath) -> ErasedRef + Send + Sync>;
-
-/// Decodes an inbound payload and hands it to the local instance.
+/// Builds and starts whatever belongs at a shard address, on the node that owns
+/// it.
 ///
-/// Type-erased for the same reason the factory is: the dispatch loop knows a
-/// path, not a Rust type.
-type Deliver = Arc<
-    dyn Fn(
-            String,
-            Vec<u8>,
-            ActorSystem,
-        ) -> futures_util::future::BoxFuture<'static, Result<(), DispatchError>>
-        + Send
-        + Sync,
->;
+/// Type-erased because a node that has to build has a path, not a Rust type.
+/// Closes over that node's own wiring, which is why it is registered on every
+/// node rather than sent to one.
+type Recipe = Arc<dyn Fn(&ActorSystem, &ActorPath) -> Result<(), ActorOfError> + Send + Sync>;
 
 /// Hands an inbound payload to the actor at one specific path.
 ///
@@ -287,8 +212,10 @@ struct Entry {
 /// Process-wide state shared by every actor in a system.
 pub(crate) struct SystemInner {
     pub(crate) journal: Arc<dyn Journal>,
-    factories: Mutex<HashMap<&'static str, Factory>>,
-    deliverers: Mutex<HashMap<&'static str, Deliver>>,
+    /// How to build each registered shard type, by `Shard::TYPE` — which is the
+    /// third segment of every shard address, so a node holding only a path can
+    /// find the recipe for what belongs there.
+    shards: Mutex<HashMap<&'static str, Recipe>>,
     cluster: Option<Arc<ClusterNode>>,
     /// Message ids this node has already handled.
     ///
@@ -307,12 +234,6 @@ pub(crate) struct SystemInner {
     /// second time, alongside this, and two records of one fact drifting apart is
     /// what generated the ownership bugs this design set out to remove.
     live: Mutex<HashMap<ActorPath, Entry>>,
-    /// Which addresses are clustered, read once at startup.
-    ///
-    /// Empty is the single-node case: nothing matches, every address takes the
-    /// default, and the default is local — so the same binary serves both
-    /// deployments and one of them mentions none of this.
-    settings: SettingsTable,
     /// Command types that have been proved to round-trip, by the command's
     /// [`TypeId`]. Config *chooses* what is clustered; this is what says whether
     /// it *can* be.
@@ -334,22 +255,6 @@ impl SystemInner {
     /// anything. Resolution never creates: a reference that woke an actor up
     /// would break the rule that reading a session must not load it.
     pub(crate) fn resolve<C: Send + 'static>(&self, path: &ActorPath) -> Option<Link<C>> {
-        if let Some(link) = self.resolve_local::<C>(path) {
-            return Some(link);
-        }
-        // Not here. An actor lives where its nearest clustered ancestor lives,
-        // so that ancestor — not this path — is what placement is asked about.
-        // A path with no clustered ancestor is local, full stop.
-        let cluster = self.cluster.as_ref()?;
-        let route = self.settings.clustered_prefix(path)?;
-        if cluster.owns(&route.to_string()) {
-            return None;
-        }
-        self.remote_link::<C>(path, &route, cluster.clone())
-    }
-
-    /// Whatever is running here at `path`.
-    fn resolve_local<C: Send + 'static>(&self, path: &ActorPath) -> Option<Link<C>> {
         let live = self.live.lock();
         let link = live
             .get(path)?
@@ -357,49 +262,6 @@ impl SystemInner {
             .downcast_ref::<ActorRef<C>>()?
             .cached()?;
         link.is_alive().then_some(link)
-    }
-
-    /// A link that encodes commands and ships them to whichever node hosts
-    /// `path`.
-    ///
-    /// It captures the *address*, never a host: the owner is resolved on every
-    /// send. So a remote link survives a relocation on its own, without the
-    /// reference holding it having to drop and re-resolve — which is why a
-    /// remote send that fails is final rather than retried. Re-resolving would
-    /// build the identical link.
-    ///
-    /// `None` for a command type nobody registered as clusterable. That cannot
-    /// happen for an actor this system created — creation refuses a clustered
-    /// path whose commands do not round-trip — so it only arises for a bare
-    /// reference to a path nothing here ever made.
-    fn remote_link<C: Send + 'static>(
-        &self,
-        path: &ActorPath,
-        route: &ActorPath,
-        cluster: Arc<ClusterNode>,
-    ) -> Option<Link<C>> {
-        let wire = self.wire::<C>()?;
-        let address = path.to_string();
-        let route = route.to_string();
-        Some(Link::Remote(Arc::new(move |cmd: C| {
-            let cluster = cluster.clone();
-            let address = address.clone();
-            let route = route.clone();
-            let wire = wire.clone();
-            Box::pin(async move {
-                // Encoded inside the router context, which is what registers any
-                // reply handle in the command against this node before it
-                // leaves. Encoding it outside is a loud error rather than a
-                // handle addressed to nobody.
-                let router: Arc<dyn crate::reply::ReplyRouter> = cluster.clone();
-                let payload = crate::reply::with_router(router, || (wire.encode)(&cmd))
-                    .ok_or(TellError::Undeliverable)?;
-                cluster
-                    .send(&route, &address, payload, cluster.next_message_id())
-                    .await
-                    .map_err(|_| TellError::Undeliverable)
-            })
-        })))
     }
 
     /// The registered wire format for `C`, if it has one.
@@ -443,7 +305,7 @@ impl ActorSystem {
     /// single-node deployment, and it mentions none of the addressing config.
     #[must_use]
     pub fn new(journal: Arc<dyn Journal>) -> Self {
-        Self::build(journal, None, SettingsTable::new())
+        Self::build(journal, None)
     }
 
     /// The one place a system is assembled.
@@ -454,11 +316,7 @@ impl ActorSystem {
     /// actor spawned before the first election exit on its first poll, silently.
     /// Refusing to *start* an instance is `require_serving`'s job, and it is a
     /// separate question with a separate answer.
-    fn build(
-        journal: Arc<dyn Journal>,
-        cluster: Option<Arc<ClusterNode>>,
-        settings: SettingsTable,
-    ) -> Self {
+    fn build(journal: Arc<dyn Journal>, cluster: Option<Arc<ClusterNode>>) -> Self {
         let (tx, rx) = tokio::sync::watch::channel(false);
         if let Some(cluster) = &cluster {
             // Inverted: actors want to know when to stop, and the node reports
@@ -477,27 +335,15 @@ impl ActorSystem {
         Self {
             inner: Arc::new(SystemInner {
                 journal,
-                factories: Mutex::new(HashMap::new()),
-                deliverers: Mutex::new(HashMap::new()),
+                shards: Mutex::new(HashMap::new()),
                 cluster,
                 seen: Mutex::new(Dedup::with_capacity(DEDUP_WINDOW)),
                 live: Mutex::new(HashMap::new()),
-                settings,
                 wires: Mutex::new(HashMap::new()),
                 stand_down: rx,
                 _stand_down_tx: tx,
             }),
         }
-    }
-
-    /// A single-node system that still reads an addressing config.
-    ///
-    /// The same tree and the same settings, on one node — which is what makes
-    /// "clustering an address changes nothing a caller can see" a thing a test
-    /// can assert rather than a claim.
-    #[must_use]
-    pub fn with_settings(journal: Arc<dyn Journal>, settings: SettingsTable) -> Self {
-        Self::build(journal, None, settings)
     }
 
     /// A system that hosts registered actors across a cluster.
@@ -506,12 +352,8 @@ impl ActorSystem {
     /// rest are reached through the transport. Business logic sees no
     /// difference — `actor_of` returns an `ActorRef` either way.
     #[must_use]
-    pub fn clustered(
-        journal: Arc<dyn Journal>,
-        cluster: Arc<ClusterNode>,
-        settings: SettingsTable,
-    ) -> Self {
-        Self::build(journal, Some(cluster), settings)
+    pub fn clustered(journal: Arc<dyn Journal>, cluster: Arc<ClusterNode>) -> Self {
+        Self::build(journal, Some(cluster))
     }
 
     /// This node's cluster, if it is in one.
@@ -575,32 +417,7 @@ impl ActorSystem {
         self.require_serving()?;
         check_name(name)?;
         let path = parent.child(name);
-
-        // Config *chooses* what is clustered; it cannot *grant* it. A clustered
-        // actor's commands must encode, no setting makes them, and because paths
-        // appear at runtime this cannot be checked at boot — so it is checked
-        // here, loudly, the first time it happens.
-        let clustered = self.inner.settings.at(&path).clustered.value;
         let wire = self.inner.wire::<A::Command>();
-        if clustered && wire.is_none() {
-            return Err(ActorOfError::NotClusterable {
-                path,
-                actor: std::any::type_name::<A>(),
-            });
-        }
-
-        // Somebody else's. Hand back a reference that reaches them and drop the
-        // actor value — an actor lives where its address says, not where the
-        // request to create it happened to land.
-        if clustered
-            && let Some(cluster) = &self.inner.cluster
-            && !cluster.owns(&path.to_string())
-            && let Some(link) = self
-                .inner
-                .remote_link::<A::Command>(&path, &path, cluster.clone())
-        {
-            return Ok(self.reference(path, Some(link)));
-        }
 
         let mut live = self.inner.live.lock();
         if let Some(existing) = live.get(&path) {
@@ -631,52 +448,7 @@ impl ActorSystem {
             },
         );
         drop(live);
-
-        if clustered && let Some(cluster) = &self.inner.cluster {
-            cluster.record_local_assignment(&path.to_string());
-        }
         Ok(self.reference(path, Some(link)))
-    }
-
-    /// A reference to `path`, whatever is or is not there.
-    ///
-    /// The general form of [`ActorContext::parent`]: a cold reference that
-    /// resolves on its first send and fails cleanly if the address reaches
-    /// nothing. This is what makes a path an *address* rather than a label — a
-    /// node that knows the name can reach the actor without having been handed
-    /// anything.
-    ///
-    /// `C` is the caller's claim about what lives there. A wrong one does not
-    /// reach the wrong actor: resolution is typed, so it simply finds nothing.
-    ///
-    /// [`ActorContext::parent`]: crate::ActorContext::parent
-    #[must_use]
-    pub fn reference_at<C: Send + 'static>(&self, path: ActorPath) -> ActorRef<C> {
-        self.reference(path, None)
-    }
-
-    /// What applies at `path`, and which configured pattern decided each part.
-    ///
-    /// Patterns compose invisibly, so without this the first surprising
-    /// configuration is unanswerable — and config that cannot be explained gets
-    /// worked around rather than fixed.
-    #[must_use]
-    pub fn settings_at(&self, path: &ActorPath) -> crate::address::Settings {
-        self.inner.settings.at(path)
-    }
-
-    /// Record that `A`'s commands round-trip, so actors of this type may be
-    /// created at a clustered address.
-    ///
-    /// Called once per type at startup, beside [`register`](Self::register). The
-    /// bound is the whole content of it: a type whose commands cannot survive a
-    /// hop between hosts cannot be recorded here, so clustering one is a named
-    /// error at creation rather than a surprise on the first send.
-    pub fn register_clusterable<A: Actor>(&self)
-    where
-        A::Command: Serialize + DeserializeOwned,
-    {
-        self.record_wire::<A::Command>(std::any::type_name::<A>());
     }
 
     fn record_wire<C: Serialize + DeserializeOwned + Send + 'static>(&self, actor: &'static str) {
@@ -711,97 +483,121 @@ impl ActorSystem {
         self.reference(path, Some(link))
     }
 
-    /// Register an actor type so instances of it can be reached by id.
+    /// Registration for one shard type.
     ///
-    /// Called once per type at startup. `deps` is cloned into every instance.
-    pub fn register<A: ClusterActor>(&self, deps: A::Deps) {
-        let factory: Factory = Arc::new(move |id: &str, system: &ActorSystem, path: ActorPath| {
-            Arc::new(A::spawn(id, deps.clone(), system, path)) as ErasedRef
-        });
-        self.inner.factories.lock().insert(A::KIND, factory);
-
-        let deliver: Deliver = Arc::new(|id, payload, system| {
-            Box::pin(async move {
-                // Decoded inside the router context so a `ReplyTo` in the
-                // command comes back knowing how to answer whoever asked. Out
-                // of context it decodes to an error instead, which is the
-                // difference between a failed request and a caller that waits
-                // forever.
-                let cmd: A::Command = match system.cluster() {
-                    Some(cluster) => {
-                        let router: Arc<dyn crate::reply::ReplyRouter> = cluster.clone();
-                        crate::reply::with_router(router, || serde_json::from_slice(&payload))
-                    }
-                    None => serde_json::from_slice(&payload),
-                }
-                .map_err(|e| DispatchError::Decode(e.to_string()))?;
-                let target = system.local_instance::<A>(&id)?;
-                target
-                    .tell(cmd)
-                    .await
-                    .map_err(|_| DispatchError::MailboxClosed)
-            })
-        });
-        self.inner.deliverers.lock().insert(A::KIND, deliver);
-        // A registered type has already proved the round-trip bound, so it is
-        // clusterable by construction — no separate declaration needed.
-        self.record_wire::<A::Command>(std::any::type_name::<A>());
+    /// The turbofish sits here so that [`register`](ShardOf::register) infers
+    /// the recipe's types and needs none of its own.
+    #[must_use]
+    pub fn shard<S: Shard>(&self) -> ShardOf<'_, S> {
+        ShardOf {
+            system: self,
+            marker: std::marker::PhantomData,
+        }
     }
 
-    /// Start, or return, the instance hosted *here* — no cluster resolution.
+    /// A reference to the actors of a shard type.
     ///
-    /// Used by the dispatch loop, which has already been told this node is the
-    /// right place. Starting an instance takes no lock on anything shared: an
-    /// event-sourced one recovers, and its first write is conditional on the log
-    /// still ending where recovery left it, so a second host starting the same
-    /// instance is caught by that write rather than by a claim taken here.
-    pub fn local_instance<A: ClusterActor>(
-        &self,
-        id: &str,
-    ) -> Result<ActorRef<A::Command>, ActorOfError> {
-        self.require_serving()?;
-        let path = singleton_path::<A>(id);
-        let factory = self
-            .inner
-            .factories
-            .lock()
-            .get(A::KIND)
-            .cloned()
-            .ok_or(ActorOfError::NotRegistered(A::KIND))?;
+    /// One reference for the whole type, not one per actor: each command names
+    /// its own target through [`Shard::entity_id`], and is routed to whichever
+    /// node owns [`Shard::shard_id`]. Indistinguishable at the call site from a
+    /// reference to a local actor — same type, same `tell`, same `ask`.
+    #[must_use]
+    pub fn shard_actor_of<S: Shard>(&self) -> ActorRef<S::Command> {
+        let system = self.clone();
+        let route: crate::runtime::RemoteSend<S::Command> = Arc::new(move |cmd: S::Command| {
+            let system = system.clone();
+            Box::pin(async move {
+                let (entity, shard) = address_for::<S>(&cmd);
+                system.deliver_to_shard::<S>(entity, shard, cmd).await
+            })
+        });
+        self.reference(region_of(S::TYPE), Some(Link::Remote(route)))
+    }
 
-        let mut live = self.inner.live.lock();
-        if let Some(existing) = live.get(&path) {
-            let cached = downcast::<A>(&existing.reference)?.cached();
-            // A stopped instance stays in the map until somebody asks for it
-            // again — there is no lifecycle callback to evict it, and polling
-            // for corpses would cost more than checking here. Handing this one
-            // back would be worse than a miss: every `tell` to it fails, and the
-            // instance it stood down for never gets started.
-            if let Some(link) = cached.filter(Link::is_alive) {
-                return Ok(self.reference(path, Some(link)));
-            }
-            live.remove(&path);
+    /// Hand `cmd` to the actor at `entity`, wherever the cluster puts it.
+    async fn deliver_to_shard<S: Shard>(
+        &self,
+        entity: ActorPath,
+        shard: ActorPath,
+        cmd: S::Command,
+    ) -> Result<(), TellError> {
+        let ours = match &self.inner.cluster {
+            Some(cluster) => cluster.owns(&shard.to_string()),
+            // No cluster: this node owns everything, which is the single-node
+            // deployment and mentions none of this.
+            None => true,
+        };
+
+        if ours {
+            let link = self
+                .start_shard_actor::<S>(&entity)
+                .map_err(|_| TellError::Undeliverable)?;
+            return link.send(cmd).await.map_err(|(e, _)| e);
         }
-        let erased = factory(id, self, path.clone());
-        let typed = downcast::<A>(&erased)?;
-        let wire = self.inner.wire::<A::Command>();
-        live.insert(
-            path.clone(),
-            Entry {
-                deliver: wire
-                    .zip(typed.cached())
-                    .map(|(wire, link)| deliver_to(path.clone(), link, wire)),
-                reference: erased,
-            },
-        );
-        drop(live);
-        if let Some(cluster) = &self.inner.cluster {
-            cluster.record_local_assignment(&path.to_string());
+
+        let Some(cluster) = self.inner.cluster.clone() else {
+            return Err(TellError::Undeliverable);
+        };
+        let wire = self
+            .inner
+            .wire::<S::Command>()
+            .ok_or(TellError::Undeliverable)?;
+        // Encoded inside the router context, which is what registers any reply
+        // handle in the command against this node before it leaves.
+        let router: Arc<dyn crate::reply::ReplyRouter> = cluster.clone();
+        let payload = crate::reply::with_router(router, || (wire.encode)(&cmd))
+            .ok_or(TellError::Undeliverable)?;
+        cluster
+            .send(
+                &shard.to_string(),
+                &entity.to_string(),
+                payload,
+                cluster.next_message_id(),
+            )
+            .await
+            .map_err(|_| TellError::Undeliverable)
+    }
+
+    /// The actor at a shard address on this node, building it from the
+    /// registered recipe if it is not running yet.
+    fn start_shard_actor<S: Shard>(
+        &self,
+        entity: &ActorPath,
+    ) -> Result<Link<S::Command>, ActorOfError> {
+        if let Some(link) = self.inner.resolve::<S::Command>(entity) {
+            return Ok(link);
         }
-        Ok(self.reference(path, typed.cached()))
+        self.build_at(entity)?;
+        self.inner
+            .resolve::<S::Command>(entity)
+            .ok_or_else(|| ActorOfError::Unclaimed(entity.clone()))
+    }
+
+    /// Run the registered recipe for whatever belongs at `path`.
+    fn build_at(&self, path: &ActorPath) -> Result<(), ActorOfError> {
+        let type_name = type_in(path).ok_or_else(|| ActorOfError::Unclaimed(path.clone()))?;
+        let recipe = self
+            .inner
+            .shards
+            .lock()
+            .get(type_name)
+            .cloned()
+            .ok_or_else(|| ActorOfError::Unclaimed(path.clone()))?;
+        recipe(self, path)?;
+        if let Some(cluster) = &self.inner.cluster
+            && let Some(shard) = crate::shard::shard_in(path)
+        {
+            cluster.record_local_assignment(&shard.to_string());
+        }
+        Ok(())
     }
 
     /// Refuse everything while this node has no quorum.
+    ///
+    /// A node in a minority cannot know whether its instances have already been
+    /// given to somebody else, and answering from state that may be history is
+    /// the one failure the write fence cannot catch — because a read never
+    /// writes.
     fn require_serving(&self) -> Result<(), ActorOfError> {
         match &self.inner.cluster {
             Some(cluster) if !cluster.serving() => Err(ActorOfError::NotServing),
@@ -843,70 +639,67 @@ impl ActorSystem {
             None => {}
         }
 
-        // A registered singleton that has not been started here yet. The one
-        // case where an inbound message creates an actor, and the last thing
-        // `(kind, id)` addressing is still used for.
-        if let Some((kind, id)) = singleton_parts(&path) {
-            let deliver = self
-                .inner
-                .deliverers
-                .lock()
-                .get(kind)
-                .cloned()
-                .ok_or_else(|| DispatchError::NoActor(path.clone()))?;
-            return deliver(id.to_owned(), env.payload, self.clone()).await;
+        // A shard actor this node owns but has not started yet. The one case
+        // where an inbound message creates an actor — and it can, because the
+        // address names the type and every node registered a recipe for it.
+        if type_in(&path).is_some() {
+            self.build_at(&path)
+                .map_err(|_| DispatchError::NoActor(path.clone()))?;
+            if let Some(Some(deliver)) = self.inner.deliver_here(&path) {
+                return deliver(env.payload, self.clone()).await;
+            }
         }
 
         Err(DispatchError::NoActor(path))
     }
-
-    /// The instance of a registered type `A` with this id, starting it if it is
-    /// not running.
-    ///
-    /// Idempotent by construction: two concurrent callers get one instance, not
-    /// two. That matters most for event-sourced actors, where two instances on
-    /// one id means two actors writing one journal.
-    ///
-    /// The `(kind, id)` addressing the cluster layer still uses. Superseded by
-    /// paths — a clustered actor becomes an ordinary path that happens to resolve
-    /// to another node — but that is the next step, not this one.
-    pub async fn singleton_of<A: ClusterActor>(
-        &self,
-        id: &str,
-    ) -> Result<ActorRef<A::Command>, ActorOfError> {
-        self.require_serving()?;
-        let path = singleton_path::<A>(id);
-
-        // Already running here: hand back the same reference regardless of what
-        // placement now says. Migrating a live instance mid-conversation would
-        // strand whatever it was doing, and the conditional append makes a brief
-        // overlap survivable anyway.
-        if let Some(link) = self.inner.resolve::<A::Command>(&path) {
-            return Ok(self.reference(path, Some(link)));
-        }
-
-        if let Some(cluster) = &self.inner.cluster
-            && !cluster.owns(&path.to_string())
-            && let Some(link) = self
-                .inner
-                .remote_link::<A::Command>(&path, &path, cluster.clone())
-        {
-            return Ok(self.reference(path, Some(link)));
-        }
-
-        self.local_instance::<A>(id)
-    }
 }
 
-/// Recover the concrete reference from a registry slot.
+/// The registration step for one shard type — see [`ActorSystem::shard`].
 ///
-/// The downcast can only fail if two actor types share a `KIND`, since `KIND` is
-/// the registry key. That is a wiring mistake worth naming rather than a panic.
-fn downcast<A: ClusterActor>(erased: &ErasedRef) -> Result<ActorRef<A::Command>, ActorOfError> {
-    erased
-        .downcast_ref::<ActorRef<A::Command>>()
-        .cloned()
-        .ok_or(ActorOfError::KindCollision(A::KIND))
+/// Carries only [`register`](Self::register), deliberately: there is one way to
+/// reach a shard type's actors, and it is [`ActorSystem::shard_actor_of`].
+pub struct ShardOf<'a, S: Shard> {
+    system: &'a ActorSystem,
+    marker: std::marker::PhantomData<fn() -> S>,
+}
+
+impl<S: Shard> ShardOf<'_, S> {
+    /// Teach this node how to build actors of this type.
+    ///
+    /// Called once per type at startup on **every** node. `recipe` closes over
+    /// this node's own wiring and is never sent anywhere: an actor is live
+    /// state, so the node that owns an address has to be able to construct what
+    /// belongs there without help from whoever wanted it.
+    ///
+    /// A plain recipe returns its actor; an event-sourced one adapts it first
+    /// with [`ActorSystem::persistent`].
+    ///
+    /// # Errors
+    /// If a type is already registered under the same [`Shard::TYPE`].
+    pub fn register<A, F>(self, recipe: F) -> Result<(), ActorOfError>
+    where
+        A: Actor<Command = S::Command>,
+        F: Fn(&ActorSystem, &ActorPath) -> A + Send + Sync + 'static,
+    {
+        let system = self.system;
+        system.record_wire::<S::Command>(std::any::type_name::<S>());
+
+        let built: Recipe = Arc::new(move |system: &ActorSystem, path: &ActorPath| {
+            let (Some(parent), Some(name)) = (path.parent(), path.name()) else {
+                return Err(ActorOfError::Unclaimed(path.clone()));
+            };
+            system
+                .get_or_create(&parent, name, recipe(system, path))
+                .map(|_| ())
+        });
+
+        let mut shards = system.inner.shards.lock();
+        if shards.contains_key(S::TYPE) {
+            return Err(ActorOfError::TypeCollision(S::TYPE));
+        }
+        shards.insert(S::TYPE, built);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -926,10 +719,20 @@ mod tests {
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
 
+    /// Every command names its own target, because the extractors are the only
+    /// thing that knows where a message is going.
     #[derive(Serialize, Deserialize)]
     enum CounterCmd {
-        Inc(i64),
-        Get(ReplyTo<i64>),
+        Inc { id: String, by: i64 },
+        Get { id: String, reply: ReplyTo<i64> },
+    }
+
+    impl CounterCmd {
+        fn id(&self) -> &str {
+            match self {
+                CounterCmd::Inc { id, .. } | CounterCmd::Get { id, .. } => id,
+            }
+        }
     }
 
     struct Counter {
@@ -968,8 +771,8 @@ mod tests {
             _ctx: &mut ActorContext<CounterCmd>,
         ) -> CommandEffect<Incremented> {
             match cmd {
-                CounterCmd::Inc(n) => CommandEffect::persist(vec![Incremented(n)]),
-                CounterCmd::Get(reply) => {
+                CounterCmd::Inc { by, .. } => CommandEffect::persist(vec![Incremented(by)]),
+                CounterCmd::Get { reply, .. } => {
                     let _ = reply.send(state.value);
                     CommandEffect::none()
                 }
@@ -977,109 +780,161 @@ mod tests {
         }
     }
 
-    impl ClusterActor for Counter {
-        const KIND: &'static str = "counter";
+    impl Shard for Counter {
         type Command = CounterCmd;
-        type Deps = ();
+        const TYPE: &'static str = "counter";
 
-        // An event-sourced registered type spawns itself persistently. A
-        // stateless one would call `system.spawn` here instead — being
-        // registered and being event-sourced are independent.
-        fn spawn(
-            id: &str,
-            _deps: (),
-            system: &ActorSystem,
-            path: ActorPath,
-        ) -> ActorRef<CounterCmd> {
-            system.spawn_at(path, system.persistent(Counter { id: id.to_owned() }))
+        fn entity_id(cmd: &CounterCmd) -> String {
+            cmd.id().to_owned()
+        }
+
+        /// One shard per counter, so each is placed on its own.
+        fn shard_id(cmd: &CounterCmd) -> String {
+            cmd.id().to_owned()
         }
     }
 
-    async fn current_value(actor: &ActorRef<CounterCmd>) -> i64 {
-        actor.ask(CounterCmd::Get).await.unwrap()
-    }
-
-    /// Two callers asking for the same (kind, id) get one actor, not two.
-    ///
-    /// This is the single-instance guarantee the cluster layer later extends
-    /// across nodes, and it is exactly the hazard a caller otherwise works
-    /// around by hand: two concurrent first requests spawning two event-sourced
-    /// actors onto one journal.
-    #[tokio::test]
-    async fn actor_of_is_idempotent_for_one_id() {
+    fn counters() -> ActorSystem {
         let system = ActorSystem::in_memory();
-        system.register::<Counter>(());
-        let a = system.singleton_of::<Counter>("c1").await.unwrap();
-        let b = system.singleton_of::<Counter>("c1").await.unwrap();
-        a.tell(CounterCmd::Inc(2)).await.unwrap();
-        b.tell(CounterCmd::Inc(3)).await.unwrap();
-        // One actor, one journal, one folded total — not two actors at 2 and 3.
-        assert_eq!(current_value(&a).await, 5);
+        system
+            .shard::<Counter>()
+            // The recipe is handed the address, which is where the identity
+            // comes from — `path.name()` is the entity id.
+            .register(|sys, path| {
+                sys.persistent(Counter {
+                    id: path.name().unwrap_or_default().to_owned(),
+                })
+            })
+            .unwrap();
+        system
     }
 
-    /// Different ids are different instances with independent journals.
+    async fn value_of(system: &ActorSystem, id: &str) -> i64 {
+        system
+            .shard_actor_of::<Counter>()
+            .ask(|reply| CounterCmd::Get {
+                id: id.to_owned(),
+                reply,
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Two sends naming one entity reach one actor, not two — the guarantee a
+    /// caller would otherwise have to build by hand, and the one that matters
+    /// most for an event-sourced actor, where two instances mean two writers on
+    /// one journal.
     #[tokio::test]
-    async fn different_ids_are_different_instances() {
+    async fn one_entity_id_is_one_actor() {
+        let system = counters();
+        let counters = system.shard_actor_of::<Counter>();
+        counters
+            .tell(CounterCmd::Inc {
+                id: "c1".into(),
+                by: 2,
+            })
+            .await
+            .unwrap();
+        counters
+            .tell(CounterCmd::Inc {
+                id: "c1".into(),
+                by: 3,
+            })
+            .await
+            .unwrap();
+        assert_eq!(value_of(&system, "c1").await, 5);
+    }
+
+    /// Different entity ids are different actors at different addresses.
+    #[tokio::test]
+    async fn different_entity_ids_are_different_actors() {
+        let system = counters();
+        let counters = system.shard_actor_of::<Counter>();
+        counters
+            .tell(CounterCmd::Inc {
+                id: "a".into(),
+                by: 2,
+            })
+            .await
+            .unwrap();
+        counters
+            .tell(CounterCmd::Inc {
+                id: "b".into(),
+                by: 3,
+            })
+            .await
+            .unwrap();
+        assert_eq!(value_of(&system, "a").await, 2);
+        assert_eq!(value_of(&system, "b").await, 3);
+    }
+
+    /// A shard address carries the type, the shard and the entity — so a node
+    /// holding only a path can find the recipe for what belongs there.
+    #[tokio::test]
+    async fn a_shard_actor_lives_at_its_address() {
+        let system = counters();
+        system
+            .shard_actor_of::<Counter>()
+            .tell(CounterCmd::Inc {
+                id: "c1".into(),
+                by: 1,
+            })
+            .await
+            .unwrap();
+        let path = crate::shard::entity_of("counter", "c1", "c1");
+        assert_eq!(path.to_string(), "/system/shard/counter/c1/c1");
+        assert!(system.inner.resolve::<CounterCmd>(&path).is_some());
+    }
+
+    /// Sending to a type nobody registered is a named error rather than a
+    /// silently spawned actor with no wiring.
+    #[tokio::test]
+    async fn an_unregistered_type_cannot_be_reached() {
         let system = ActorSystem::in_memory();
-        system.register::<Counter>(());
-        let a = system.singleton_of::<Counter>("a").await.unwrap();
-        let b = system.singleton_of::<Counter>("b").await.unwrap();
-        a.tell(CounterCmd::Inc(2)).await.unwrap();
-        b.tell(CounterCmd::Inc(3)).await.unwrap();
-        assert_eq!(current_value(&a).await, 2);
-        assert_eq!(current_value(&b).await, 3);
+        let sent = system
+            .shard_actor_of::<Counter>()
+            .tell(CounterCmd::Inc {
+                id: "c1".into(),
+                by: 1,
+            })
+            .await;
+        assert!(sent.is_err());
     }
 
-    /// Asking for a kind nobody registered is a named error, not a panic and
-    /// not a silently spawned actor with no wiring.
+    /// Two types sharing a `TYPE` would share addresses and each other's
+    /// recipes, so the second registration is refused.
     #[tokio::test]
-    async fn actor_of_reports_an_unregistered_kind() {
-        let system = ActorSystem::in_memory();
-        let err = system.singleton_of::<Counter>("c1").await.unwrap_err();
-        assert!(matches!(err, ActorOfError::NotRegistered("counter")));
-    }
-
-    /// Two types sharing a KIND collide in the registry. The second
-    /// registration wins the slot, so a lookup for the first gets a reference
-    /// of the wrong command type — reported rather than downcast-panicked.
-    #[tokio::test]
-    async fn colliding_kinds_are_reported() {
+    async fn colliding_type_names_are_reported() {
         struct Impostor;
-        #[derive(Serialize, Deserialize)]
-        struct OtherCmd;
-
         #[async_trait]
         impl Actor for Impostor {
-            type Command = OtherCmd;
+            type Command = CounterCmd;
             type ParentCommand = Root;
-            async fn handle(&mut self, _cmd: OtherCmd, _ctx: &mut ActorContext<OtherCmd>) -> Flow {
+            async fn handle(
+                &mut self,
+                _cmd: CounterCmd,
+                _ctx: &mut ActorContext<CounterCmd>,
+            ) -> Flow {
                 Flow::Continue
             }
         }
-
-        impl ClusterActor for Impostor {
-            // Same KIND as Counter — the mistake under test.
-            const KIND: &'static str = "counter";
-            type Command = OtherCmd;
-            type Deps = ();
-
-            // Stateless: no journal anywhere in sight, which is the point —
-            // being registered for cluster hosting says nothing about
-            // persistence.
-            fn spawn(
-                _id: &str,
-                _deps: (),
-                system: &ActorSystem,
-                path: ActorPath,
-            ) -> ActorRef<OtherCmd> {
-                system.spawn_at(path, Impostor)
+        impl Shard for Impostor {
+            type Command = CounterCmd;
+            // The mistake under test.
+            const TYPE: &'static str = "counter";
+            fn entity_id(cmd: &CounterCmd) -> String {
+                cmd.id().to_owned()
+            }
+            fn shard_id(cmd: &CounterCmd) -> String {
+                cmd.id().to_owned()
             }
         }
 
-        let system = ActorSystem::in_memory();
-        system.register::<Counter>(());
-        system.register::<Impostor>(());
-        let err = system.singleton_of::<Counter>("c1").await.unwrap_err();
-        assert!(matches!(err, ActorOfError::KindCollision("counter")));
+        let system = counters();
+        let err = system
+            .shard::<Impostor>()
+            .register(|_sys, _path| Impostor)
+            .unwrap_err();
+        assert!(matches!(err, ActorOfError::TypeCollision("counter")));
     }
 }

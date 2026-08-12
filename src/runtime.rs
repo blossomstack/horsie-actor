@@ -134,20 +134,6 @@ impl<C: Send + 'static> ActorRef<C> {
         &self.path
     }
 
-    /// Whether this path currently reaches a running actor.
-    ///
-    /// Deliberately not part of sending: a caller does not have to check, because
-    /// a send that finds a stale link resolves the path again by itself. This
-    /// exists for the few places that genuinely ask a question about the *world*
-    /// — a test waiting for a node to stand down — rather than about a handle.
-    #[must_use]
-    pub fn is_alive(&self) -> bool {
-        if self.cached().is_some_and(|link| link.is_alive()) {
-            return true;
-        }
-        self.resolve().is_some()
-    }
-
     /// Deliver `cmd` to the actor's mailbox, waiting if the mailbox is full.
     ///
     /// Fails if the path reaches nothing: no actor was ever created there, or the
@@ -330,18 +316,16 @@ impl<C: Send + 'static, PC: Send + 'static> ActorContext<C, PC> {
         crate::Persistent::new(actor, self.journal().clone())
     }
 
-    /// The instance of a registered type `A` under `id`, wherever the cluster
-    /// puts it.
+    /// A reference to the actors of a shard type, from inside an actor.
     ///
-    /// The `(kind, id)` addressing the cluster layer still uses, reached from
-    /// inside an actor. Superseded by paths — a clustered actor becomes an
-    /// ordinary path that happens to resolve to another node — but that is the
-    /// next step, not this one.
-    pub async fn singleton_of<A: crate::ClusterActor>(
-        &self,
-        id: &str,
-    ) -> Result<ActorRef<A::Command>, ActorOfError> {
-        self.system().singleton_of::<A>(id).await
+    /// The same reference [`ActorSystem::shard_actor_of`] hands out, reached
+    /// from where most sends happen: an actor that needs a peer knows what to
+    /// say to it, not where it is.
+    ///
+    /// [`ActorSystem::shard_actor_of`]: crate::ActorSystem::shard_actor_of
+    #[must_use]
+    pub fn shard_actor_of<S: crate::Shard>(&self) -> ActorRef<S::Command> {
+        self.system().shard_actor_of::<S>()
     }
 
     /// Direct journal access for actors that manage persistence themselves
