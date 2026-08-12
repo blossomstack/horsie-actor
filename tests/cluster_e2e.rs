@@ -142,6 +142,7 @@ impl EventSourcedActor for Counter {
 
 impl Shard for Counter {
     type Command = CounterCmd;
+    type EntityId = String;
     const TYPE: &'static str = "counter";
 
     fn entity_id(cmd: &CounterCmd) -> String {
@@ -221,7 +222,7 @@ impl TestCluster {
             let system = ActorSystem::clustered(journal.clone(), node.clone());
             system
                 .shard::<Counter>()
-                .register(|sys, path| sys.persistent(Counter::new(path.name().unwrap_or_default())))
+                .register(|sys, entity| sys.persistent(Counter::new(&entity.entity_id)))
                 .expect("counter should register");
             spawn_dispatch_loop(&system, &node);
             systems.push(system);

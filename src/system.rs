@@ -7,7 +7,9 @@ use crate::journal::{InMemoryJournal, Journal};
 use crate::path::ActorPath;
 use crate::persistent::Persistent;
 use crate::runtime::{ActorRef, Link, check_name, spawn_at};
-use crate::shard::{Shard, address_for, region_of, type_in};
+use crate::shard::{
+    BadEntityId, EntityContext, Shard, address_for, entity_in, region_of, shard_in, type_in,
+};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -101,6 +103,14 @@ pub enum ActorOfError {
     /// addresses and each other's recipes.
     #[error("two shard types are registered as '{0}'")]
     TypeCollision(&'static str),
+
+    /// A registered type claims this address and cannot read the id in it.
+    ///
+    /// Separate from "nothing claims it" because the fix is different: this one
+    /// is a node being handed an id in a shape it does not know, which is what
+    /// a half-finished rollout looks like from the new side.
+    #[error(transparent)]
+    BadEntityId(#[from] BadEntityId),
 
     /// The name could not be one path segment — it was empty, or it contained
     /// the separator, which would make one actor's path ambiguous with another's.
@@ -732,8 +742,11 @@ impl ActorSystem {
         // where an inbound message creates an actor — and it can, because the
         // address names the type and every node registered a recipe for it.
         if type_in(&path).is_some() {
-            self.build_at(&path)
-                .map_err(|_| DispatchError::NoActor(path.clone()))?;
+            // Carried out rather than flattened into "nothing is there": the
+            // address named a type this node knows, so a failure here says
+            // something about the sender — an unreadable id, an unregistered
+            // type — that the receiving side is the only one placed to report.
+            self.build_at(&path)?;
             if let Some(Some(deliver)) = self.inner.deliver_here(&path) {
                 return deliver(env.payload, self.clone()).await;
             }
@@ -768,17 +781,30 @@ impl<S: Shard> ShardOf<'_, S> {
     pub fn register<A, F>(self, recipe: F) -> Result<(), ActorOfError>
     where
         A: Actor<Command = S::Command>,
-        F: Fn(&ActorSystem, &ActorPath) -> A + Send + Sync + 'static,
+        F: Fn(&ActorSystem, &EntityContext<S>) -> A + Send + Sync + 'static,
     {
         let system = self.system;
         system.record_wire::<S::Command>(std::any::type_name::<S>());
 
+        // The one place an address is read back into an identity. Building is
+        // reached from a send, which had the command and so both extractors, and
+        // from an inbound envelope, which had only text; putting the parse here
+        // rather than at either of those means the two cannot come to different
+        // conclusions about who lives at an address.
         let built: Recipe = Arc::new(move |system: &ActorSystem, path: &ActorPath| {
-            let (Some(parent), Some(name)) = (path.parent(), path.name()) else {
+            let entity_id = entity_in::<S>(path)?;
+            let (Some(shard_id), Some(parent), Some(name)) =
+                (shard_in(path), path.parent(), path.name())
+            else {
                 return Err(ActorOfError::Unclaimed(path.clone()));
             };
+            let entity = EntityContext::<S> {
+                entity_id,
+                shard_id: shard_id.to_owned(),
+                path: path.clone(),
+            };
             system
-                .get_or_create(&parent, name, recipe(system, path))
+                .get_or_create(&parent, name, recipe(system, &entity))
                 .map(|_| ())
         });
 
@@ -870,6 +896,7 @@ mod tests {
 
     impl Shard for Counter {
         type Command = CounterCmd;
+        type EntityId = String;
         const TYPE: &'static str = "counter";
 
         fn entity_id(cmd: &CounterCmd) -> String {
@@ -886,11 +913,12 @@ mod tests {
         let system = ActorSystem::in_memory();
         system
             .shard::<Counter>()
-            // The recipe is handed the address, which is where the identity
-            // comes from — `path.name()` is the entity id.
-            .register(|sys, path| {
+            // Identity comes from the context, which is the address already
+            // read back — so the persistence id below cannot drift from the
+            // address the journal will be recovered under.
+            .register(|sys, entity| {
                 sys.persistent(Counter {
-                    id: path.name().unwrap_or_default().to_owned(),
+                    id: entity.entity_id.clone(),
                 })
             })
             .unwrap();
@@ -1007,6 +1035,7 @@ mod tests {
         }
         impl Shard for Impostor {
             type Command = CounterCmd;
+            type EntityId = String;
             // The mistake under test.
             const TYPE: &'static str = "counter";
             fn entity_id(cmd: &CounterCmd) -> String {
@@ -1020,8 +1049,115 @@ mod tests {
         let system = counters();
         let err = system
             .shard::<Impostor>()
-            .register(|_sys, _path| Impostor)
+            .register(|_sys, _entity| Impostor)
             .unwrap_err();
         assert!(matches!(err, ActorOfError::TypeCollision("counter")));
+    }
+
+    /// An account and a session in one id, which is the case a `String` would
+    /// have forced every recipe to take apart for itself.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Tenanted {
+        account: String,
+        session: String,
+    }
+
+    impl std::fmt::Display for Tenanted {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}|{}", self.account, self.session)
+        }
+    }
+
+    impl std::str::FromStr for Tenanted {
+        type Err = ();
+
+        fn from_str(text: &str) -> Result<Self, ()> {
+            let (account, session) = text.split_once('|').ok_or(())?;
+            Ok(Self {
+                account: account.to_owned(),
+                session: session.to_owned(),
+            })
+        }
+    }
+
+    /// Carries nothing: what is under test is what the recipe was told, which
+    /// it records before this is ever built.
+    struct Tenant;
+
+    #[derive(Serialize, Deserialize)]
+    struct Announce(Tenanted);
+
+    #[async_trait]
+    impl Actor for Tenant {
+        type Command = Announce;
+        async fn handle(&mut self, _cmd: Announce, _ctx: &mut ActorContext<Announce>) -> Flow {
+            Flow::Continue
+        }
+    }
+
+    impl Shard for Tenant {
+        type Command = Announce;
+        type EntityId = Tenanted;
+        const TYPE: &'static str = "tenant";
+
+        fn entity_id(cmd: &Announce) -> Tenanted {
+            cmd.0.clone()
+        }
+
+        /// Placed by account, so the id in the address says more than the
+        /// shard does — which is the whole reason it has to be readable.
+        fn shard_id(cmd: &Announce) -> String {
+            cmd.0.account.clone()
+        }
+    }
+
+    /// A recipe is handed the id, parsed, and never sees a segment. What an
+    /// event-sourced actor derives its persistence id from before a byte of its
+    /// history has been read.
+    #[tokio::test]
+    async fn a_recipe_is_given_the_id_the_address_holds() {
+        let seen: Arc<Mutex<Option<Tenanted>>> = Arc::new(Mutex::new(None));
+        let system = ActorSystem::in_memory();
+        let recorded = seen.clone();
+        system
+            .shard::<Tenant>()
+            .register(move |_sys, entity| {
+                *recorded.lock() = Some(entity.entity_id.clone());
+                Tenant
+            })
+            .unwrap();
+
+        let id = Tenanted {
+            account: "acct-7".into(),
+            session: "sess-3".into(),
+        };
+        system
+            .shard_actor_of::<Tenant>()
+            .tell(Announce(id.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(seen.lock().as_ref(), Some(&id));
+    }
+
+    /// An address whose id this type cannot read builds nothing, and says which
+    /// type could not read what. The alternative — an actor under a substituted
+    /// id — is a second writer on somebody else's journal.
+    #[tokio::test]
+    async fn an_unreadable_address_builds_nothing() {
+        let system = ActorSystem::in_memory();
+        system.shard::<Tenant>().register(|_sys, _| Tenant).unwrap();
+
+        // The shard segment reads as an id and the entity segment does not,
+        // which is the mix-up the parse has to be looking at the right segment
+        // to catch.
+        let path = crate::shard::entity_of("tenant", "acct-7|sess-3", "sess-3");
+        let err = system.build_at(&path).unwrap_err();
+
+        assert!(
+            matches!(&err, ActorOfError::BadEntityId(bad) if bad.type_name == "tenant"),
+            "built from an address it cannot read: {err}"
+        );
+        assert_eq!(system.hosted(), 0);
     }
 }

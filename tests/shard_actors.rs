@@ -68,6 +68,7 @@ impl Actor for Session {
 
 impl Shard for Session {
     type Command = SessionCmd;
+    type EntityId = String;
     const TYPE: &'static str = "session";
 
     fn entity_id(cmd: &SessionCmd) -> String {
@@ -105,6 +106,7 @@ impl Actor for Stranger {
 
 impl Shard for Stranger {
     type Command = Knock;
+    type EntityId = String;
     const TYPE: &'static str = "stranger";
     fn entity_id(_cmd: &Knock) -> String {
         "one".to_owned()
@@ -125,8 +127,8 @@ fn one_node() -> ActorSystem {
 fn register(system: &ActorSystem) {
     system
         .shard::<Session>()
-        .register(|_sys, path| Session {
-            address: path.to_string(),
+        .register(|_sys, entity| Session {
+            address: entity.path.to_string(),
         })
         .expect("session should register");
 }
