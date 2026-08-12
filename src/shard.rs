@@ -92,13 +92,6 @@ pub fn type_in(path: &ActorPath) -> Option<&str> {
     }
 }
 
-/// The shard an address belongs to — its placement key — if it is a shard
-/// address.
-#[must_use]
-pub fn shard_in(path: &ActorPath) -> Option<ActorPath> {
-    type_in(path).and(path.parent())
-}
-
 /// Where an actor of type `S` handling `cmd` lives, and which shard it is in.
 pub(crate) fn address_for<S: Shard>(cmd: &S::Command) -> (ActorPath, ActorPath) {
     let shard_id = S::shard_id(cmd);
@@ -117,8 +110,9 @@ mod tests {
         assert_eq!(path.to_string(), "/system/shard/session/17/sess-abc");
         assert_eq!(type_in(&path), Some("session"));
         assert_eq!(
-            shard_in(&path).unwrap().to_string(),
-            "/system/shard/session/17"
+            path.parent().unwrap().to_string(),
+            "/system/shard/session/17",
+            "the entity does not sit under the shard placement is decided over"
         );
     }
 
@@ -128,7 +122,6 @@ mod tests {
     fn an_ordinary_address_is_not_a_shard_address() {
         let path = ActorPath::root().child("acct-7").child("session-3");
         assert_eq!(type_in(&path), None);
-        assert_eq!(shard_in(&path), None);
     }
 
     /// A child of a shard actor is local to it, and is not itself addressed as

@@ -20,6 +20,6 @@ mod types;
 pub use delivery::Dedup;
 pub use network::serve_consensus;
 pub use node::{ClusterConfig, ClusterNode};
-pub use placement::{Assignment, InstanceKey, PlacementCommand, PlacementEffect, PlacementTable};
+pub use placement::PlacementTable;
 pub use store::RaftStore;
 pub use types::{LiveSet, Membership, NodeIdx};

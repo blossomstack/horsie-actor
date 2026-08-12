@@ -58,8 +58,8 @@ mod transport_tcp;
 pub use actor::{CommandEffect, EventSourcedActor};
 pub use behaviour::{Actor, Flow, Root, StartError};
 pub use cluster::{
-    Assignment, ClusterConfig, ClusterNode, Dedup, InstanceKey, LiveSet, Membership, NodeIdx,
-    PlacementCommand, PlacementEffect, PlacementTable, RaftStore, serve_consensus,
+    ClusterConfig, ClusterNode, Dedup, LiveSet, Membership, NodeIdx, PlacementTable, RaftStore,
+    serve_consensus,
 };
 pub use envelope::{Envelope, Message, NodeId, Reply};
 pub use error::{JournalError, TellError};
