@@ -143,6 +143,7 @@ impl EventSourcedActor for Counter {
 impl Shard for Counter {
     type Command = CounterCmd;
     type EntityId = String;
+    type ShardId = String;
     const TYPE: &'static str = "counter";
 
     fn entity_id(cmd: &CounterCmd) -> String {

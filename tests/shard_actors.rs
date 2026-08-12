@@ -69,6 +69,7 @@ impl Actor for Session {
 impl Shard for Session {
     type Command = SessionCmd;
     type EntityId = String;
+    type ShardId = String;
     const TYPE: &'static str = "session";
 
     fn entity_id(cmd: &SessionCmd) -> String {
@@ -107,6 +108,7 @@ impl Actor for Stranger {
 impl Shard for Stranger {
     type Command = Knock;
     type EntityId = String;
+    type ShardId = String;
     const TYPE: &'static str = "stranger";
     fn entity_id(_cmd: &Knock) -> String {
         "one".to_owned()

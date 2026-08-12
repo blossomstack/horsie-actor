@@ -8,7 +8,7 @@ use crate::path::ActorPath;
 use crate::persistent::Persistent;
 use crate::runtime::{ActorRef, Link, check_name, spawn_at};
 use crate::shard::{
-    BadEntityId, EntityContext, Shard, address_for, entity_in, region_of, shard_in, type_in,
+    EntityContext, Shard, UnreadableAddress, address_for, entity_in, region_of, shard_in, type_in,
 };
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -104,13 +104,13 @@ pub enum ActorOfError {
     #[error("two shard types are registered as '{0}'")]
     TypeCollision(&'static str),
 
-    /// A registered type claims this address and cannot read the id in it.
+    /// A registered type claims this address and cannot read an id in it.
     ///
     /// Separate from "nothing claims it" because the fix is different: this one
     /// is a node being handed an id in a shape it does not know, which is what
     /// a half-finished rollout looks like from the new side.
     #[error(transparent)]
-    BadEntityId(#[from] BadEntityId),
+    Unreadable(#[from] UnreadableAddress),
 
     /// The name could not be one path segment — it was empty, or it contained
     /// the separator, which would make one actor's path ambiguous with another's.
@@ -792,16 +792,13 @@ impl<S: Shard> ShardOf<'_, S> {
         // rather than at either of those means the two cannot come to different
         // conclusions about who lives at an address.
         let built: Recipe = Arc::new(move |system: &ActorSystem, path: &ActorPath| {
-            let entity_id = entity_in::<S>(path)?;
-            let (Some(shard_id), Some(parent), Some(name)) =
-                (shard_in(path), path.parent(), path.name())
-            else {
-                return Err(ActorOfError::Unclaimed(path.clone()));
-            };
             let entity = EntityContext::<S> {
-                entity_id,
-                shard_id: shard_id.to_owned(),
+                entity_id: entity_in::<S>(path)?,
+                shard_id: shard_in::<S>(path)?,
                 path: path.clone(),
+            };
+            let (Some(parent), Some(name)) = (path.parent(), path.name()) else {
+                return Err(ActorOfError::Unclaimed(path.clone()));
             };
             system
                 .get_or_create(&parent, name, recipe(system, &entity))
@@ -831,6 +828,7 @@ mod tests {
     use crate::persistence_id::PersistenceId;
     use crate::reply::ReplyTo;
     use crate::runtime::ActorContext;
+    use crate::shard::AddressPart;
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
 
@@ -897,6 +895,7 @@ mod tests {
     impl Shard for Counter {
         type Command = CounterCmd;
         type EntityId = String;
+        type ShardId = String;
         const TYPE: &'static str = "counter";
 
         fn entity_id(cmd: &CounterCmd) -> String {
@@ -1036,6 +1035,7 @@ mod tests {
         impl Shard for Impostor {
             type Command = CounterCmd;
             type EntityId = String;
+            type ShardId = String;
             // The mistake under test.
             const TYPE: &'static str = "counter";
             fn entity_id(cmd: &CounterCmd) -> String {
@@ -1080,12 +1080,34 @@ mod tests {
         }
     }
 
+    /// The placement bucket a hashed policy produces. A `u8` refuses anything
+    /// out of range on the way back in, which is what a segment could not.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    struct Bucket(u8);
+
+    impl std::fmt::Display for Bucket {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::str::FromStr for Bucket {
+        type Err = ();
+
+        fn from_str(text: &str) -> Result<Self, ()> {
+            text.parse().map(Bucket).map_err(|_| ())
+        }
+    }
+
     /// Carries nothing: what is under test is what the recipe was told, which
     /// it records before this is ever built.
     struct Tenant;
 
     #[derive(Serialize, Deserialize)]
-    struct Announce(Tenanted);
+    struct Announce {
+        at: Bucket,
+        id: Tenanted,
+    }
 
     #[async_trait]
     impl Actor for Tenant {
@@ -1098,34 +1120,40 @@ mod tests {
     impl Shard for Tenant {
         type Command = Announce;
         type EntityId = Tenanted;
+        type ShardId = Bucket;
         const TYPE: &'static str = "tenant";
 
         fn entity_id(cmd: &Announce) -> Tenanted {
-            cmd.0.clone()
+            cmd.id.clone()
         }
-
-        /// Placed by account, so the id in the address says more than the
-        /// shard does — which is the whole reason it has to be readable.
-        fn shard_id(cmd: &Announce) -> String {
-            cmd.0.account.clone()
+        fn shard_id(cmd: &Announce) -> Bucket {
+            cmd.at
         }
     }
 
-    /// A recipe is handed the id, parsed, and never sees a segment. What an
-    /// event-sourced actor derives its persistence id from before a byte of its
-    /// history has been read.
-    #[tokio::test]
-    async fn a_recipe_is_given_the_id_the_address_holds() {
-        let seen: Arc<Mutex<Option<Tenanted>>> = Arc::new(Mutex::new(None));
+    /// What the recipe was told, so a test can compare it with what was sent.
+    type Told = Arc<Mutex<Option<(Bucket, Tenanted)>>>;
+
+    fn tenants(told: &Told) -> ActorSystem {
         let system = ActorSystem::in_memory();
-        let recorded = seen.clone();
+        let recorded = told.clone();
         system
             .shard::<Tenant>()
             .register(move |_sys, entity| {
-                *recorded.lock() = Some(entity.entity_id.clone());
+                *recorded.lock() = Some((entity.shard_id, entity.entity_id.clone()));
                 Tenant
             })
             .unwrap();
+        system
+    }
+
+    /// A recipe is handed both ids, parsed, and never sees a segment. The
+    /// entity half is what an event-sourced actor derives its persistence id
+    /// from, before a byte of its history has been read.
+    #[tokio::test]
+    async fn a_recipe_is_given_the_ids_the_address_holds() {
+        let told: Told = Arc::new(Mutex::new(None));
+        let system = tenants(&told);
 
         let id = Tenanted {
             account: "acct-7".into(),
@@ -1133,29 +1161,49 @@ mod tests {
         };
         system
             .shard_actor_of::<Tenant>()
-            .tell(Announce(id.clone()))
+            .tell(Announce {
+                at: Bucket(9),
+                id: id.clone(),
+            })
             .await
             .unwrap();
 
-        assert_eq!(seen.lock().as_ref(), Some(&id));
+        assert_eq!(told.lock().as_ref(), Some(&(Bucket(9), id)));
     }
 
-    /// An address whose id this type cannot read builds nothing, and says which
-    /// type could not read what. The alternative — an actor under a substituted
-    /// id — is a second writer on somebody else's journal.
+    /// An address whose entity this type cannot read builds nothing, and says
+    /// which half it was. The alternative — an actor under a substituted id —
+    /// is a second writer on somebody else's journal.
     #[tokio::test]
-    async fn an_unreadable_address_builds_nothing() {
-        let system = ActorSystem::in_memory();
-        system.shard::<Tenant>().register(|_sys, _| Tenant).unwrap();
+    async fn an_unreadable_entity_builds_nothing() {
+        let told: Told = Arc::new(Mutex::new(None));
+        let system = tenants(&told);
 
-        // The shard segment reads as an id and the entity segment does not,
-        // which is the mix-up the parse has to be looking at the right segment
-        // to catch.
-        let path = crate::shard::entity_of("tenant", "acct-7|sess-3", "sess-3");
+        let path = crate::shard::entity_of("tenant", Bucket(9), "no-account-here");
         let err = system.build_at(&path).unwrap_err();
 
         assert!(
-            matches!(&err, ActorOfError::BadEntityId(bad) if bad.type_name == "tenant"),
+            matches!(&err, ActorOfError::Unreadable(bad)
+                if bad.type_name == "tenant" && bad.part == AddressPart::Entity),
+            "built from an address it cannot read: {err}"
+        );
+        assert_eq!(system.hosted(), 0);
+    }
+
+    /// And an unreadable *shard* is refused just as hard, even though the
+    /// entity beside it reads cleanly — a bucket out of range means this
+    /// address was minted by something that does not agree with us about
+    /// placement.
+    #[tokio::test]
+    async fn an_out_of_range_shard_builds_nothing() {
+        let told: Told = Arc::new(Mutex::new(None));
+        let system = tenants(&told);
+
+        let path = ActorPath::parse("/system/shard/tenant/999/acct-7|sess-3").unwrap();
+        let err = system.build_at(&path).unwrap_err();
+
+        assert!(
+            matches!(&err, ActorOfError::Unreadable(bad) if bad.part == AddressPart::Shard),
             "built from an address it cannot read: {err}"
         );
         assert_eq!(system.hosted(), 0);

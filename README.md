@@ -227,7 +227,7 @@ system.shard::<SessionActor>().register(move |sys, entity| {
 })?;
 ```
 
-The recipe is told which actor it is being asked for, not where: an `EntityContext` carries the entity id already parsed, the shard it was placed by, and the address. So an event-sourced type derives its persistence id from the id itself — which matters, because that id is asked for at construction, before a byte of history has been read, and is how recovery finds the log.
+The recipe is told which actor it is being asked for: an `EntityContext` carries both ids already parsed, and the address. So an event-sourced type derives its persistence id from the id itself — which matters, because that id is asked for at construction, before a byte of history has been read, and is how recovery finds the log.
 
 The recipe never crosses the wire — an actor is live state, holding a pool and open connections, so the node that owns an address has to be able to build what belongs there without help from whoever wanted it. That is why every node registers, rather than one node sending.
 
@@ -241,7 +241,7 @@ system.shard_actor_of::<SessionActor>()
 
 `Shard::entity_id` says which actor a command is for, and `Shard::shard_id` says which shard — and therefore which node. That second function is the whole placement policy: return the entity id for one shard per actor, or something coarser, like an account, to put a group on one machine. Actors live at `/system/shard/<type>/<shard>/<entity>`, and their own children live below them, local.
 
-An entity id is a type of your choosing rather than a string — `Shard::EntityId`, written into the address through `Display` and read back through `FromStr`. An id that carries structure, such as an account alongside a session, therefore stays derivable from the address on a node that was handed nothing else, and no application code takes a path apart. A segment that does not read back is refused by name, so nothing is ever built under a substituted id.
+Both ids are types of your choosing rather than strings — `Shard::EntityId` and `Shard::ShardId`, written into the address through `Display` and read back through `FromStr`. An id that carries structure, such as an account alongside a session, therefore stays derivable from the address on a node that was handed nothing else; a shard that is a hash bucket arrives as a number with a range rather than a segment to be trusted. Either way no application code takes a path apart, and a segment that does not read back is refused by name — saying which half it was — so nothing is ever built under a substituted id.
 
 One reference type throughout: `shard_actor_of` returns an ordinary `ActorRef`, so business logic is written once and hosted either way.
 

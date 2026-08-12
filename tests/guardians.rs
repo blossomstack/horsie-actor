@@ -267,6 +267,7 @@ async fn stopping_a_shard_reference_drains_what_this_node_hosts() {
     impl horsie_actor::Shard for Entity {
         type Command = Ping;
         type EntityId = String;
+        type ShardId = String;
         const TYPE: &'static str = "entity";
         fn entity_id(cmd: &Ping) -> String {
             cmd.0.clone()
