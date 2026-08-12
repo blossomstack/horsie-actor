@@ -544,22 +544,20 @@ impl ActorSystem {
         self.get_or_create(&ActorPath::root(), name, actor)
     }
 
-    /// The top-level event-sourced actor named `name`, creating it from `actor`
-    /// if it is not there. It recovers from its own `persistence_id` before
-    /// accepting commands.
+    /// Adapt an event-sourced actor into an ordinary one, over this system's
+    /// journal.
     ///
-    /// # Errors
-    /// As [`actor_of`](Self::actor_of).
-    pub fn actor_of_persistent<A: EventSourcedActor>(
-        &self,
-        name: &str,
-        actor: A,
-    ) -> Result<ActorRef<A::Command>, ActorOfError> {
-        self.get_or_create(
-            &ActorPath::root(),
-            name,
-            Persistent::new(actor, self.inner.journal.clone()),
-        )
+    /// Event sourcing is a *wrapper*, not a property of being an actor, and this
+    /// is where that shows: adapt it and it is an ordinary actor everywhere
+    /// afterwards. So there is one way to create an actor rather than one per
+    /// kind of actor.
+    ///
+    /// ```ignore
+    /// system.actor_of("c1", system.persistent(Counter::new("c1")))?;
+    /// ```
+    #[must_use]
+    pub fn persistent<A: EventSourcedActor>(&self, actor: A) -> Persistent<A> {
+        Persistent::new(actor, self.inner.journal.clone())
     }
 
     /// Get-or-create the child of `parent` named `name`.
@@ -711,16 +709,6 @@ impl ActorSystem {
     pub fn spawn_at<A: Actor>(&self, path: ActorPath, actor: A) -> ActorRef<A::Command> {
         let link = spawn_at(actor, self.inner.clone(), path.clone());
         self.reference(path, Some(link))
-    }
-
-    /// Start an event-sourced actor at `path` without registering it. It recovers
-    /// from its own `persistence_id` before accepting commands.
-    pub fn spawn_persistent_at<A: EventSourcedActor>(
-        &self,
-        path: ActorPath,
-        actor: A,
-    ) -> ActorRef<A::Command> {
-        self.spawn_at(path, Persistent::new(actor, self.inner.journal.clone()))
     }
 
     /// Register an actor type so instances of it can be reached by id.
@@ -1003,7 +991,7 @@ mod tests {
             system: &ActorSystem,
             path: ActorPath,
         ) -> ActorRef<CounterCmd> {
-            system.spawn_persistent_at(path, Counter { id: id.to_owned() })
+            system.spawn_at(path, system.persistent(Counter { id: id.to_owned() }))
         }
     }
 

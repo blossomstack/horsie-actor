@@ -92,7 +92,7 @@ impl ClusterActor for Counter {
     type Deps = ();
 
     fn spawn(id: &str, _deps: (), system: &ActorSystem, path: ActorPath) -> ActorRef<CounterCmd> {
-        system.spawn_persistent_at(path, Counter { id: id.to_owned() })
+        system.spawn_at(path, system.persistent(Counter { id: id.to_owned() }))
     }
 }
 
@@ -441,9 +441,10 @@ async fn a_displaced_host_stops_writing() {
     let elsewhere = (first_host + 1) % 3;
     // Unregistered, and deliberately: a second incarnation over the same
     // journal, which is what a peer taking the instance over would be.
-    let fresh = cluster.system(elsewhere).spawn_persistent_at(
+    let elsewhere = cluster.system(elsewhere);
+    let fresh = elsewhere.spawn_at(
         ActorPath::root().child("fresh"),
-        Counter { id: id.to_owned() },
+        elsewhere.persistent(Counter { id: id.to_owned() }),
     );
     let value = fresh.ask(CounterCmd::Get).await.unwrap();
     assert_eq!(
@@ -906,9 +907,9 @@ async fn an_actor_spawned_before_the_first_election_survives() {
     assert!(!node.serving());
 
     let system = ActorSystem::clustered(journal, node, SettingsTable::new());
-    let actor = system.spawn_persistent_at(
+    let actor = system.spawn_at(
         ActorPath::root().child("early"),
-        Counter { id: "early".into() },
+        system.persistent(Counter { id: "early".into() }),
     );
     settle().await;
     assert!(
