@@ -210,45 +210,43 @@ fence — so a new backend can be held to it.
 
 ## Clustering
 
-Several nodes can host one actor tree, addressed the same way from any of them:
-`system.singleton_of::<A>(&id)` returns an `ActorRef` whether the instance runs
-here or on another node, and `tell` and `ask` both work across the boundary. A reply
-handle carries the node that asked and a correlation id, so the answer finds its
-way back to a caller still awaiting it.
+An actor tree is **node-local**: a parent and its children are always on the same machine. Clustering happens only at the roots, so supervision stays local, `ctx.parent()` is always a live local link, and "stop everything under here" is a prefix scan over one map rather than a cluster-wide operation.
 
-The requirement that a reply must be encodable sits on `ReplyTo`'s own
-`Serialize` rather than on `ask`. So it applies exactly to handles that really do
-cross a host — `ClusterActor` already requires its command type to round-trip,
-and a command holding a `ReplyTo<R>` only does if `R` does — and never to the
-local-only reply types that make up most of an application.
+A shard type is registered once per node, with that node's own wiring:
 
-**Which addresses are clustered is configuration.** An entry is a pattern over paths — `/*`, `/acct-7/*` — and a set of settings, and an address takes every matching entry merged *per field*, most specific winning. Declaration order decides nothing. `system.settings_at(&path)` answers what applies and which entry set it, because patterns compose invisibly and config that cannot be explained gets worked around rather than fixed.
+```rust
+system.shard::<SessionActor>().register(move |sys, path| {
+    sys.persistent(SessionActor::new(path, pool.clone()))
+})?;
+```
 
-Matched on the address, not the actor's type, because resolution happens before the actor exists: a node asked for `/acct-7/session-3` has to decide whether that path is clustered with nothing at the path to ask. The default is local, so a single-node deployment configures none of this.
+The recipe never crosses the wire — an actor is live state, holding a pool and open connections, so the node that owns an address has to be able to build what belongs there without help from whoever wanted it. That is why every node registers, rather than one node sending.
 
-**An actor lives where its nearest clustered ancestor lives.** Only some addresses are placed by the cluster; the rest are ordinary children that live with their parent. Resolving a path means routing to the host of its deepest clustered prefix and walking the remaining segments there — so clustering stays something you turn on for a few addresses rather than for every actor in the tree.
+Sending needs no address, because the command carries one:
 
-Config *chooses*; it cannot *grant*. A clustered actor's commands must round-trip, and no setting makes them — so `register_clusterable::<A>()` is where that is proved, and creating an actor at a clustered address without it fails there, naming the path and the type.
+```rust
+system.shard_actor_of::<SessionActor>()
+    .ask(|reply| SessionCommand::History { account, session, reply })
+    .await?;
+```
+
+`Shard::entity_id` says which actor a command is for, and `Shard::shard_id` says which shard — and therefore which node. That second function is the whole placement policy: return the entity id for one shard per actor, or something coarser, like an account, to put a group on one machine. Actors live at `/system/shard/<type>/<shard>/<entity>`, and their own children live below them, local.
+
+One reference type throughout: `shard_actor_of` returns an ordinary `ActorRef`, so business logic is written once and hosted either way.
+
+The requirement that a reply must be encodable sits on `ReplyTo`'s own `Serialize` rather than on `ask`. So it applies exactly to handles that really do cross a host — `Shard` already requires its command type to round-trip, and a command holding a `ReplyTo<R>` only does if `R` does — and never to the local-only reply types that make up most of an application.
 
 Three things, kept separate:
 
-- **Membership** — who is in the cluster — is agreed by Raft, so no node can
-  invent its own answer. This is the part that matters: the alternative is a
-  node that drops a peer the moment one send fails, and a node cut off from its
-  peers then concludes it is the whole cluster.
-- **Liveness** — which members are up — is observed by the leader and
-  replicated, so every node places instances over the same set.
-- **The write fence** — the conditional append above — is what makes a wrong
-  answer to either survivable rather than corrupting.
+- **Membership** — who is in the cluster — is agreed by Raft, so no node can invent its own answer. This is the part that matters: the alternative is a node that drops a peer the moment one send fails, and a node cut off from its peers then concludes it is the whole cluster.
+- **Liveness** — which members are up — is observed by the leader and replicated, so every node places actors over the same set.
+- **The write fence** — the conditional append above — is what makes a wrong answer to either survivable rather than corrupting.
 
-A node that cannot see a quorum stops: it refuses to start instances, stops the
-ones it is running, and drops their in-flight work. That bounds how long a
-displaced node keeps answering reads, which the fence cannot do because a read
-never writes.
+Placement itself is rendezvous hashing over the shard id against the live members, computed identically everywhere without anyone being consulted. There is no shard count to choose up front, and losing a node moves only the shards that were on it.
 
-`TcpTransport` carries both actor deliveries and consensus over one
-length-prefixed, authenticated connection. It authenticates the peer; it does
-not encrypt, so run it on a private network or through a TLS tunnel.
+A node that cannot see a quorum stops: it refuses to start actors, stops the ones it is running, and drops their in-flight work. That bounds how long a displaced node keeps answering reads, which the fence cannot do because a read never writes.
+
+`TcpTransport` carries both actor deliveries and consensus over one length-prefixed, authenticated connection. It authenticates the peer; it does not encrypt, so run it on a private network or through a TLS tunnel.
 
 ## License
 

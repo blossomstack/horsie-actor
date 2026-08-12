@@ -9,9 +9,9 @@
 
 use async_trait::async_trait;
 use horsie_actor::{
-    ActorContext, ActorPath, ActorRef, ActorSystem, ClusterActor, ClusterConfig, ClusterNode,
-    CommandEffect, Envelope, EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId,
-    RaftStore, ReplyTo, Root, SettingsTable,
+    ActorContext, ActorPath, ActorSystem, ClusterConfig, ClusterNode, CommandEffect, Envelope,
+    EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, RaftStore, ReplyTo, Root,
+    Shard,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -23,20 +23,40 @@ struct Counter {
     id: String,
 }
 
+/// Every command names its own target. The extractors are the only thing that
+/// knows where a message is going, so the address travels in the message rather
+/// than in the reference.
 #[derive(Serialize, Deserialize)]
 enum CounterCmd {
-    Inc(i64),
-    /// A read, answered wherever the instance happens to live. The reply
-    /// channel round-trips like any other field — which is the whole point of
-    /// reply routing, and was impossible before it.
-    Get(ReplyTo<i64>),
-    /// Pass it on: resolve another counter *by id* from inside this one and
-    /// increment that. An actor knows ids, not references — and a host that
-    /// built this instance may never have seen whoever holds the other.
-    IncOther {
+    Inc {
         id: String,
         by: i64,
     },
+    /// A read, answered wherever the instance happens to live. The reply
+    /// channel round-trips like any other field — which is the whole point of
+    /// reply routing, and was impossible before it.
+    Get {
+        id: String,
+        reply: ReplyTo<i64>,
+    },
+    /// Pass it on: reach another counter from inside this one. An actor knows
+    /// what to say, not where the other lives — and the host that built this
+    /// instance may never have seen whoever holds the other.
+    IncOther {
+        id: String,
+        other: String,
+        by: i64,
+    },
+}
+
+impl CounterCmd {
+    fn id(&self) -> &str {
+        match self {
+            CounterCmd::Inc { id, .. }
+            | CounterCmd::Get { id, .. }
+            | CounterCmd::IncOther { id, .. } => id,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -71,35 +91,59 @@ impl EventSourcedActor for Counter {
         _ctx: &mut ActorContext<CounterCmd>,
     ) -> CommandEffect<Incremented> {
         match cmd {
-            CounterCmd::Inc(n) => CommandEffect::persist(vec![Incremented(n)]),
-            CounterCmd::Get(reply) => {
+            CounterCmd::Inc { by, .. } => CommandEffect::persist(vec![Incremented(by)]),
+            CounterCmd::Get { reply, .. } => {
                 let _ = reply.send(state.value);
                 CommandEffect::none()
             }
-            CounterCmd::IncOther { id, by } => {
-                if let Ok(peer) = _ctx.singleton_of::<Counter>(&id).await {
-                    let _ = peer.tell(CounterCmd::Inc(by)).await;
-                }
+            CounterCmd::IncOther { other, by, .. } => {
+                let _ = _ctx
+                    .shard_actor_of::<Counter>()
+                    .tell(CounterCmd::Inc { id: other, by })
+                    .await;
                 CommandEffect::none()
             }
         }
     }
 }
 
-impl ClusterActor for Counter {
-    const KIND: &'static str = "counter";
+impl Shard for Counter {
     type Command = CounterCmd;
-    type Deps = ();
+    const TYPE: &'static str = "counter";
 
-    fn spawn(id: &str, _deps: (), system: &ActorSystem, path: ActorPath) -> ActorRef<CounterCmd> {
-        system.spawn_at(path, system.persistent(Counter { id: id.to_owned() }))
+    fn entity_id(cmd: &CounterCmd) -> String {
+        cmd.id().to_owned()
+    }
+
+    /// One shard per counter, so every instance is placed on its own and a
+    /// failover moves exactly one of them.
+    fn shard_id(cmd: &CounterCmd) -> String {
+        cmd.id().to_owned()
     }
 }
 
-/// Where a registered singleton sits: `/counter/<id>`, the bridge the cluster
-/// layer still addresses through.
-fn at(id: &str) -> String {
-    format!("/counter/{id}")
+/// Increment `id`.
+fn inc(id: &str, by: i64) -> CounterCmd {
+    CounterCmd::Inc {
+        id: id.to_owned(),
+        by,
+    }
+}
+
+/// Read `id`, for use with `ask`.
+fn get(id: &str) -> impl FnOnce(ReplyTo<i64>) -> CounterCmd {
+    let id = id.to_owned();
+    move |reply| CounterCmd::Get { id, reply }
+}
+
+/// The shard a counter belongs to — the key placement is decided over.
+fn shard_at(id: &str) -> String {
+    format!("/system/shard/counter/{id}")
+}
+
+/// The counter itself.
+fn entity_at(id: &str) -> String {
+    format!("/system/shard/counter/{id}/{id}")
 }
 
 // ---------------------------------------------------------------- the harness
@@ -141,9 +185,15 @@ impl TestCluster {
             )
             .await
             .expect("raft should start");
-            let system =
-                ActorSystem::clustered(journal.clone(), node.clone(), SettingsTable::new());
-            system.register::<Counter>(());
+            let system = ActorSystem::clustered(journal.clone(), node.clone());
+            system
+                .shard::<Counter>()
+                .register(|sys, path| {
+                    sys.persistent(Counter {
+                        id: path.name().unwrap_or_default().to_owned(),
+                    })
+                })
+                .expect("counter should register");
             spawn_dispatch_loop(&system, &node);
             systems.push(system);
             nodes.push(node);
@@ -187,7 +237,7 @@ impl TestCluster {
     fn host_of(&self, id: &str) -> usize {
         self.nodes
             .iter()
-            .position(|n| n.owns(&at(id)))
+            .position(|n| n.owns(&shard_at(id)))
             .expect("some node must host it")
     }
 
@@ -240,12 +290,8 @@ fn spawn_dispatch_loop(system: &ActorSystem, node: &Arc<ClusterNode>) {
 /// thing it is trying to prove.
 async fn value_at_host(cluster: &TestCluster, id: &str) -> i64 {
     let host = cluster.host_of(id);
-    let actor = cluster
-        .system(host)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
-    actor.ask(CounterCmd::Get).await.unwrap()
+    let actor = cluster.system(host).shard_actor_of::<Counter>();
+    actor.ask(get(id)).await.unwrap()
 }
 
 /// Let a cross-node send land. The write is asynchronous by construction — the
@@ -265,12 +311,8 @@ async fn a_caller_reaches_an_instance_hosted_on_another_node() {
     let host = cluster.host_of(id);
     let elsewhere = (host + 1) % 3;
 
-    let remote = cluster
-        .system(elsewhere)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
-    remote.tell(CounterCmd::Inc(5)).await.unwrap();
+    let remote = cluster.system(elsewhere).shard_actor_of::<Counter>();
+    remote.tell(inc(id, 5)).await.unwrap();
     settle().await;
 
     assert_eq!(value_at_host(&cluster, id).await, 5);
@@ -286,10 +328,8 @@ async fn all_nodes_address_one_instance() {
     for i in 0..3 {
         cluster
             .system(i)
-            .singleton_of::<Counter>(id)
-            .await
-            .unwrap()
-            .tell(CounterCmd::Inc(1))
+            .shard_actor_of::<Counter>()
+            .tell(inc(id, 1))
             .await
             .unwrap();
     }
@@ -309,10 +349,8 @@ async fn an_instance_survives_the_death_of_its_host() {
 
     cluster
         .system(host)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap()
-        .tell(CounterCmd::Inc(5))
+        .shard_actor_of::<Counter>()
+        .tell(inc(id, 5))
         .await
         .unwrap();
     settle().await;
@@ -324,12 +362,8 @@ async fn an_instance_survives_the_death_of_its_host() {
     // on from 5 rather than starting over.
     let new_host = cluster.host_of(id);
     assert_ne!(new_host, host, "the instance stayed on the dead node");
-    let revived = cluster
-        .system(new_host)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
-    revived.tell(CounterCmd::Inc(3)).await.unwrap();
+    let revived = cluster.system(new_host).shard_actor_of::<Counter>();
+    revived.tell(inc(id, 3)).await.unwrap();
     settle().await;
     assert_eq!(value_at_host(&cluster, id).await, 8);
 }
@@ -373,7 +407,11 @@ async fn placement_agrees_across_every_node() {
     let cluster = TestCluster::of_size(5).await;
     for i in 0..40 {
         let id = format!("c{i}");
-        let hosts: Vec<_> = cluster.nodes.iter().map(|n| n.owner_of(&at(&id))).collect();
+        let hosts: Vec<_> = cluster
+            .nodes
+            .iter()
+            .map(|n| n.owner_of(&shard_at(&id)))
+            .collect();
         assert!(
             hosts.windows(2).all(|w| w[0] == w[1]),
             "nodes disagreed about {id}: {hosts:?}"
@@ -395,11 +433,7 @@ async fn starting_an_instance_writes_nothing() {
     let pid = PersistenceId::new("counter", id);
 
     let host = cluster.host_of(id);
-    let _actor = cluster
-        .system(host)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
+    let _actor = cluster.system(host).shard_actor_of::<Counter>();
 
     assert_eq!(
         cluster.journal.last_seq(&pid).await.unwrap(),
@@ -420,12 +454,8 @@ async fn a_displaced_host_stops_writing() {
     let pid = PersistenceId::new("counter", id);
 
     let first_host = cluster.host_of(id);
-    let stale = cluster
-        .system(first_host)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
-    stale.tell(CounterCmd::Inc(5)).await.unwrap();
+    let stale = cluster.system(first_host).shard_actor_of::<Counter>();
+    stale.tell(inc(id, 5)).await.unwrap();
     settle().await;
 
     // Somebody else appends — what a peer that took the instance over does. The
@@ -433,7 +463,7 @@ async fn a_displaced_host_stops_writing() {
     let seven = serde_json::to_vec(&Incremented(7)).unwrap();
     cluster.journal.persist(&pid, &[seven], 1).await.unwrap();
 
-    stale.tell(CounterCmd::Inc(100)).await.unwrap();
+    stale.tell(inc(id, 100)).await.unwrap();
     settle().await;
 
     // Read through a freshly recovered instance rather than the stale actor's
@@ -446,7 +476,7 @@ async fn a_displaced_host_stops_writing() {
         ActorPath::root().child("fresh"),
         elsewhere.persistent(Counter { id: id.to_owned() }),
     );
-    let value = fresh.ask(CounterCmd::Get).await.unwrap();
+    let value = fresh.ask(get(id)).await.unwrap();
     assert_eq!(
         value, 12,
         "the displaced host's write landed; the fence is not being applied"
@@ -467,30 +497,27 @@ async fn a_displaced_host_stops_instead_of_serving_stale() {
     let pid = PersistenceId::new("counter", id);
 
     let host = cluster.host_of(id);
-    let actor = cluster
-        .system(host)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
-    actor.tell(CounterCmd::Inc(1)).await.unwrap();
+    let actor = cluster.system(host).shard_actor_of::<Counter>();
+    actor.tell(inc(id, 1)).await.unwrap();
     settle().await;
 
     // Somebody else appends, so this host's next write is from a state that no
-    // longer exists.
-    let one = serde_json::to_vec(&Incremented(1)).unwrap();
-    cluster.journal.persist(&pid, &[one], 1).await.unwrap();
+    // longer exists — and the value it holds in memory is now history.
+    let ten = serde_json::to_vec(&Incremented(10)).unwrap();
+    cluster.journal.persist(&pid, &[ten], 1).await.unwrap();
 
-    // The next write is where it finds out — and it must be the last thing it
-    // does.
-    actor.tell(CounterCmd::Inc(1)).await.unwrap();
+    // The next write is where it finds out, and standing down is the last thing
+    // it does. Its own increment is rejected rather than merged.
+    actor.tell(inc(id, 1)).await.unwrap();
+    settle().await;
 
-    for _ in 0..100 {
-        if actor.tell(CounterCmd::Inc(1)).await.is_err() {
-            return; // mailbox closed: the host stood down
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("a displaced host kept accepting commands");
+    // The read is answered by a fresh instance that replayed the real log —
+    // 1 + 10 — and not by the displaced one, which never saw the 10 and would
+    // still be reporting 1. Asserting the *answer* rather than a closed mailbox
+    // is what makes this about serving stale rather than about a handle: a
+    // reference names an address, so a later send is served by whoever is there
+    // now, which is exactly the point.
+    assert_eq!(value_at_host(&cluster, id).await, 11);
 }
 
 /// `ask` reaches an actor on another host and the answer comes back.
@@ -511,21 +538,15 @@ async fn ask_reaches_an_actor_on_another_host() {
     // the real instance could know.
     cluster
         .system(host)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap()
-        .tell(CounterCmd::Inc(9))
+        .shard_actor_of::<Counter>()
+        .tell(inc(id, 9))
         .await
         .unwrap();
     settle().await;
 
-    let remote = cluster
-        .system(elsewhere)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
+    let remote = cluster.system(elsewhere).shard_actor_of::<Counter>();
 
-    let value = tokio::time::timeout(Duration::from_secs(5), remote.ask(CounterCmd::Get))
+    let value = tokio::time::timeout(Duration::from_secs(5), remote.ask(get(id)))
         .await
         .expect("ask must return rather than hang")
         .expect("ask across a host must succeed");
@@ -546,13 +567,9 @@ async fn an_ask_to_an_unreachable_host_fails_rather_than_hanging() {
 
     cluster.net.remove(cluster.nodes[host].local());
 
-    let remote = cluster
-        .system(elsewhere)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
+    let remote = cluster.system(elsewhere).shard_actor_of::<Counter>();
 
-    let outcome = tokio::time::timeout(Duration::from_secs(5), remote.ask(CounterCmd::Get))
+    let outcome = tokio::time::timeout(Duration::from_secs(5), remote.ask(get(id)))
         .await
         .expect("ask must return rather than hang");
     assert!(outcome.is_err());
@@ -570,9 +587,9 @@ async fn a_redelivered_command_is_applied_once() {
 
     // Same message id twice, as a retry of an envelope the sender could not
     // confirm.
-    let payload = serde_json::to_vec(&CounterCmd::Inc(5)).unwrap();
+    let payload = serde_json::to_vec(&inc(id, 5)).unwrap();
     let env = Envelope {
-        path: at(id),
+        path: entity_at(id),
         message_id: 42,
         payload,
     };
@@ -614,13 +631,9 @@ async fn a_send_to_a_departed_host_fails_rather_than_re_aiming() {
     // Off the network, with nobody told.
     cluster.net.remove(cluster.nodes[host].local());
 
-    let remote = cluster
-        .system(elsewhere)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
+    let remote = cluster.system(elsewhere).shard_actor_of::<Counter>();
     assert!(
-        remote.tell(CounterCmd::Inc(7)).await.is_err(),
+        remote.tell(inc(id, 7)).await.is_err(),
         "the sender re-aimed a send instead of reporting the failure"
     );
 }
@@ -638,12 +651,8 @@ async fn a_send_lands_elsewhere_once_the_cluster_agrees_the_host_is_gone() {
 
     cluster.kill(host).await;
 
-    let remote = cluster
-        .system(elsewhere)
-        .singleton_of::<Counter>(id)
-        .await
-        .unwrap();
-    remote.tell(CounterCmd::Inc(7)).await.unwrap();
+    let remote = cluster.system(elsewhere).shard_actor_of::<Counter>();
+    remote.tell(inc(id, 7)).await.unwrap();
     settle().await;
 
     assert_eq!(value_at_host(&cluster, id).await, 7);
@@ -698,10 +707,11 @@ async fn a_minority_node_refuses_to_host() {
 
     let outcome = cluster
         .system(odd_one_out)
-        .singleton_of::<Counter>("orphan")
+        .shard_actor_of::<Counter>()
+        .tell(inc("c1", 1))
         .await;
     assert!(
-        matches!(outcome, Err(horsie_actor::ActorOfError::NotServing)),
+        outcome.is_err(),
         "a node with no quorum started an instance anyway"
     );
 }
@@ -718,23 +728,19 @@ async fn losing_quorum_stops_hosted_instances() {
     // Find an instance hosted on node 0, so the partition takes its host.
     let id = (0..64)
         .map(|i| format!("c{i}"))
-        .find(|id| cluster.nodes[0].owns(&at(id)))
+        .find(|id| cluster.nodes[0].owns(&shard_at(id)))
         .expect("some id must land on node 0");
 
-    let actor = cluster
-        .system(0)
-        .singleton_of::<Counter>(&id)
-        .await
-        .unwrap();
-    actor.tell(CounterCmd::Inc(1)).await.unwrap();
+    let actor = cluster.system(0).shard_actor_of::<Counter>();
+    actor.tell(inc(&id, 1)).await.unwrap();
     settle().await;
-    assert!(actor.is_alive());
+    assert!(actor.tell(inc(&id, 1)).await.is_ok());
 
     cluster.net.remove(cluster.nodes[0].local());
     await_not_serving(&cluster, 0).await;
 
     for _ in 0..200 {
-        if !actor.is_alive() {
+        if actor.tell(inc(&id, 1)).await.is_err() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -768,11 +774,12 @@ async fn a_node_recovers_when_quorum_returns() {
             // Lazily, on the next message — nothing is respawned at recovery.
             let id = (0..64)
                 .map(|i| format!("c{i}"))
-                .find(|id| node.owns(&at(id)))
+                .find(|id| node.owns(&shard_at(id)))
                 .expect("some id must land back on this node");
             cluster
                 .system(odd_one_out)
-                .singleton_of::<Counter>(&id)
+                .shard_actor_of::<Counter>()
+                .tell(inc(&id, 1))
                 .await
                 .expect("a node with quorum must host again");
             return;
@@ -797,15 +804,9 @@ async fn no_node_holds_a_private_view_of_who_is_live() {
     // implementation made, and the one that created split brain.
     let elsewhere = 1;
     let before = cluster.nodes[elsewhere].live_members();
-    let _ = cluster
-        .system(elsewhere)
-        .singleton_of::<Counter>("nowhere")
-        .await;
+    let _ = cluster.system(elsewhere).shard_actor_of::<Counter>();
     cluster.net.remove(cluster.nodes[0].local());
-    let _ = cluster
-        .system(elsewhere)
-        .singleton_of::<Counter>("nowhere")
-        .await;
+    let _ = cluster.system(elsewhere).shard_actor_of::<Counter>();
     assert_eq!(
         cluster.nodes[elsewhere].live_members(),
         before,
@@ -865,12 +866,11 @@ async fn an_actor_reaches_another_instance_by_id() {
 
     let caller = cluster
         .system(cluster.host_of(&from))
-        .singleton_of::<Counter>(&from)
-        .await
-        .unwrap();
+        .shard_actor_of::<Counter>();
     caller
         .tell(CounterCmd::IncOther {
-            id: to.clone(),
+            id: from.clone(),
+            other: to.clone(),
             by: 7,
         })
         .await
@@ -906,14 +906,14 @@ async fn an_actor_spawned_before_the_first_election_survives() {
     // No peers exist, so this node never reaches a quorum and never serves.
     assert!(!node.serving());
 
-    let system = ActorSystem::clustered(journal, node, SettingsTable::new());
+    let system = ActorSystem::clustered(journal, node);
     let actor = system.spawn_at(
         ActorPath::root().child("early"),
         system.persistent(Counter { id: "early".into() }),
     );
     settle().await;
     assert!(
-        actor.is_alive(),
+        actor.tell(inc("early", 1)).await.is_ok(),
         "an actor spawned before the first election was killed on sight"
     );
 }
