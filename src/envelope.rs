@@ -42,14 +42,19 @@ pub enum Message {
     Reply(Reply),
 }
 
-/// One addressed message between nodes.
+/// One command in flight between nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
-    /// Who it is for, as an [`ActorPath`] in its display form. Text because an
-    /// envelope is a wire type, and every reader parses it straight back.
+    /// Which shard type this is for — [`Shard::TYPE`].
     ///
-    /// [`ActorPath`]: crate::ActorPath
-    pub path: String,
+    /// The whole of the addressing, and deliberately so. Which actor and which
+    /// shard are in the payload, where the extractors put them, and the
+    /// receiver takes them from there once it has decoded. Repeating either one
+    /// out here would be a second copy that routing must never trust, and a
+    /// rule like that erodes.
+    ///
+    /// [`Shard::TYPE`]: crate::Shard::TYPE
+    pub type_name: String,
     /// Deduplication key. The receiver remembers these, so a redelivery after a
     /// retry is dropped rather than applied a second time — which is what turns
     /// at-least-once delivery into effectively-once processing.

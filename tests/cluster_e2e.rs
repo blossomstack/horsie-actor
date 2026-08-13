@@ -142,6 +142,8 @@ impl EventSourcedActor for Counter {
 
 impl Shard for Counter {
     type Command = CounterCmd;
+    type EntityId = String;
+    type ShardId = String;
     const TYPE: &'static str = "counter";
 
     fn entity_id(cmd: &CounterCmd) -> String {
@@ -169,15 +171,10 @@ fn get(id: &str) -> impl FnOnce(ReplyTo<i64>) -> CounterCmd {
     move |reply| CounterCmd::Get { id, reply }
 }
 
-/// The shard a counter belongs to — the key placement is decided over.
-fn shard_at(id: &str) -> String {
-    format!("/system/shard/counter/{id}")
-}
-
-/// The counter itself.
-fn entity_at(id: &str) -> String {
-    format!("/system/shard/counter/{id}/{id}")
-}
+/// Every counter is its own shard, so the shard id is the counter id — see
+/// `Counter::shard_id`. Placement is decided over the pair below, never over an
+/// address.
+const TYPE: &str = "counter";
 
 // ---------------------------------------------------------------- the harness
 
@@ -221,7 +218,7 @@ impl TestCluster {
             let system = ActorSystem::clustered(journal.clone(), node.clone());
             system
                 .shard::<Counter>()
-                .register(|sys, path| sys.persistent(Counter::new(path.name().unwrap_or_default())))
+                .register(|sys, entity| sys.persistent(Counter::new(&entity.entity_id)))
                 .expect("counter should register");
             spawn_dispatch_loop(&system, &node);
             systems.push(system);
@@ -266,7 +263,7 @@ impl TestCluster {
     fn host_of(&self, id: &str) -> usize {
         self.nodes
             .iter()
-            .position(|n| n.owns(&shard_at(id)))
+            .position(|n| n.owns(TYPE, id))
             .expect("some node must host it")
     }
 
@@ -439,7 +436,7 @@ async fn placement_agrees_across_every_node() {
         let hosts: Vec<_> = cluster
             .nodes
             .iter()
-            .map(|n| n.owner_of(&shard_at(&id)))
+            .map(|n| n.owner_of(TYPE, &id))
             .collect();
         assert!(
             hosts.windows(2).all(|w| w[0] == w[1]),
@@ -736,7 +733,7 @@ async fn a_redelivered_command_is_applied_once() {
     // confirm.
     let payload = serde_json::to_vec(&inc(id, 5)).unwrap();
     let env = Envelope {
-        path: entity_at(id),
+        type_name: TYPE.to_owned(),
         message_id: 42,
         payload,
     };
@@ -875,7 +872,7 @@ async fn losing_quorum_stops_hosted_instances() {
     // Find an instance hosted on node 0, so the partition takes its host.
     let id = (0..64)
         .map(|i| format!("c{i}"))
-        .find(|id| cluster.nodes[0].owns(&shard_at(id)))
+        .find(|id| cluster.nodes[0].owns(TYPE, id))
         .expect("some id must land on node 0");
 
     let actor = cluster.system(0).shard_actor_of::<Counter>();
@@ -921,7 +918,7 @@ async fn a_node_recovers_when_quorum_returns() {
             // Lazily, on the next message — nothing is respawned at recovery.
             let id = (0..64)
                 .map(|i| format!("c{i}"))
-                .find(|id| node.owns(&shard_at(id)))
+                .find(|id| node.owns(TYPE, id))
                 .expect("some id must land back on this node");
             cluster
                 .system(odd_one_out)

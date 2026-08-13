@@ -266,6 +266,8 @@ async fn stopping_a_shard_reference_drains_what_this_node_hosts() {
     struct Ping(String);
     impl horsie_actor::Shard for Entity {
         type Command = Ping;
+        type EntityId = String;
+        type ShardId = String;
         const TYPE: &'static str = "entity";
         fn entity_id(cmd: &Ping) -> String {
             cmd.0.clone()
@@ -278,7 +280,7 @@ async fn stopping_a_shard_reference_drains_what_this_node_hosts() {
     let system = ActorSystem::in_memory();
     system
         .shard::<Entity>()
-        .register(|_sys, _path| Entity)
+        .register(|_sys, _entity| Entity)
         .unwrap();
     let entities = system.shard_actor_of::<Entity>();
     entities.tell(Ping("a".into())).await.unwrap();

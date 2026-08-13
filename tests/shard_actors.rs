@@ -24,11 +24,12 @@ use std::time::Duration;
 
 /// A session, sharded by the account it belongs to — so every session of one
 /// account is placed together, without any of them being a child of anything.
-struct Session {
-    /// Where it was built. Answering with this is how a test tells one instance
-    /// from another, and one *address* from another.
-    address: String,
-}
+///
+/// Carries nothing. It answers with its own address, which it reads from its
+/// context rather than being handed at construction: that is the address it is
+/// really filed under, so a test comparing two of them is comparing where the
+/// framework actually put them.
+struct Session;
 
 #[derive(Serialize, Deserialize)]
 enum SessionCmd {
@@ -56,10 +57,10 @@ impl SessionCmd {
 impl Actor for Session {
     type Command = SessionCmd;
 
-    async fn handle(&mut self, cmd: SessionCmd, _ctx: &mut ActorContext<SessionCmd>) -> Flow {
+    async fn handle(&mut self, cmd: SessionCmd, ctx: &mut ActorContext<SessionCmd>) -> Flow {
         match cmd {
             SessionCmd::Which { reply, .. } => {
-                let _ = reply.send(self.address.clone());
+                let _ = reply.send(ctx.path().to_string());
                 Flow::Continue
             }
         }
@@ -68,6 +69,8 @@ impl Actor for Session {
 
 impl Shard for Session {
     type Command = SessionCmd;
+    type EntityId = String;
+    type ShardId = String;
     const TYPE: &'static str = "session";
 
     fn entity_id(cmd: &SessionCmd) -> String {
@@ -105,6 +108,8 @@ impl Actor for Stranger {
 
 impl Shard for Stranger {
     type Command = Knock;
+    type EntityId = String;
+    type ShardId = String;
     const TYPE: &'static str = "stranger";
     fn entity_id(_cmd: &Knock) -> String {
         "one".to_owned()
@@ -125,9 +130,7 @@ fn one_node() -> ActorSystem {
 fn register(system: &ActorSystem) {
     system
         .shard::<Session>()
-        .register(|_sys, path| Session {
-            address: path.to_string(),
-        })
+        .register(|_sys, _entity| Session)
         .expect("session should register");
 }
 
@@ -249,13 +252,10 @@ impl Cluster {
     /// the network keeps its own opinion for a moment, and asking it is asking
     /// somebody who has not heard the news.
     async fn host_of(&self, account: &str, excluding: &[usize]) -> usize {
-        let shard = format!("/system/shard/session/{account}");
         for _ in 0..200 {
-            let found = self
-                .nodes
-                .iter()
-                .enumerate()
-                .position(|(i, n)| !excluding.contains(&i) && n.serving() && n.owns(&shard));
+            let found = self.nodes.iter().enumerate().position(|(i, n)| {
+                !excluding.contains(&i) && n.serving() && n.owns("session", account)
+            });
             if let Some(index) = found {
                 return index;
             }
@@ -356,10 +356,7 @@ async fn one_shard_id_places_actors_together() {
     // A different account is a different shard, and placed on its own.
     let other = (0..64)
         .map(|i| format!("acct-{i}"))
-        .find(|account| {
-            let shard = format!("/system/shard/session/{account}");
-            !cluster.nodes[host].owns(&shard)
-        })
+        .find(|account| !cluster.nodes[host].owns("session", account))
         .expect("some account must land elsewhere");
     assert_ne!(cluster.host_of(&other, &[]).await, host);
 }

@@ -428,7 +428,7 @@ mod tests {
 
     fn env(payload: &[u8]) -> Message {
         Message::Command(Envelope {
-            path: "/counter/c1".into(),
+            type_name: "counter".into(),
             message_id: 1,
             payload: payload.to_vec(),
         })
@@ -478,7 +478,7 @@ mod tests {
 
         let got = delivered(inbox.recv().await.unwrap());
         assert_eq!(got.payload, b"hello");
-        assert_eq!(got.path, "/counter/c1");
+        assert_eq!(got.type_name, "counter");
     }
 
     /// The connection is cached, so a second envelope does not redial — and

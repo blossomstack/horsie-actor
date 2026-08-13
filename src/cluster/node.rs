@@ -235,20 +235,20 @@ impl ClusterNode {
         &self.raft
     }
 
-    /// Which node should host the actor at `path`.
+    /// Which node should host one shard of one type.
     ///
     /// Hashed over the agreed live set, so every node answers this identically
     /// without asking anyone. `None` when no member is live — including this
     /// one, which is the state a stood-down node is in.
     #[must_use]
-    pub fn owner_of(&self, path: &str) -> Option<NodeId> {
-        self.table.lock().owner_of(path)
+    pub fn owner_of(&self, type_name: &str, shard_id: &str) -> Option<NodeId> {
+        self.table.lock().owner_of(type_name, shard_id)
     }
 
-    /// Whether this node should host the actor at `path`.
+    /// Whether this node should host that shard.
     #[must_use]
-    pub fn owns(&self, path: &str) -> bool {
-        self.serving() && self.owner_of(path) == Some(self.local)
+    pub fn owns(&self, type_name: &str, shard_id: &str) -> bool {
+        self.serving() && self.owner_of(type_name, shard_id) == Some(self.local)
     }
 
     /// The nodes placement is currently using.
@@ -271,12 +271,11 @@ impl ClusterNode {
         self.table.lock().set_members(live.iter().copied());
     }
 
-    /// Send an already-encoded command to whichever node hosts `route`.
+    /// Send an already-encoded command to whichever node hosts its shard.
     ///
-    /// `route` is the shard the target belongs to, which is what placement
-    /// decides over, and `address` is the actor itself. They differ because many
-    /// entities share one shard, so the envelope has to carry the full path for
-    /// the receiving node to know which of them it is for.
+    /// Takes the shard's two ids and nothing about the actor: placement decides
+    /// over a shard, and which of the entities in it this command is for is
+    /// already in `payload`, which the receiving node decodes anyway.
     ///
     /// Retries, because a caller cannot usefully do it: each attempt re-resolves
     /// the owner, so a send racing a failover lands on the new host rather than
@@ -284,20 +283,20 @@ impl ClusterNode {
     /// promise — an undeliverable command is dropped and its caller told.
     pub async fn send(
         &self,
-        route: &str,
-        address: &str,
+        type_name: &str,
+        shard_id: &str,
         payload: Vec<u8>,
         message_id: u128,
     ) -> Result<(), TransportError> {
         let mut last = None;
         for attempt in 0..SEND_ATTEMPTS {
-            let Some(owner) = self.owner_of(route) else {
+            let Some(owner) = self.owner_of(type_name, shard_id) else {
                 return Err(TransportError::Io(format!(
-                    "no live member can host {route}"
+                    "no live member can host {type_name}/{shard_id}"
                 )));
             };
             let env = Envelope {
-                path: address.to_owned(),
+                type_name: type_name.to_owned(),
                 message_id,
                 payload: payload.clone(),
             };
@@ -312,7 +311,9 @@ impl ClusterNode {
                 }
             }
         }
-        Err(last.unwrap_or_else(|| TransportError::Io(format!("gave up delivering to {address}"))))
+        Err(last.unwrap_or_else(|| {
+            TransportError::Io(format!("gave up delivering to {type_name}/{shard_id}"))
+        }))
     }
 
     /// The stream of messages arriving here, taken once.
