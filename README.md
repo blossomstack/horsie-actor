@@ -227,9 +227,9 @@ system.shard::<SessionActor>().register(move |sys, entity| {
 })?;
 ```
 
-The recipe is told which actor it is being asked for: an `EntityContext` carries both ids as the extractors returned them, and the address they put it at. So an event-sourced type derives its persistence id from the id itself — which matters, because that id is asked for at construction, before a byte of history has been read, and is how recovery finds the log.
+The recipe is told which actor it is being asked for: an `EntityContext` carries the shard type and both ids, exactly as the extractors returned them. So an event-sourced type derives its persistence id from the id itself — which matters, because that id is asked for at construction, before a byte of history has been read, and is how recovery finds the log.
 
-The recipe never crosses the wire — an actor is live state, holding a pool and open connections, so the node that owns an address has to be able to build what belongs there without help from whoever wanted it. That is why every node registers, rather than one node sending.
+The recipe never crosses the wire — an actor is live state, holding a pool and open connections, so the node that owns a shard has to be able to build what belongs there without help from whoever wanted it. That is why every node registers, rather than one node sending.
 
 Sending needs no address, because the command carries one:
 
@@ -241,7 +241,11 @@ system.shard_actor_of::<SessionActor>()
 
 `Shard::entity_id` says which actor a command is for, and `Shard::shard_id` says which shard — and therefore which node. That second function is the whole placement policy: return the entity id for one shard per actor, or something coarser, like an account, to put a group on one machine. Actors live at `/system/shard/<type>/<shard>/<entity>`, and their own children live below them, local.
 
-Both ids are types of your choosing rather than strings — `Shard::EntityId` and `Shard::ShardId`. They only need `Display`, because an address is where an actor is filed and never where its identity is kept: both directions take the ids off the command. A send that starts here has it already; one that arrives from another node decodes it first, and reads the address for the type name alone. So an id is free to carry structure a segment could not — an account alongside a session, say — and no code anywhere takes a path apart.
+Both ids are types of your choosing rather than strings — `Shard::EntityId` and `Shard::ShardId`. They only need `Display`, and only so that an actor this node hosts can be filed under a key: `/system/shard/<type>/<shard>/<entity>`. That address is local. It is not what placement decides over, it does not go on the wire, and nothing ever reads it back.
+
+Identity comes off the command, in both directions. A send that starts here calls the extractors and has both ids; one that arrives from another node decodes the payload and calls the same two functions on it. An envelope carries the shard type, a deduplication key and the bytes — no address — so there is no second copy of an identity for routing to disagree with. An id is therefore free to carry structure a segment could not, such as an account alongside a session.
+
+Placement takes the pair `(type, shard)` and the agreed live set, and hashes them with FNV-1a rather than the standard library's default hasher, whose output is explicitly not stable across Rust releases: two nodes built by different toolchains have to reach the same answer, or one shard has two live hosts.
 
 One reference type throughout: `shard_actor_of` returns an ordinary `ActorRef`, so business logic is written once and hosted either way.
 

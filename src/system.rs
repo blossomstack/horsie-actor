@@ -7,7 +7,7 @@ use crate::journal::{InMemoryJournal, Journal};
 use crate::path::ActorPath;
 use crate::persistent::Persistent;
 use crate::runtime::{ActorRef, Link, check_name, spawn_at};
-use crate::shard::{EntityContext, Shard, context_of, region_of, type_in};
+use crate::shard::{EntityContext, Shard, address_of, context_of, region_of};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -16,59 +16,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
-/// Build the closure that decodes for one actor and hands it the command.
-///
-/// Takes the *link* rather than a reference, so an inbound message is delivered
-/// to the instance this entry is for and nothing else. A reference would
-/// re-resolve when that instance is gone, and re-resolving could hand the
-/// message straight back to another node — which, while two nodes disagree about
-/// placement for a moment, is a forwarding loop that dedup cannot see, because
-/// every hop mints a fresh message id. Dispatch delivers what is here or says it
-/// cannot.
-fn deliver_to<C: Send + 'static>(path: ActorPath, link: Link<C>, wire: Wire<C>) -> DeliverHere {
-    Arc::new(move |payload, system| {
-        let path = path.clone();
-        let link = link.clone();
-        let wire = wire.clone();
-        Box::pin(async move {
-            let cmd = system
-                .decode_arrival(&wire, &payload)
-                .ok_or_else(|| DispatchError::Decode(path.to_string()))?;
-            link.send(cmd)
-                .await
-                .map_err(|_| DispatchError::MailboxClosed)
-        })
-    })
-}
-
 /// Why an inbound envelope could not be delivered.
 #[derive(Debug, Error)]
 pub enum DispatchError {
-    /// Nothing is at this address here, and nothing here knows how to make it.
-    /// Two nodes running different builds, or a placement decision that has
-    /// moved since the sender resolved it, are the usual causes.
+    /// The command was built here and then was not there to take it. Only a
+    /// stop racing the build produces this, since building is what the line
+    /// above it did.
     #[error("no actor is at '{0}' on this node")]
     NoActor(ActorPath),
 
-    /// The envelope's address is not a path. Only a corrupt or foreign sender
-    /// produces this.
-    #[error(transparent)]
-    BadAddress(#[from] crate::path::InvalidPath),
+    /// No shard type of that name is registered here. Two nodes running
+    /// different builds is the cause worth suspecting — the sender knows a type
+    /// this node has never been taught to make.
+    #[error("no shard type named '{0}' is registered on this node")]
+    UnknownShardType(String),
 
-    /// The actor is here, but its commands have no wire format, so nothing off
-    /// this node was ever meant to reach it. Only a shard type's commands are
-    /// registered to cross a host; an ordinary child is local by construction.
+    /// The payload did not decode into that type's command — usually a version
+    /// skew between nodes.
     ///
-    /// Named separately from "nothing is there" because the two call for
-    /// different fixes: this one is a sender addressing an actor that was never
-    /// meant to be reachable from where it sits.
-    #[error("the actor at '{0}' is local to this node and takes nothing from elsewhere")]
-    LocalOnly(ActorPath),
-
-    /// The payload did not decode into the command type the actor at that
-    /// address accepts — usually a version skew between nodes.
-    #[error("could not decode a command for '{0}'")]
-    Decode(String),
+    /// Named by the type and the message id, which is everything there is: the
+    /// command is what says which actor it was for, and it is the thing that
+    /// would not decode.
+    #[error("could not decode a '{type_name}' command (message {message_id})")]
+    Decode {
+        /// The shard type the envelope was addressed to.
+        type_name: &'static str,
+        /// The envelope's deduplication key.
+        message_id: u128,
+    },
 
     /// The instance could not be started here.
     #[error(transparent)]
@@ -143,29 +118,16 @@ struct Registered {
 ///
 /// Closes over that node's own wiring, which is why it is registered on every
 /// node rather than sent to one.
-type Build<S> =
-    Arc<dyn Fn(&ActorSystem, &EntityContext<S>) -> Result<(), ActorOfError> + Send + Sync>;
+type Build<S> = Arc<
+    dyn Fn(&ActorSystem, &EntityContext<S>, &ActorPath) -> Result<(), ActorOfError> + Send + Sync,
+>;
 
 /// Decodes an inbound payload for one shard type, builds if it has to, delivers.
 type Receive = Arc<
     dyn Fn(
             ActorSystem,
-            ActorPath,
+            u128,
             Vec<u8>,
-        ) -> futures_util::future::BoxFuture<'static, Result<(), DispatchError>>
-        + Send
-        + Sync,
->;
-
-/// Hands an inbound payload to the actor at one specific path.
-///
-/// Built where the command type is known and stored beside the reference, so
-/// dispatch needs neither a type registry nor a kind on the wire — it has a
-/// path, and the path has an entry.
-type DeliverHere = Arc<
-    dyn Fn(
-            Vec<u8>,
-            ActorSystem,
         ) -> futures_util::future::BoxFuture<'static, Result<(), DispatchError>>
         + Send
         + Sync,
@@ -208,10 +170,6 @@ type ErasedWire = (Arc<dyn Any + Send + Sync>, &'static str);
 /// One actor on this node.
 struct Entry {
     reference: ErasedRef,
-    /// How to hand this actor a command that arrived from another node. `None`
-    /// for a local-only actor, which is what makes a send from another host fail
-    /// cleanly and say why.
-    deliver: Option<DeliverHere>,
     /// Raise to stop this actor. Held here rather than in the reference,
     /// because a reference is a name that anyone may hold and stopping is
     /// something the tree does.
@@ -286,10 +244,6 @@ impl SystemInner {
             .cloned()
     }
 
-    /// How to hand an inbound payload to whatever is at `path`.
-    ///
-    /// The outer `Option` is whether anything is there at all; the inner one is
-    /// whether it can be reached from another node.
     /// How a shard type takes delivery of an inbound payload, if it is
     /// registered here.
     fn receiver(&self, type_name: &str) -> Option<Receive> {
@@ -297,10 +251,6 @@ impl SystemInner {
             .lock()
             .get(type_name)
             .map(|registered| registered.receive.clone())
-    }
-
-    fn deliver_here(&self, path: &ActorPath) -> Option<Option<DeliverHere>> {
-        Some(self.live.lock().get(path)?.deliver.clone())
     }
 
     /// How many actors are registered here.
@@ -509,7 +459,6 @@ impl ActorSystem {
         self.require_serving()?;
         check_name(name)?;
         let path = parent.child(name);
-        let wire = self.inner.wire::<A::Command>();
 
         let mut live = self.inner.live.lock();
         if let Some(existing) = live.get(&path) {
@@ -536,7 +485,6 @@ impl ActorSystem {
         live.insert(
             path.clone(),
             Entry {
-                deliver: wire.map(|wire| deliver_to(path.clone(), link.clone(), wire)),
                 reference: Arc::new(reference) as ErasedRef,
                 stop: spawned.stop,
                 terminated: spawned.terminated,
@@ -633,9 +581,11 @@ impl ActorSystem {
         entity: EntityContext<S>,
         cmd: S::Command,
     ) -> Result<(), TellError> {
-        let shard = entity.shard_path();
+        // Placement first, and over the ids alone: no address exists yet, and on
+        // every send but the ones this node keeps, none ever will.
+        let shard_id = entity.shard_id.to_string();
         let ours = match &self.inner.cluster {
-            Some(cluster) => cluster.owns(&shard.to_string()),
+            Some(cluster) => cluster.owns(S::TYPE, &shard_id),
             // No cluster: this node owns everything, which is the single-node
             // deployment and mentions none of this.
             None => true,
@@ -661,12 +611,7 @@ impl ActorSystem {
         let payload = crate::reply::with_router(router, || (wire.encode)(&cmd))
             .ok_or(TellError::Undeliverable)?;
         cluster
-            .send(
-                &shard.to_string(),
-                &entity.path.to_string(),
-                payload,
-                cluster.next_message_id(),
-            )
+            .send(S::TYPE, &shard_id, payload, cluster.next_message_id())
             .await
             .map_err(|_| TellError::Undeliverable)
     }
@@ -677,31 +622,38 @@ impl ActorSystem {
         &self,
         entity: &EntityContext<S>,
     ) -> Result<Link<S::Command>, ActorOfError> {
-        if let Some(link) = self.inner.resolve::<S::Command>(&entity.path) {
+        // Where the ids become a key, and the first of only two places that
+        // happens. This node is hosting, so there is finally something to file.
+        let at = address_of(entity);
+        if let Some(link) = self.inner.resolve::<S::Command>(&at) {
             return Ok(link);
         }
-        self.build_shard_actor(entity)?;
+        self.build_shard_actor(entity, &at)?;
         self.inner
-            .resolve::<S::Command>(&entity.path)
-            .ok_or_else(|| ActorOfError::Unclaimed(entity.path.clone()))
+            .resolve::<S::Command>(&at)
+            .ok_or(ActorOfError::Unclaimed(at))
     }
 
     /// Run the registered recipe for the actor this context names.
-    fn build_shard_actor<S: Shard>(&self, entity: &EntityContext<S>) -> Result<(), ActorOfError> {
+    fn build_shard_actor<S: Shard>(
+        &self,
+        entity: &EntityContext<S>,
+        at: &ActorPath,
+    ) -> Result<(), ActorOfError> {
         let erased = self
             .inner
             .shards
             .lock()
             .get(S::TYPE)
             .map(|registered| registered.build.clone())
-            .ok_or_else(|| ActorOfError::Unclaimed(entity.path.clone()))?;
+            .ok_or_else(|| ActorOfError::Unclaimed(at.clone()))?;
         // A hit under this name that is not this type's recipe means two types
         // answer to one `TYPE`, which registration refuses — so reaching here
         // is that refusal having been bypassed rather than a runtime condition.
         let build = erased
             .downcast_ref::<Build<S>>()
             .ok_or(ActorOfError::TypeCollision(S::TYPE))?;
-        build(self, entity)
+        build(self, entity, at)
     }
 
     /// Decode a command that arrived from another node.
@@ -753,34 +705,25 @@ impl ActorSystem {
         self.require_serving()?;
         // A repeat is a success, not a failure: the sender retried because it
         // could not tell "lost" from "slow", and the answer to both is that the
-        // command has already been applied.
+        // command has already been applied. Ahead of the decode below, and it
+        // has to stay there: decoding a repeat would register a second reply
+        // handle for one caller, and hand the actor a command it has applied.
         if !self.inner.seen.lock().accept(&env) {
-            tracing::debug!(path = %env.path, "dropped a duplicate delivery");
+            tracing::debug!(
+                type_name = %env.type_name,
+                message_id = env.message_id,
+                "dropped a duplicate delivery"
+            );
             return Ok(());
         }
-        let path = ActorPath::parse(&env.path)?;
 
-        // Something is already running here at that address: its entry knows how
-        // to decode for it, so dispatch needs no type registry and the wire needs
-        // no kind.
-        match self.inner.deliver_here(&path) {
-            Some(Some(deliver)) => return deliver(env.payload, self.clone()).await,
-            // There, but local-only. Nothing off this node was meant to reach
-            // it, and saying so beats "nothing is there".
-            Some(None) => return Err(DispatchError::LocalOnly(path)),
-            None => {}
-        }
-
-        // A shard actor this node owns but has not started yet. The one case
-        // where an inbound message creates an actor, and the address is read
-        // only for the type — which is the whole of what it has to say. Which
-        // actor and which shard come off the command, once the type's own
-        // receiver has decoded it.
-        if let Some(receive) = type_in(&path).and_then(|type_name| self.inner.receiver(type_name)) {
-            return receive(self.clone(), path, env.payload).await;
-        }
-
-        Err(DispatchError::NoActor(path))
+        // The envelope is addressed to a shard type and nothing narrower.
+        // Which actor is in the payload, so the type's own receiver decodes
+        // first and takes it from there.
+        let Some(receive) = self.inner.receiver(&env.type_name) else {
+            return Err(DispatchError::UnknownShardType(env.type_name));
+        };
+        receive(self.clone(), env.message_id, env.payload).await
     }
 }
 
@@ -814,14 +757,16 @@ impl<S: Shard> ShardOf<'_, S> {
         let system = self.system;
         system.record_wire::<S::Command>(std::any::type_name::<S>());
 
-        let build: Build<S> = Arc::new(move |system: &ActorSystem, entity: &EntityContext<S>| {
-            let (Some(parent), Some(name)) = (entity.path.parent(), entity.path.name()) else {
-                return Err(ActorOfError::Unclaimed(entity.path.clone()));
-            };
-            system
-                .get_or_create(&parent, name, recipe(system, entity))
-                .map(|_| ())
-        });
+        let build: Build<S> = Arc::new(
+            move |system: &ActorSystem, entity: &EntityContext<S>, at: &ActorPath| {
+                let (Some(parent), Some(name)) = (at.parent(), at.name()) else {
+                    return Err(ActorOfError::Unclaimed(at.clone()));
+                };
+                system
+                    .get_or_create(&parent, name, recipe(system, entity))
+                    .map(|_| ())
+            },
+        );
 
         // Everything a payload from another node has to go through, in the one
         // place that still knows `S`. Decoding first is what breaks the
@@ -832,33 +777,33 @@ impl<S: Shard> ShardOf<'_, S> {
         let receive: Receive = {
             let build = Arc::clone(&build);
             Arc::new(
-                move |system: ActorSystem, arrived_at: ActorPath, payload: Vec<u8>| {
+                move |system: ActorSystem, message_id: u128, payload: Vec<u8>| {
                     let build = Arc::clone(&build);
                     Box::pin(async move {
-                        let wire = system
-                            .inner
-                            .wire::<S::Command>()
-                            .ok_or_else(|| DispatchError::NoActor(arrived_at.clone()))?;
-                        let cmd = system
-                            .decode_arrival(&wire, &payload)
-                            .ok_or_else(|| DispatchError::Decode(arrived_at.to_string()))?;
+                        let unknown = || DispatchError::Decode {
+                            type_name: S::TYPE,
+                            message_id,
+                        };
+                        let wire = system.inner.wire::<S::Command>().ok_or_else(unknown)?;
+                        let cmd = system.decode_arrival(&wire, &payload).ok_or_else(unknown)?;
 
-                        // The address it arrived at named the type and has now
-                        // said all it has to say. Where the actor goes is the
-                        // extractors' answer, so a send that starts here and one
-                        // that arrives cannot place the same command differently.
+                        // The envelope said which type, and has now said all it has
+                        // to say. Which actor is the extractors' answer, exactly as
+                        // it is for a send that starts on this node — so the two
+                        // directions cannot place one command differently.
                         let entity = context_of::<S>(&cmd);
-                        if system.inner.resolve::<S::Command>(&entity.path).is_none() {
-                            // Failing here drops `cmd`, which is deliberate: a
-                            // reply handle inside it tells its caller that no
-                            // answer is coming exactly when it is dropped, and
-                            // a caller left waiting is the worse outcome.
-                            build(&system, &entity)?;
+                        let at = address_of(&entity);
+                        if system.inner.resolve::<S::Command>(&at).is_none() {
+                            // Failing here drops `cmd`, which is deliberate: a reply
+                            // handle inside it tells its caller that no answer is
+                            // coming exactly when it is dropped, and a caller left
+                            // waiting is the worse outcome.
+                            build(&system, &entity, &at)?;
                         }
                         let link = system
                             .inner
-                            .resolve::<S::Command>(&entity.path)
-                            .ok_or_else(|| DispatchError::NoActor(entity.path.clone()))?;
+                            .resolve::<S::Command>(&at)
+                            .ok_or(DispatchError::NoActor(at))?;
                         link.send(cmd)
                             .await
                             .map_err(|_| DispatchError::MailboxClosed)
@@ -1063,7 +1008,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let path = crate::shard::entity_of("counter", "c1", "c1");
+        let path = ActorPath::parse("/system/shard/counter/c1/c1").unwrap();
         assert_eq!(path.to_string(), "/system/shard/counter/c1/c1");
         assert!(system.inner.resolve::<CounterCmd>(&path).is_some());
     }
@@ -1299,13 +1244,12 @@ mod tests {
         );
     }
 
-    /// **The headline.** A command that arrives from another node says which
-    /// actor it is for, in its own bytes. The address it came in on is read for
-    /// the type and nothing else — here it names a shard and an entity that are
-    /// both wrong, and the actor is still built where the command says.
+    /// **The headline.** An envelope carries a shard type and nothing narrower.
+    /// Which actor, and which shard, are in the payload where the extractors put
+    /// them, and that is where the receiving node takes them from.
     ///
-    /// That is what stops an address from being a second, weaker encoding of an
-    /// identity the command already carries.
+    /// So there is no address on the wire to disagree with the command, and no
+    /// second, weaker encoding of an identity the command already carries.
     #[tokio::test]
     async fn an_arriving_command_names_its_own_actor() {
         let told: Told = Arc::new(Mutex::new(None));
@@ -1313,7 +1257,7 @@ mod tests {
 
         let payload = serde_json::to_vec(&announce(9, "acct-7", "sess-3")).unwrap();
         system
-            .dispatch(envelope("/system/shard/tenant/0/somebody-else", payload, 1))
+            .dispatch(envelope("tenant", payload, 1))
             .await
             .unwrap();
 
@@ -1321,7 +1265,7 @@ mod tests {
             told.lock().as_ref(),
             Some(&(Bucket(9), tenanted("acct-7", "sess-3")))
         );
-        let built = crate::shard::entity_of("tenant", Bucket(9), "acct-7|sess-3");
+        let built = ActorPath::parse("/system/shard/tenant/9/acct-7|sess-3").unwrap();
         assert!(
             system.inner.resolve::<Announce>(&built).is_some(),
             "the actor was not built where its command said"
@@ -1337,20 +1281,80 @@ mod tests {
         let system = tenants(&told);
 
         let payload = serde_json::to_vec(&announce(9, "acct-7", "sess-3")).unwrap();
-        let at = "/system/shard/tenant/9/acct-7|sess-3";
 
         system
-            .dispatch(envelope(at, payload.clone(), 7))
+            .dispatch(envelope("tenant", payload.clone(), 7))
             .await
             .unwrap();
         let once = decoded();
 
-        system.dispatch(envelope(at, payload, 7)).await.unwrap();
+        system
+            .dispatch(envelope("tenant", payload, 7))
+            .await
+            .unwrap();
 
         assert_eq!(
             decoded(),
             once,
             "the repeat was decoded, so the dedup window is no longer ahead of it"
+        );
+    }
+
+    /// A node without quorum refuses an envelope before decoding it.
+    ///
+    /// Ahead of the dedup window, which is ahead of the decode. It is the outer
+    /// check for a reason: a node in a minority cannot know whether its actors
+    /// have already been given to somebody else, so it must not build one, and
+    /// must not register a reply handle promising an answer it may never be
+    /// entitled to give.
+    #[tokio::test]
+    async fn a_node_without_quorum_refuses_before_decoding() {
+        let told: Told = Arc::new(Mutex::new(None));
+        // Bootstrapped into a three-member cluster with nobody else there, so it
+        // never reaches quorum and never starts serving.
+        let network = crate::transport::InProcessNetwork::new();
+        let node = ClusterNode::start(
+            crate::cluster::ClusterConfig {
+                local: crate::envelope::NodeId(1),
+                bootstrap: (1..=3).map(crate::envelope::NodeId).collect(),
+                liveness_window: std::time::Duration::from_millis(600),
+            },
+            Arc::new(network.node(crate::envelope::NodeId(1))),
+            crate::cluster::RaftStore::in_memory_unsafe(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !node.serving(),
+            "a lone node of three should not be serving"
+        );
+
+        let system = ActorSystem::clustered(Arc::new(InMemoryJournal::new()), node);
+        let recorded = told.clone();
+        system
+            .shard::<Tenant>()
+            .register(move |_sys, entity| {
+                *recorded.lock() = Some((entity.shard_id, entity.entity_id.clone()));
+                Tenant
+            })
+            .unwrap();
+
+        let payload = serde_json::to_vec(&announce(9, "acct-7", "sess-3")).unwrap();
+        let before = decoded();
+
+        let outcome = system.dispatch(envelope("tenant", payload, 11)).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(DispatchError::Resolve(ActorOfError::NotServing))
+            ),
+            "a stood-down node took the command: {outcome:?}"
+        );
+        assert_eq!(
+            decoded(),
+            before,
+            "the command was decoded by a node that is not serving"
         );
     }
 
@@ -1367,7 +1371,7 @@ mod tests {
 
         // Stand something of another command type exactly where the command
         // below says its actor belongs, so the recipe cannot have that name.
-        let taken = crate::shard::entity_of("tenant", Bucket(9), "acct-7|sess-3");
+        let taken = ActorPath::parse("/system/shard/tenant/9/acct-7|sess-3").unwrap();
         system
             .get_or_create(&taken.parent().unwrap(), taken.name().unwrap(), Squatter)
             .unwrap();
@@ -1375,12 +1379,7 @@ mod tests {
         let payload = serde_json::to_vec(&announce(9, "acct-7", "sess-3")).unwrap();
         let before = dropped();
 
-        // Addressed away from the squatter, so this is the receiver reaching
-        // the taken name through the command rather than tripping over it on
-        // the way in.
-        let outcome = system
-            .dispatch(envelope("/system/shard/tenant/0/anywhere", payload, 3))
-            .await;
+        let outcome = system.dispatch(envelope("tenant", payload, 3)).await;
 
         assert!(
             matches!(
@@ -1411,9 +1410,9 @@ mod tests {
         }
     }
 
-    fn envelope(at: &str, payload: Vec<u8>, message_id: u128) -> Message {
+    fn envelope(type_name: &str, payload: Vec<u8>, message_id: u128) -> Message {
         Message::Command(crate::envelope::Envelope {
-            path: at.to_owned(),
+            type_name: type_name.to_owned(),
             message_id,
             payload,
         })

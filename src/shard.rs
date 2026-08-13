@@ -76,6 +76,9 @@ pub trait Shard: Send + Sized + 'static {
 }
 
 /// `/system/shard/<type>` — where a type's actors live, collectively.
+///
+/// What a shard reference names, and the prefix that sweeps every actor of a
+/// type this node hosts.
 #[must_use]
 pub fn region_of(type_name: &str) -> ActorPath {
     ActorPath::root()
@@ -84,81 +87,52 @@ pub fn region_of(type_name: &str) -> ActorPath {
         .child(type_name)
 }
 
-/// `/system/shard/<type>/<shard>` — the unit placement is decided over.
-#[must_use]
-pub fn shard_of(type_name: &str, shard_id: impl Display) -> ActorPath {
-    region_of(type_name).child(&shard_id.to_string())
-}
-
-/// `/system/shard/<type>/<shard>/<entity>` — one actor.
-#[must_use]
-pub fn entity_of(type_name: &str, shard_id: impl Display, entity_id: impl Display) -> ActorPath {
-    shard_of(type_name, shard_id).child(&entity_id.to_string())
-}
-
-/// The type name in a shard address, if this is one.
+/// `/system/shard/<type>/<shard>/<entity>` — where one actor is filed.
 ///
-/// How a node that has only a path finds the recipe for what belongs there.
-#[must_use]
-pub fn type_in(path: &ActorPath) -> Option<&str> {
-    match path.segments() {
-        [system, shard, type_name, _, _] if system == SYSTEM && shard == SHARD => {
-            Some(type_name.as_str())
-        }
-        _ => None,
-    }
+/// The only thing in the crate that knows the address grammar, and it is called
+/// at exactly the two points where an actor is about to be looked up or created
+/// on this node. Everything upstream of those — which node hosts this, what
+/// crosses the wire — works in ids, because that is what it is about.
+///
+/// An address is therefore a local registry key and nothing else. It is not
+/// parsed, not sent, and not what placement decides over.
+pub(crate) fn address_of<S: Shard>(entity: &EntityContext<S>) -> ActorPath {
+    region_of(entity.type_name)
+        .child(&entity.shard_id.to_string())
+        .child(&entity.entity_id.to_string())
 }
 
 /// Which actor a recipe is being asked to build.
 ///
-/// Both ids as the extractors returned them, off the command that is about to
-/// be delivered. A recipe therefore reads fields rather than segments, and the
-/// address grammar stays the framework's business.
+/// The extractors' own outputs, and nothing this crate worked out from them.
+/// Every node that needs to know which actor a command is for gets it from the
+/// command, so there is one encoding of identity and nothing to disagree with.
 pub struct EntityContext<S: Shard> {
+    /// The shard type these ids belong to — [`Shard::TYPE`].
+    ///
+    /// A field rather than something a reader looks up, because the code that
+    /// hands this to placement has gone through a type-erased hop and no longer
+    /// names `S`.
+    pub type_name: &'static str,
+    /// Which shard, and so which node. What placement is decided over.
+    pub shard_id: S::ShardId,
     /// Which actor of this type. What an event-sourced one derives its
     /// persistence id from, since that id is asked for at construction and is
     /// how recovery finds the log.
     pub entity_id: S::EntityId,
-    /// Which shard placed it here.
-    pub shard_id: S::ShardId,
-    /// Its full address.
-    ///
-    /// Spelled from the two ids above, and here because a recipe runs before
-    /// the actor exists and so before there is an [`ActorContext`] to ask —
-    /// which is where a running actor gets its own path from. Reassembling it
-    /// would mean knowing the address grammar, which is the one thing an
-    /// application is not supposed to need.
-    ///
-    /// [`ActorContext`]: crate::ActorContext::path
-    pub path: ActorPath,
 }
 
-impl<S: Shard> EntityContext<S> {
-    /// The shard this actor sits in — what placement is decided over.
-    ///
-    /// Derived rather than carried. It is the address above with its last
-    /// segment removed, only the cluster ever asks for it, and a value holding
-    /// two paths that differ by one segment tells them apart by position alone.
-    pub(crate) fn shard_path(&self) -> ActorPath {
-        shard_of(S::TYPE, &self.shard_id)
-    }
-}
-
-/// Which actor `cmd` is for.
+/// Which actor `cmd` is for, and which shard it belongs to.
 ///
 /// The single source of identity, in both directions: a send that starts here
 /// calls it with the command in hand, and one that arrives from another node
-/// calls it with the command it has just decoded. The address falls out of the
-/// ids rather than the ids out of the address, so there is no second encoding
-/// of who an actor is and nothing to disagree about.
+/// calls it with the command it has just decoded. Nothing reads either id back
+/// out of anywhere, so the two directions cannot come to different conclusions.
 pub(crate) fn context_of<S: Shard>(cmd: &S::Command) -> EntityContext<S> {
-    let entity_id = S::entity_id(cmd);
-    let shard_id = S::shard_id(cmd);
-    let path = entity_of(S::TYPE, &shard_id, &entity_id);
     EntityContext {
-        entity_id,
-        shard_id,
-        path,
+        type_name: S::TYPE,
+        shard_id: S::shard_id(cmd),
+        entity_id: S::entity_id(cmd),
     }
 }
 
@@ -229,59 +203,62 @@ mod tests {
         }
     }
 
+    /// A region is where a type's actors live collectively, and one actor is
+    /// filed two segments under it: the shard it was placed in, then itself.
     #[test]
-    fn a_shard_address_is_type_shard_entity() {
-        let path = entity_of("session", "17", "sess-abc");
-        assert_eq!(path.to_string(), "/system/shard/session/17/sess-abc");
-        assert_eq!(type_in(&path), Some("session"));
-        assert_eq!(
-            path.parent().unwrap().to_string(),
-            "/system/shard/session/17",
-            "the entity does not sit under the shard placement is decided over"
-        );
-    }
-
-    /// An application's own tree is not a shard address, so nothing tries to
-    /// build one from a recipe.
-    #[test]
-    fn an_ordinary_address_is_not_a_shard_address() {
-        let path = ActorPath::root().child("acct-7").child("session-3");
-        assert_eq!(type_in(&path), None);
-    }
-
-    /// A child of a shard actor is local to it, and is not itself addressed as
-    /// a shard — otherwise it would be placed independently of its parent.
-    #[test]
-    fn a_child_of_a_shard_actor_is_not_a_shard_address() {
-        let child = entity_of("session", "17", "sess-abc").child("agent-main");
-        assert_eq!(type_in(&child), None);
-    }
-
-    /// The extractors decide both halves of the address, and the entity sits
-    /// under the shard placement is decided over rather than beside it.
-    #[test]
-    fn a_command_decides_where_its_actor_lives() {
-        let cmd = Open {
+    fn an_address_is_region_shard_entity() {
+        let entity = context_of::<Session>(&Open {
             at: Bucket(17),
             id: Tenanted {
                 account: "acct-7".into(),
                 session: "sess-3".into(),
             },
-        };
-        let entity = context_of::<Session>(&cmd);
+        });
 
         assert_eq!(
-            entity.path.to_string(),
+            address_of(&entity).to_string(),
             "/system/shard/session/17/acct-7|sess-3"
         );
-        assert_eq!(entity.shard_path().to_string(), "/system/shard/session/17");
-        assert_eq!(entity.shard_id, Bucket(17));
-        assert_eq!(entity.entity_id.account, "acct-7");
+        assert!(address_of(&entity).starts_with(&region_of("session")));
     }
 
-    /// Two commands naming one entity land on one address, and the ids the
-    /// context carries are the extractors' own values — not something spelled
-    /// out and read back, which is what would let the two disagree.
+    /// A child of a shard actor is local to it and sits below its address, so
+    /// nothing places it independently of its parent.
+    #[test]
+    fn a_child_of_a_shard_actor_lives_under_it() {
+        let entity = context_of::<Session>(&Open {
+            at: Bucket(17),
+            id: Tenanted {
+                account: "acct-7".into(),
+                session: "sess-3".into(),
+            },
+        });
+        let address = address_of(&entity);
+        let child = address.child("agent-main");
+
+        assert_eq!(child.parent().as_ref(), Some(&address));
+    }
+
+    /// The extractors decide both ids, and the context carries their answers
+    /// rather than anything worked out from them.
+    #[test]
+    fn a_command_decides_which_actor_it_is_for() {
+        let entity = context_of::<Session>(&Open {
+            at: Bucket(17),
+            id: Tenanted {
+                account: "acct-7".into(),
+                session: "sess-3".into(),
+            },
+        });
+
+        assert_eq!(entity.type_name, "session");
+        assert_eq!(entity.shard_id, Bucket(17));
+        assert_eq!(entity.entity_id.account, "acct-7");
+        assert_eq!(entity.entity_id.session, "sess-3");
+    }
+
+    /// Two commands naming one entity are filed under one key, and one naming
+    /// another is not.
     #[test]
     fn one_entity_is_one_address() {
         let open = |account: &str| Open {
@@ -291,11 +268,11 @@ mod tests {
                 session: "sess-3".into(),
             },
         };
-        let first = context_of::<Session>(&open("acct-7"));
-        let again = context_of::<Session>(&open("acct-7"));
-        let other = context_of::<Session>(&open("acct-9"));
+        let first = address_of(&context_of::<Session>(&open("acct-7")));
+        let again = address_of(&context_of::<Session>(&open("acct-7")));
+        let other = address_of(&context_of::<Session>(&open("acct-9")));
 
-        assert_eq!(first.path, again.path);
-        assert_ne!(first.path, other.path);
+        assert_eq!(first, again);
+        assert_ne!(first, other);
     }
 }
