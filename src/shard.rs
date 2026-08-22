@@ -89,17 +89,71 @@ pub fn region_of(type_name: &str) -> ActorPath {
 
 /// `/system/shard/<type>/<shard>/<entity>` — where one actor is filed.
 ///
-/// The only thing in the crate that knows the address grammar, and it is called
-/// at exactly the two points where an actor is about to be looked up or created
-/// on this node. Everything upstream of those — which node hosts this, what
-/// crosses the wire — works in ids, because that is what it is about.
+/// Where the grammar is written, and it is called at exactly the two points
+/// where an actor is about to be looked up or created on this node. Everything
+/// upstream of those — which node hosts this, what crosses the wire — works in
+/// ids, because that is what it is about.
 ///
 /// An address is therefore a local registry key and nothing else. It is not
-/// parsed, not sent, and not what placement decides over.
+/// sent, and it is not what placement decides over. It is read back in one
+/// place — [`shard_root_of`], for the sweep that stops a shard this node no
+/// longer hosts — and that reader is next door rather than anywhere else, so
+/// the grammar still has one home.
 pub(crate) fn address_of<S: Shard>(entity: &EntityContext<S>) -> ActorPath {
     region_of(entity.type_name)
         .child(&entity.shard_id.to_string())
         .child(&entity.entity_id.to_string())
+}
+
+/// A shard this node is running, read back off one of its actors' addresses.
+///
+/// The two ids as text, which is exactly what placement takes: `owner_of`
+/// decides over a type name and a shard id, and both reached the address as
+/// [`Display`] output on the way in. Nothing here reconstructs an
+/// [`S::ShardId`](Shard::ShardId) or an [`S::EntityId`](Shard::EntityId) — an
+/// entity's identity still comes off its command, and this cannot see one.
+///
+/// Owned, and ordered: a scan of the registry produces one of these per actor
+/// and wants the shards, so they are collected into a set that dedups them and
+/// gives the sweep behind it a fixed order to work and log in.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PlacedShard {
+    /// [`Shard::TYPE`], as it was spelled into the address.
+    pub type_name: String,
+    /// The shard, as [`Shard::shard_id`]'s answer was spelled into the address.
+    pub shard_id: String,
+}
+
+impl PlacedShard {
+    /// `/system/shard/<type>/<shard>` — the subtree this shard's actors occupy,
+    /// and so the path that stops all of them at once.
+    pub(crate) fn root(&self) -> ActorPath {
+        region_of(&self.type_name).child(&self.shard_id)
+    }
+}
+
+/// Which shard `path` belongs to, if it is a shard address at all.
+///
+/// The one reader of the grammar in this direction, kept beside the one writer
+/// of it. Every path from `/system/shard/<type>/<shard>` down — the entity, and
+/// any child the entity created — answers with the same pair, which is what
+/// makes a scan of the registry a scan of the shards this node is running.
+///
+/// It reads the *placement* segments and only those. That is the line: which
+/// node hosts a shard is a question about the pair below, and the pair below is
+/// what every node computed the address from in the first place. Which actor a
+/// command is for is a different question, and it is still answered by the
+/// extractors and never by a segment.
+pub(crate) fn shard_root_of(path: &ActorPath) -> Option<PlacedShard> {
+    match path.segments() {
+        [system, shard, type_name, shard_id, ..] if system == SYSTEM && shard == SHARD => {
+            Some(PlacedShard {
+                type_name: type_name.clone(),
+                shard_id: shard_id.clone(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Which actor a recipe is being asked to build.
@@ -255,6 +309,54 @@ mod tests {
         assert_eq!(entity.shard_id, Bucket(17));
         assert_eq!(entity.entity_id.account, "acct-7");
         assert_eq!(entity.entity_id.session, "sess-3");
+    }
+
+    /// The grammar reads back the same way it was written, from the entity and
+    /// from anything the entity created. A sweep looks at the registry, which
+    /// holds a row per actor rather than a row per shard, so a child has to
+    /// answer with its shard and not with itself.
+    #[test]
+    fn a_shard_address_says_which_shard_it_is_in() {
+        let entity = context_of::<Session>(&Open {
+            at: Bucket(17),
+            id: Tenanted {
+                account: "acct-7".into(),
+                session: "sess-3".into(),
+            },
+        });
+        let address = address_of(&entity);
+
+        for path in [address.clone(), address.child("agent-main")] {
+            let shard = shard_root_of(&path).expect("a shard address must be read back");
+            assert_eq!(shard.type_name, "session");
+            assert_eq!(shard.shard_id, "17");
+            assert_eq!(shard.root().to_string(), "/system/shard/session/17");
+        }
+    }
+
+    /// The tree an application builds for itself is not swept. `/system/shard`
+    /// is the prefix that keeps the two apart, and a path that merely starts
+    /// with something similar is not in it.
+    #[test]
+    fn an_ordinary_address_is_not_a_shard_address() {
+        for path in [
+            ActorPath::root(),
+            ActorPath::root().child("acct-7").child("session-3"),
+            // The prefix, with nothing placed under it: a region, and a region
+            // is every shard of a type rather than one of them.
+            region_of("session"),
+            // Right shape, wrong prefix.
+            ActorPath::root()
+                .child("system")
+                .child("shards")
+                .child("session")
+                .child("17"),
+        ] {
+            assert!(
+                shard_root_of(&path).is_none(),
+                "{path} was read as a shard address"
+            );
+        }
     }
 
     /// Two commands naming one entity are filed under one key, and one naming

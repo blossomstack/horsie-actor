@@ -94,6 +94,13 @@ pub struct ClusterNode {
     /// The same flag, watchable, so the actor system can stop what it hosts the
     /// moment this node stands down.
     serving_tx: tokio::sync::watch::Sender<bool>,
+    /// The live set as this node last applied it, watchable.
+    ///
+    /// Serving answers "may I host anything at all"; this answers "has what I
+    /// host moved". They are separate signals because they have separate
+    /// remedies: a node that stands down stops everything, and a node that is
+    /// still serving stops only the shards that hashed away from it.
+    live_tx: tokio::sync::watch::Sender<Vec<NodeId>>,
     /// Local half of the message id. Paired with the node id it is unique
     /// cluster-wide without coordination, which is what lets the receiver dedup
     /// retries without a shared counter.
@@ -173,6 +180,7 @@ impl ClusterNode {
         }
 
         let (serving_tx, _) = tokio::sync::watch::channel(false);
+        let (live_tx, _) = tokio::sync::watch::channel(Vec::new());
         let node = Arc::new(Self {
             local: config.local,
             transport,
@@ -181,6 +189,7 @@ impl ClusterNode {
             table: Mutex::new(PlacementTable::new()),
             serving: AtomicBool::new(false),
             serving_tx,
+            live_tx,
             counter: AtomicU64::new(0),
             waiting: Mutex::new(BTreeMap::new()),
             correlations: AtomicU64::new(0),
@@ -229,6 +238,20 @@ impl ClusterNode {
         self.serving_tx.subscribe()
     }
 
+    /// Watch the live set this node applies placement over.
+    ///
+    /// Fires when the set actually changes, not on every tick that reaffirms
+    /// it: a `watch` wakes every receiver on every send, and the loop behind
+    /// this re-reads consensus several times a second. A receiver that woke on
+    /// each of those would sweep the whole registry for nothing.
+    ///
+    /// The table is updated before the send, so a receiver that wakes and asks
+    /// [`owner_of`](Self::owner_of) is answered from the set it was woken for.
+    #[must_use]
+    pub fn live_watch(&self) -> tokio::sync::watch::Receiver<Vec<NodeId>> {
+        self.live_tx.subscribe()
+    }
+
     /// The Raft handle, for membership changes and metrics.
     #[must_use]
     pub fn raft(&self) -> &Raft<Membership, RaftStore> {
@@ -269,6 +292,16 @@ impl ClusterNode {
     /// elect itself host of everything.
     fn set_live(&self, live: &[NodeId]) {
         self.table.lock().set_members(live.iter().copied());
+        // Placement first, then the announcement, so nobody is told the set
+        // moved and then reads the one it moved from.
+        self.live_tx.send_if_modified(|applied| {
+            if applied == live {
+                return false;
+            }
+            applied.clear();
+            applied.extend_from_slice(live);
+            true
+        });
     }
 
     /// Send an already-encoded command to whichever node hosts its shard.

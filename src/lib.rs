@@ -29,7 +29,8 @@
 //! path), and the recipe for each registered shard type. Shard types can be
 //! hosted across several nodes: membership is agreed by Raft, placement hashes
 //! over the members the leader reports as live, replies route back to whoever
-//! asked, and a node that cannot see a quorum stops what it hosts.
+//! asked, a node that cannot see a quorum stops what it hosts, and a node that
+//! keeps its quorum stops whatever placement has moved to somebody else.
 //!
 //! None of that is what keeps a log consistent. [`Journal::persist`] is
 //! conditional on the sequence number the writer believes the log ends at, and
