@@ -1,0 +1,36 @@
+version: 2
+updates:
+  # Rust crate dependencies.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: daily
+      time: "18:00"
+      timezone: "America/Vancouver"
+    open-pull-requests-limit: 10
+    groups:
+      cargo-routine:
+        # Group routine minor/patch updates into a single daily PR.
+        update-types:
+          - minor
+          - patch
+    # Semver-major updates are not covered by the group above, so they open as
+    # individual PRs automatically.
+    ignore:
+      # Pinned exactly to =0.10.0-alpha.33 for the June 2026 consensus
+      # correctness fixes. Which alpha this crate sits on is a read-the-
+      # changelog decision, not a routine bump.
+      - dependency-name: "openraft"
+
+  # Keeps the actions used by ci.yml and publish.yml current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: daily
+      time: "18:00"
+      timezone: "America/Vancouver"
+    open-pull-requests-limit: 5
+    groups:
+      all-actions:
+        patterns:
+          - "*"
