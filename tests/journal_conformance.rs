@@ -79,6 +79,10 @@ mod in_memory {
         conformance::persist_rejects_a_stale_writer(&journal()).await;
     }
     #[tokio::test]
+    async fn an_empty_persist_still_enforces_the_condition() {
+        conformance::an_empty_persist_still_enforces_the_condition(&journal()).await;
+    }
+    #[tokio::test]
     async fn persist_rejects_a_writer_ahead_of_the_log() {
         conformance::persist_rejects_a_writer_ahead_of_the_log(&journal()).await;
     }

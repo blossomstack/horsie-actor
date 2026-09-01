@@ -72,6 +72,12 @@ enum CounterCmd {
         id: String,
         reply: ReplyTo<i64>,
     },
+    /// The checked read: answered only once the journal confirms the log has
+    /// not moved past this instance.
+    GetChecked {
+        id: String,
+        reply: ReplyTo<i64>,
+    },
 }
 
 impl CounterCmd {
@@ -81,7 +87,8 @@ impl CounterCmd {
             | CounterCmd::Get { id, .. }
             | CounterCmd::IncOther { id, .. }
             | CounterCmd::Ignore { id, .. }
-            | CounterCmd::Hold { id, .. } => id,
+            | CounterCmd::Hold { id, .. }
+            | CounterCmd::GetChecked { id, .. } => id,
         }
     }
 }
@@ -136,6 +143,16 @@ impl EventSourcedActor for Counter {
             CounterCmd::Hold { reply, .. } => {
                 self.held.push(reply);
                 CommandEffect::none()
+            }
+            CounterCmd::GetChecked { reply, .. } => {
+                let value = state.value;
+                CommandEffect::none().and_confirm(move |check| {
+                    if check.is_ok() {
+                        let _ = reply.send(value);
+                    }
+                    // Dropped otherwise: the caller fails rather than reads a
+                    // history that has moved on.
+                })
             }
         }
     }
@@ -1174,4 +1191,47 @@ async fn await_not_serving(cluster: &TestCluster, index: usize) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("node {index} never stood down");
+}
+
+/// #37: a displaced host answers plain reads from memory until it notices —
+/// that is the documented trade — but a *checked* read refuses, because it
+/// makes the journal confirm the log has not moved before answering.
+///
+/// Opt-in per call site: nothing here slows the reads that do not ask.
+#[tokio::test]
+async fn a_displaced_host_refuses_a_checked_read() {
+    let cluster = TestCluster::of_size(3).await;
+    let id = "checked";
+    let pid = PersistenceId::new("counter", id);
+
+    let host = cluster.host_of(id);
+    let actor = cluster.system(host).shard_actor_of::<Counter>();
+    actor.tell(inc(id, 1)).await.unwrap();
+    settle().await;
+    assert_eq!(value_at_host(&cluster, id).await, 1);
+
+    // Somebody else appends, so the instance's memory is now history.
+    let ten = serde_json::to_vec(&Incremented(10)).unwrap();
+    cluster.journal.persist(&pid, &[ten], 1).await.unwrap();
+
+    // A plain read still answers 1, from memory. The window this leaves open
+    // is exactly what the checked read exists for.
+    assert_eq!(actor.ask(get(id)).await.unwrap(), 1);
+
+    // The checked read catches it: the empty conditional append conflicts and
+    // the caller fails now, rather than acting on a stale answer.
+    let checked = actor
+        .ask(|reply| CounterCmd::GetChecked {
+            id: id.to_owned(),
+            reply,
+        })
+        .await;
+    assert!(
+        checked.is_err(),
+        "a checked read on a displaced host answered: {checked:?}"
+    );
+
+    // And the conflict retired the stale instance, so the next read is served
+    // by a fresh recovery of the real log: 1 + 10.
+    assert_eq!(value_at_host(&cluster, id).await, 11);
 }
