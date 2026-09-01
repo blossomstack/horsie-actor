@@ -251,6 +251,7 @@ mod tests {
             type_name: type_name.into(),
             message_id: 1,
             payload: payload.to_vec(),
+            replies: Vec::new(),
         })
     }
 

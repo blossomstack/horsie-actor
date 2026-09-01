@@ -737,6 +737,7 @@ async fn a_redelivered_command_is_applied_once() {
         type_name: TYPE.to_owned(),
         message_id: 42,
         payload,
+        replies: Vec::new(),
     };
     cluster
         .system(host)
@@ -1174,4 +1175,192 @@ async fn await_not_serving(cluster: &TestCluster, index: usize) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("node {index} never stood down");
+}
+
+// ------------------------------------------------------- two different builds
+
+/// One build's idea of the "probe" type.
+#[derive(Serialize, Deserialize)]
+enum ProbeCmd {
+    Ask { id: String, reply: ReplyTo<i64> },
+}
+
+struct Probe;
+
+#[async_trait]
+impl horsie_actor::Actor for Probe {
+    type Command = ProbeCmd;
+    async fn handle(
+        &mut self,
+        cmd: ProbeCmd,
+        _ctx: &mut ActorContext<ProbeCmd>,
+    ) -> horsie_actor::Flow {
+        let ProbeCmd::Ask { reply, .. } = cmd;
+        let _ = reply.send(1);
+        horsie_actor::Flow::Continue
+    }
+}
+
+impl Shard for Probe {
+    type Command = ProbeCmd;
+    type EntityId = String;
+    type ShardId = String;
+    const TYPE: &'static str = "probe";
+
+    fn entity_id(cmd: &ProbeCmd) -> String {
+        let ProbeCmd::Ask { id, .. } = cmd;
+        id.clone()
+    }
+    fn shard_id(cmd: &ProbeCmd) -> String {
+        Self::entity_id(cmd)
+    }
+}
+
+/// Another build's idea of the same type: registered under the same name, and
+/// refusing everything the first one encodes.
+#[derive(Serialize, Deserialize)]
+struct StrictCmd {
+    id: String,
+    count: u64,
+}
+
+struct Strict;
+
+#[async_trait]
+impl horsie_actor::Actor for Strict {
+    type Command = StrictCmd;
+    async fn handle(
+        &mut self,
+        _cmd: StrictCmd,
+        _ctx: &mut ActorContext<StrictCmd>,
+    ) -> horsie_actor::Flow {
+        horsie_actor::Flow::Continue
+    }
+}
+
+impl Shard for Strict {
+    type Command = StrictCmd;
+    type EntityId = String;
+    type ShardId = String;
+    const TYPE: &'static str = "probe";
+
+    fn entity_id(cmd: &StrictCmd) -> String {
+        cmd.id.clone()
+    }
+    fn shard_id(cmd: &StrictCmd) -> String {
+        cmd.id.clone()
+    }
+}
+
+/// Two nodes running different builds: node 1 registers [`Probe`]; node 2
+/// registers whatever `register_second` says — a skewed type, or nothing.
+async fn skewed_pair(
+    register_second: impl Fn(&ActorSystem),
+) -> (Vec<ActorSystem>, Vec<Arc<ClusterNode>>) {
+    let net = horsie_actor::InProcessNetwork::new();
+    let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+    let members = vec![NodeId(1), NodeId(2)];
+
+    let mut systems = Vec::new();
+    let mut nodes = Vec::new();
+    for id in &members {
+        let node = ClusterNode::start(
+            ClusterConfig {
+                local: *id,
+                bootstrap: members.clone(),
+                liveness_window: Duration::from_millis(600),
+            },
+            Arc::new(net.node(*id)),
+            RaftStore::in_memory_unsafe(),
+        )
+        .await
+        .expect("raft should start");
+        let system = ActorSystem::clustered(journal.clone(), node.clone());
+        if id.0 == 1 {
+            system
+                .shard::<Probe>()
+                .register(|_sys, _entity| Probe)
+                .expect("probe should register");
+        } else {
+            register_second(&system);
+        }
+        spawn_dispatch_loop(&system, &node);
+        systems.push(system);
+        nodes.push(node);
+    }
+
+    for _ in 0..200 {
+        let serving: Vec<_> = nodes.iter().filter(|n| n.serving()).collect();
+        let sets: Vec<Vec<NodeId>> = serving.iter().map(|n| n.live_members()).collect();
+        let agreed = sets
+            .first()
+            .is_some_and(|first| first.len() == 2 && sets.iter().all(|s| s == first));
+        if serving.len() == 2 && agreed {
+            return (systems, nodes);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the pair never settled on a leader and a live set");
+}
+
+/// An id whose shard node 2 owns, so a send from node 1 has to cross.
+fn owned_by_second(nodes: &[Arc<ClusterNode>]) -> String {
+    an_id("skew", |id| {
+        nodes[0].owner_of("probe", id) == Some(NodeId(2))
+    })
+    .expect("some id must land on node 2")
+}
+
+/// #44: a payload the receiving node cannot decode fails its caller rather
+/// than stranding it.
+///
+/// The receiver never materialises a `ReplyTo`, so no `Drop` can report back;
+/// the envelope's own copy of the reply addresses is what lets it answer
+/// "undeliverable" anyway. Before that copy existed this `ask` waited forever.
+#[tokio::test]
+async fn a_command_the_receiver_cannot_decode_fails_its_caller() {
+    let (systems, nodes) = skewed_pair(|system| {
+        system
+            .shard::<Strict>()
+            .register(|_sys, _entity| Strict)
+            .expect("strict should register");
+    })
+    .await;
+    let id = owned_by_second(&nodes);
+
+    let asked = tokio::time::timeout(
+        Duration::from_secs(10),
+        systems[0]
+            .shard_actor_of::<Probe>()
+            .ask(|reply| ProbeCmd::Ask { id, reply }),
+    )
+    .await
+    .expect("the caller was left waiting forever on a payload that would not decode");
+
+    assert!(
+        asked.is_err(),
+        "an undecodable command somehow produced an answer: {asked:?}"
+    );
+}
+
+/// The same stranding through the other pre-decode failure: the receiving node
+/// has never heard of the shard type at all.
+#[tokio::test]
+async fn a_command_for_an_unregistered_type_fails_its_caller() {
+    let (systems, nodes) = skewed_pair(|_system| {}).await;
+    let id = owned_by_second(&nodes);
+
+    let asked = tokio::time::timeout(
+        Duration::from_secs(10),
+        systems[0]
+            .shard_actor_of::<Probe>()
+            .ask(|reply| ProbeCmd::Ask { id, reply }),
+    )
+    .await
+    .expect("the caller was left waiting forever on a type the receiver has never seen");
+
+    assert!(
+        asked.is_err(),
+        "a command nobody could take somehow produced an answer: {asked:?}"
+    );
 }

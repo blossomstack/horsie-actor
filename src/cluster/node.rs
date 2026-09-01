@@ -319,6 +319,7 @@ impl ClusterNode {
         type_name: &str,
         shard_id: &str,
         payload: Vec<u8>,
+        replies: Vec<crate::envelope::ReplyAddress>,
         message_id: u128,
     ) -> Result<(), TransportError> {
         let mut last = None;
@@ -332,6 +333,7 @@ impl ClusterNode {
                 type_name: type_name.to_owned(),
                 message_id,
                 payload: payload.clone(),
+                replies: replies.clone(),
             };
             match self.transport.send(owner, Message::Command(env)).await {
                 Ok(()) => return Ok(()),

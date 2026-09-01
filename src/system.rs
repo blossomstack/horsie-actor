@@ -657,12 +657,21 @@ impl ActorSystem {
             .wire::<S::Command>()
             .ok_or(TellError::Undeliverable)?;
         // Encoded inside the router context, which is what registers any reply
-        // handle in the command against this node before it leaves.
+        // handle in the command against this node before it leaves. The
+        // capture collects each handle's address so it can ride on the
+        // envelope, readable by a receiver whose decode of the payload fails.
         let router: Arc<dyn crate::reply::ReplyRouter> = cluster.clone();
-        let payload = crate::reply::with_router(router, || (wire.encode)(&cmd))
-            .ok_or(TellError::Undeliverable)?;
+        let (payload, replies) =
+            crate::reply::with_router_capturing(router, || (wire.encode)(&cmd));
+        let payload = payload.ok_or(TellError::Undeliverable)?;
         cluster
-            .send(S::TYPE, &shard_id, payload, cluster.next_message_id())
+            .send(
+                S::TYPE,
+                &shard_id,
+                payload,
+                replies,
+                cluster.next_message_id(),
+            )
             .await
             .map_err(|_| TellError::Undeliverable)
     }
@@ -753,7 +762,14 @@ impl ActorSystem {
                 return Ok(());
             }
         };
-        self.require_serving()?;
+        if let Err(refused) = self.require_serving() {
+            // Refused before the payload was ever read, so the reply handles in
+            // it were never materialised — nothing will fail their callers from
+            // a `Drop`. The envelope's own copy of their addresses is what lets
+            // this node say so instead of leaving them waiting.
+            self.abandon_replies(&env.replies);
+            return Err(refused.into());
+        }
         // A repeat is a success, not a failure: the sender retried because it
         // could not tell "lost" from "slow", and the answer to both is that the
         // command has already been applied. Ahead of the decode below, and it
@@ -772,9 +788,35 @@ impl ActorSystem {
         // Which actor is in the payload, so the type's own receiver decodes
         // first and takes it from there.
         let Some(receive) = self.inner.receiver(&env.type_name) else {
+            // Same situation as the decode failure below: the payload never
+            // became a command, so only the envelope knows who was waiting.
+            self.abandon_replies(&env.replies);
             return Err(DispatchError::UnknownShardType(env.type_name));
         };
-        receive(self.clone(), env.message_id, env.payload).await
+        let replies = env.replies;
+        let outcome = receive(self.clone(), env.message_id, env.payload).await;
+        if matches!(outcome, Err(DispatchError::Decode { .. })) {
+            // The one hole the reply guarantee had: no value, so no `ReplyTo`,
+            // so no `Drop` to report back — a version skew between nodes left
+            // its caller waiting forever. Every failure *after* the decode is
+            // already covered by the decoded handles being dropped.
+            self.abandon_replies(&replies);
+        }
+        outcome
+    }
+
+    /// Tell every caller listed on an envelope that no answer is coming.
+    ///
+    /// For the failures where the payload never became a command. A dropped
+    /// command's own handles report back from their `Drop`; these are the
+    /// callers no handle was ever materialised for.
+    fn abandon_replies(&self, replies: &[crate::envelope::ReplyAddress]) {
+        let Some(cluster) = &self.inner.cluster else {
+            return;
+        };
+        for reply in replies {
+            crate::reply::ReplyRouter::abandon(&**cluster, reply.origin, reply.correlation);
+        }
     }
 }
 
@@ -1486,6 +1528,7 @@ mod tests {
             type_name: type_name.to_owned(),
             message_id,
             payload,
+            replies: Vec::new(),
         })
     }
 }

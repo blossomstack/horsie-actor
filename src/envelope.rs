@@ -61,4 +61,23 @@ pub struct Envelope {
     pub message_id: u128,
     /// The encoded command.
     pub payload: Vec<u8>,
+    /// Every reply handle inside `payload`, by address.
+    ///
+    /// A copy, and the one the no-second-copy rule above tolerates, because it
+    /// exists for exactly the moment the payload's own copy is unreadable: a
+    /// receiver that cannot decode the command must still tell the callers
+    /// waiting inside it that no answer is coming, and the correlation ids are
+    /// otherwise sealed in the bytes that would not decode. Never consulted
+    /// when the decode succeeds — the decoded handles answer for themselves.
+    pub replies: Vec<ReplyAddress>,
+}
+
+/// Where one reply handle leads back to: the node that registered the waiting
+/// caller, and the correlation id it minted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyAddress {
+    /// The node the caller is waiting on.
+    pub origin: NodeId,
+    /// Which caller, in that node's waiting table.
+    pub correlation: u128,
 }

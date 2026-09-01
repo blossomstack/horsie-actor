@@ -431,6 +431,7 @@ mod tests {
             type_name: "counter".into(),
             message_id: 1,
             payload: payload.to_vec(),
+            replies: Vec::new(),
         })
     }
 

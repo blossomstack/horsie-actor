@@ -1,4 +1,4 @@
-use crate::envelope::NodeId;
+use crate::envelope::{NodeId, ReplyAddress};
 use parking_lot::Mutex;
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -60,6 +60,14 @@ thread_local! {
     /// encode knows which. Akka does exactly this, for exactly this reason.
     static ROUTER: std::cell::RefCell<Option<Arc<dyn ReplyRouter>>> =
         const { std::cell::RefCell::new(None) };
+
+    /// The reply handles encoded so far, collected only while a capture is on.
+    ///
+    /// What lets an envelope carry its handles' addresses outside the payload —
+    /// which a receiver needs exactly when the payload will not decode, since
+    /// the payload's own copy is sealed inside the bytes that failed.
+    static CAPTURED: std::cell::RefCell<Option<Vec<ReplyAddress>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f` with `router` available to any [`ReplyTo`] encoded or decoded inside it.
@@ -73,8 +81,38 @@ pub(crate) fn with_router<T>(router: Arc<dyn ReplyRouter>, f: impl FnOnce() -> T
     out
 }
 
+/// [`with_router`], also collecting the address of every reply handle `f`
+/// encodes.
+///
+/// The encode path uses this so the addresses can ride on the envelope beside
+/// the payload. Both kinds of handle are collected: one registered here, and
+/// one being forwarded on — a forwarded command that fails to decode strands
+/// its original caller just the same.
+pub(crate) fn with_router_capturing<T>(
+    router: Arc<dyn ReplyRouter>,
+    f: impl FnOnce() -> T,
+) -> (T, Vec<ReplyAddress>) {
+    let previous = CAPTURED.with(|slot| slot.borrow_mut().replace(Vec::new()));
+    let out = with_router(router, f);
+    let captured = CAPTURED
+        .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), previous).unwrap_or_default());
+    (out, captured)
+}
+
 fn router() -> Option<Arc<dyn ReplyRouter>> {
     ROUTER.with(|slot| slot.borrow().clone())
+}
+
+/// Record one encoded handle's address, if a capture is on.
+fn capture(origin: NodeId, correlation: u128) {
+    CAPTURED.with(|slot| {
+        if let Some(list) = slot.borrow_mut().as_mut() {
+            list.push(ReplyAddress {
+                origin,
+                correlation,
+            });
+        }
+    });
 }
 
 /// Where an actor sends the answer to a request.
@@ -256,6 +294,7 @@ impl<R: DeserializeOwned + Send + 'static> Serialize for ReplyTo<R> {
             },
         };
         let encoded = wire.serialize(serializer)?;
+        capture(wire.origin, wire.correlation);
 
         // Only now, once the handle is genuinely on its way, does this one stop
         // being responsible for the caller. Disarming before the encode
@@ -538,6 +577,58 @@ mod tests {
         (deregister.lock().take().unwrap())();
 
         assert_eq!(asking.forgotten.lock().as_slice(), [1]);
+    }
+
+    /// The capture collects the address of every handle an encode sends out —
+    /// a fresh one registered here and one being forwarded on — which is what
+    /// lets an envelope name its waiting callers outside the payload. A
+    /// receiver needs those exactly when the payload will not decode.
+    #[tokio::test]
+    async fn encoding_under_capture_collects_every_handle_address() {
+        let asking = FakeRouter::new(1);
+        let middle = FakeRouter::new(2);
+
+        // A handle that has already crossed once, now held by node 2.
+        let (original, _rx) = ReplyTo::<i32>::channel();
+        let bytes = with_router(asking, || serde_json::to_vec(&original)).unwrap();
+        let forwarded: ReplyTo<i32> =
+            with_router(middle.clone(), || serde_json::from_slice(&bytes)).unwrap();
+
+        // A fresh local handle, encoded in the same command.
+        let (fresh, _rx2) = ReplyTo::<i32>::channel();
+
+        let (encoded, captured) =
+            with_router_capturing(middle, || serde_json::to_vec(&(&fresh, &forwarded)));
+        assert!(encoded.is_ok());
+
+        assert_eq!(
+            captured,
+            vec![
+                // The fresh handle, registered against node 2 as it left.
+                ReplyAddress {
+                    origin: NodeId(2),
+                    correlation: 1,
+                },
+                // The forwarded one still points at the original asker.
+                ReplyAddress {
+                    origin: NodeId(1),
+                    correlation: 1,
+                },
+            ]
+        );
+    }
+
+    /// A capture sees only its own encode: one that ends leaves nothing behind
+    /// for the next.
+    #[tokio::test]
+    async fn a_capture_is_scoped_to_its_own_encode() {
+        let asking = FakeRouter::new(1);
+        let (first, _rx) = ReplyTo::<i32>::channel();
+        let (_, captured) = with_router_capturing(asking.clone(), || serde_json::to_vec(&first));
+        assert_eq!(captured.len(), 1);
+
+        let (_, captured) = with_router_capturing(asking, || serde_json::to_vec(&7));
+        assert!(captured.is_empty(), "a later capture saw an earlier handle");
     }
 
     /// Encoding the same handle twice would leave two callers waiting on one

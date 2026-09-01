@@ -62,7 +62,7 @@ pub use cluster::{
     ClusterConfig, ClusterNode, Dedup, LiveSet, Membership, NodeIdx, PlacementTable, RaftStore,
     serve_consensus,
 };
-pub use envelope::{Envelope, Message, NodeId, Reply};
+pub use envelope::{Envelope, Message, NodeId, Reply, ReplyAddress};
 pub use error::{JournalError, TellError};
 pub use journal::{InMemoryJournal, Journal, JournalResult};
 // Re-exported so a caller can read `ClusterNode::raft().metrics()` without
