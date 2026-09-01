@@ -7,12 +7,14 @@ use crate::journal::{InMemoryJournal, Journal};
 use crate::path::ActorPath;
 use crate::persistent::Persistent;
 use crate::runtime::{ActorRef, Link, check_name, spawn_at};
-use crate::shard::{EntityContext, Shard, address_of, context_of, region_of};
+use crate::shard::{
+    EntityContext, PlacedShard, Shard, address_of, context_of, region_of, shard_root_of,
+};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -182,8 +184,7 @@ struct Entry {
 pub(crate) struct SystemInner {
     pub(crate) journal: Arc<dyn Journal>,
     /// What is known about each registered shard type, by `Shard::TYPE` — which
-    /// is the third segment of every shard address, and the only part of one
-    /// this node ever reads.
+    /// is the third segment of every shard address.
     shards: Mutex<HashMap<&'static str, Registered>>,
     cluster: Option<Arc<ClusterNode>>,
     /// Message ids this node has already handled.
@@ -292,6 +293,47 @@ impl SystemInner {
         }
     }
 
+    /// Stop every shard this node is running that no longer hashes to it.
+    ///
+    /// Placement moving is the whole point of placement, and until this existed
+    /// only half of the move happened: the new host started an instance from the
+    /// journal on the next message, and the old one was simply left running.
+    /// A leftover holds its registry row and its journal handle for the life of
+    /// the process, answers anything that still reaches it locally from state
+    /// that has moved on, and learns it is not the host any more only if it
+    /// writes — as a fenced append in the middle of a turn, which is the worst
+    /// place to find out.
+    ///
+    /// Stopping is not a handover. The new host recovers from the journal, so an
+    /// in-flight turn here is lost — the same loss standing down already
+    /// imposes, and a second rule for this case would be worse than the loss.
+    ///
+    /// Two nodes apply a new live set moments apart, so for a beat the new owner
+    /// may have started before the old one stops. That window is not closed
+    /// here and is not meant to be: the fence covers the writes in it, and this
+    /// is what makes it end.
+    pub(crate) async fn release_vacated_shards(&self) {
+        let Some(cluster) = &self.cluster else {
+            return;
+        };
+        // Read the registry, then ask placement — never both at once. The two
+        // locks are never held together anywhere else, and this is not the
+        // place to introduce an order for them.
+        let running: BTreeSet<PlacedShard> = {
+            let live = self.live.lock();
+            live.keys().filter_map(shard_root_of).collect()
+        };
+        let local = cluster.local();
+        for shard in running {
+            if cluster.owner_of(&shard.type_name, &shard.shard_id) == Some(local) {
+                continue;
+            }
+            let root = shard.root();
+            tracing::info!(shard = %root, "placement moved this shard away; stopping it here");
+            self.stop_at(&root).await;
+        }
+    }
+
     /// Take one actor out of the registry, ask it to stop, and wait for it.
     async fn halt(&self, path: &ActorPath) -> bool {
         let Some(entry) = self.live.lock().remove(path) else {
@@ -374,18 +416,27 @@ impl ActorSystem {
                 }
             });
         }
-        Self {
-            inner: Arc::new(SystemInner {
-                journal,
-                shards: Mutex::new(HashMap::new()),
-                cluster,
-                seen: Mutex::new(Dedup::with_capacity(DEDUP_WINDOW)),
-                live: Mutex::new(HashMap::new()),
-                wires: Mutex::new(HashMap::new()),
-                stand_down: rx,
-                _stand_down_tx: tx,
-            }),
+        let inner = Arc::new(SystemInner {
+            journal,
+            shards: Mutex::new(HashMap::new()),
+            cluster: cluster.clone(),
+            seen: Mutex::new(Dedup::with_capacity(DEDUP_WINDOW)),
+            live: Mutex::new(HashMap::new()),
+            wires: Mutex::new(HashMap::new()),
+            stand_down: rx,
+            _stand_down_tx: tx,
+        });
+        if let Some(cluster) = cluster {
+            // Not relayed into every actor the way stand-down is. Standing down
+            // stops everything and so is every actor's business; this is one
+            // sweep of the registry against placement, and no actor could
+            // answer it for itself — an actor does not know its own shard id.
+            tokio::spawn(watch_placement(
+                Arc::downgrade(&inner),
+                cluster.live_watch(),
+            ));
         }
+        Self { inner }
     }
 
     /// A system that hosts registered actors across a cluster.
@@ -824,6 +875,26 @@ impl<S: Shard> ShardOf<'_, S> {
             },
         );
         Ok(())
+    }
+}
+
+/// Sweep the registry whenever the live set moves.
+///
+/// A change to the live set is the only thing that can move a shard, since
+/// placement is a pure function of that set and the shard's ids — so this is
+/// the whole trigger, and between changes there is nothing to check.
+///
+/// Weak, so a system that has been dropped takes this with it rather than being
+/// kept alive by its own housekeeping.
+async fn watch_placement(
+    system: std::sync::Weak<SystemInner>,
+    mut live: tokio::sync::watch::Receiver<Vec<crate::envelope::NodeId>>,
+) {
+    while live.changed().await.is_ok() {
+        let Some(inner) = system.upgrade() else {
+            return;
+        };
+        inner.release_vacated_shards().await;
     }
 }
 

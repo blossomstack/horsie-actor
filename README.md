@@ -241,7 +241,7 @@ system.shard_actor_of::<SessionActor>()
 
 `Shard::entity_id` says which actor a command is for, and `Shard::shard_id` says which shard — and therefore which node. That second function is the whole placement policy: return the entity id for one shard per actor, or something coarser, like an account, to put a group on one machine. Actors live at `/system/shard/<type>/<shard>/<entity>`, and their own children live below them, local.
 
-Both ids are types of your choosing rather than strings — `Shard::EntityId` and `Shard::ShardId`. They only need `Display`, and only so that an actor this node hosts can be filed under a key: `/system/shard/<type>/<shard>/<entity>`. That address is local. It is not what placement decides over, it does not go on the wire, and nothing ever reads it back.
+Both ids are types of your choosing rather than strings — `Shard::EntityId` and `Shard::ShardId`. They only need `Display`, and only so that an actor this node hosts can be filed under a key: `/system/shard/<type>/<shard>/<entity>`. That address is local. It is not what placement decides over and it does not go on the wire. The one thing that reads it back is the sweep below, which needs to know which shards this node is currently running and asks the registry rather than keeping a second list of them.
 
 Identity comes off the command, in both directions. A send that starts here calls the extractors and has both ids; one that arrives from another node decodes the payload and calls the same two functions on it. An envelope carries the shard type, a deduplication key and the bytes — no address — so there is no second copy of an identity for routing to disagree with. An id is therefore free to carry structure a segment could not, such as an account alongside a session.
 
@@ -260,6 +260,8 @@ Three things, kept separate:
 Placement itself is rendezvous hashing over the shard id against the live members, computed identically everywhere without anyone being consulted. There is no shard count to choose up front, and losing a node moves only the shards that were on it.
 
 A node that cannot see a quorum stops: it refuses to start actors, stops the ones it is running, and drops their in-flight work. That bounds how long a displaced node keeps answering reads, which the fence cannot do because a read never writes.
+
+A node that *keeps* its quorum stops what it has lost. When the live set changes, every node sweeps the shards it is running and stops the ones that no longer hash to it — otherwise the new host starts an instance from the journal, which is the point of placement moving, and the old one is simply left holding a registry row and answering from state that has moved on. It is not a handover: the new host recovers the log, so an in-flight turn on the old one is lost, exactly as it is when a node stands down.
 
 `TcpTransport` carries both actor deliveries and consensus over one length-prefixed, authenticated connection. It authenticates the peer; it does not encrypt, so run it on a private network or through a TLS tunnel.
 

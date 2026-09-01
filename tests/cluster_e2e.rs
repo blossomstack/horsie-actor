@@ -10,7 +10,8 @@
 use async_trait::async_trait;
 use horsie_actor::{
     ActorContext, ActorPath, ActorSystem, ClusterConfig, ClusterNode, CommandEffect, Envelope,
-    EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, RaftStore, ReplyTo, Shard,
+    EventSourcedActor, InMemoryJournal, Journal, NodeId, PersistenceId, PlacementTable, RaftStore,
+    ReplyTo, Shard,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -1060,6 +1061,109 @@ async fn an_actor_spawned_before_the_first_election_survives() {
         actor.tell(inc("early", 1)).await.is_ok(),
         "an actor spawned before the first election was killed on sight"
     );
+}
+
+/// A node that loses a shard stops running it.
+///
+/// The half of a move that nothing used to do. Placement moving is the point —
+/// the new host starts the instance from the journal on the next message — but
+/// the *old* host was simply left, holding a registry row and a journal handle
+/// for the life of the process and answering anything that still reached it
+/// locally from state that had moved on somewhere else. Nothing stopped it,
+/// because the only thing that stopped a hosted actor was the stand-down signal
+/// and this node never lost quorum.
+///
+/// A healed partition is what moves a shard *onto* a serving node here: losing
+/// a member only moves what was on it, so the vacating side is only ever
+/// exercised by the cluster growing back.
+#[tokio::test]
+async fn a_node_that_loses_a_shard_stops_running_it() {
+    let cluster = TestCluster::of_size(3).await;
+    let (one, two, three) = (NodeId(1), NodeId(2), NodeId(3));
+    let whole = table_over(&[one, two, three]);
+    let without_one = table_over(&[two, three]);
+
+    // An instance that lives on node 1 while the cluster is whole, and so moves
+    // away and back as node 1 leaves and returns.
+    let mover = an_id("mover", |id| whole.owner_of(TYPE, id) == Some(one))
+        .expect("some id must land on node 1");
+    let taker_id = without_one
+        .owner_of(TYPE, &mover)
+        .expect("two live members must host it");
+    // One that is on the taker either way, so the sweep has something it must
+    // leave alone: this is what separates "stops what moved" from "stops
+    // everything the moment placement is mentioned".
+    let keeper = an_id("keeper", |id| {
+        whole.owner_of(TYPE, id) == Some(taker_id)
+            && without_one.owner_of(TYPE, id) == Some(taker_id)
+    })
+    .expect("some id must stay on the taker across the change");
+
+    let taker = cluster
+        .nodes
+        .iter()
+        .position(|n| n.local() == taker_id)
+        .expect("the taker must be one of the nodes");
+
+    cluster.kill(0).await;
+
+    // Both instances start on the taker: `mover` because node 1 is gone, and
+    // `keeper` because that is where it belongs anyway.
+    let actor = cluster.system(taker).shard_actor_of::<Counter>();
+    actor.tell(inc(&mover, 5)).await.unwrap();
+    actor.tell(inc(&keeper, 9)).await.unwrap();
+    settle().await;
+    assert_eq!(
+        cluster.system(taker).hosted(),
+        2,
+        "the taker should be running both instances while node 1 is away"
+    );
+
+    // The partition heals and node 1 is live again, so `mover` hashes back to
+    // it. Nothing tells the taker; it has to notice the live set change.
+    cluster.net.restore(one);
+    cluster.await_settled(3).await;
+
+    for _ in 0..400 {
+        if cluster.system(taker).hosted() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        cluster.system(taker).hosted(),
+        1,
+        "the taker kept running a shard that had hashed away from it"
+    );
+
+    // What it kept is the one that is still its own, and that one is untouched
+    // rather than merely present: it answers from the state it already had.
+    assert_eq!(cluster.host_of(&keeper), taker);
+    assert_eq!(value_at_host(&cluster, &keeper).await, 9);
+
+    // And the one it gave up carries on where it left off, on its new host,
+    // recovered from the shared journal.
+    assert_eq!(cluster.host_of(&mover), 0);
+    assert_eq!(value_at_host(&cluster, &mover).await, 5);
+}
+
+/// A counter id named `prefix-n` that `wanted` accepts.
+///
+/// Placement is a pure function of the live set and the ids, so a test can work
+/// out where an instance will land for any membership it likes — including one
+/// no node currently has — rather than asking a running cluster and taking
+/// whatever it says.
+fn an_id(prefix: &str, wanted: impl Fn(&str) -> bool) -> Option<String> {
+    (0..256)
+        .map(|i| format!("{prefix}-{i}"))
+        .find(|id| wanted(id))
+}
+
+/// A placement table over exactly `members`.
+fn table_over(members: &[NodeId]) -> PlacementTable {
+    let mut table = PlacementTable::new();
+    table.set_members(members.iter().copied());
+    table
 }
 
 async fn await_not_serving(cluster: &TestCluster, index: usize) {
