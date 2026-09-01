@@ -80,6 +80,7 @@ mod tests {
             type_name: "counter".into(),
             message_id,
             payload: Vec::new(),
+            replies: Vec::new(),
         }
     }
 
