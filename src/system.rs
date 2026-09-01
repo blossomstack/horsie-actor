@@ -1388,6 +1388,7 @@ mod tests {
             crate::cluster::ClusterConfig {
                 local: crate::envelope::NodeId(1),
                 bootstrap: (1..=3).map(crate::envelope::NodeId).collect(),
+                addrs: std::collections::HashMap::new(),
                 liveness_window: std::time::Duration::from_millis(600),
             },
             Arc::new(network.node(crate::envelope::NodeId(1))),

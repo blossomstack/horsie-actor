@@ -50,7 +50,14 @@ pub struct TcpConfig {
     pub local: NodeId,
     /// Where this node listens.
     pub bind: SocketAddr,
-    /// Where each peer listens.
+    /// Where each peer listens — a bootstrap seed, not the roster.
+    ///
+    /// Once the cluster's membership carries addresses,
+    /// [`learn_peer`](crate::Transport::learn_peer) keeps the live table in
+    /// step with it, so a node added at runtime is dialable without a config
+    /// rollout. A brand-new node joining an existing cluster may leave this
+    /// empty: the leader dials *it*, and it learns everyone else from the
+    /// membership it is sent.
     pub peers: HashMap<NodeId, SocketAddr>,
     /// Shared secret. Both ends prove they know it before any envelope moves.
     ///
@@ -93,7 +100,9 @@ impl Peer {
 /// connection so the next send redials rather than reusing a corpse.
 pub struct TcpTransport {
     local: NodeId,
-    peers: HashMap<NodeId, SocketAddr>,
+    /// Seeded from configuration, then kept in step with the membership via
+    /// [`Transport::learn_peer`].
+    peers: Mutex<HashMap<NodeId, SocketAddr>>,
     secret: Vec<u8>,
     outbound: tokio::sync::Mutex<HashMap<NodeId, Arc<Peer>>>,
     inbox: Mutex<Option<mpsc::Receiver<Message>>>,
@@ -112,7 +121,7 @@ impl TcpTransport {
 
         let transport = Arc::new(Self {
             local: config.local,
-            peers: config.peers,
+            peers: Mutex::new(config.peers),
             secret: config.secret.clone(),
             outbound: tokio::sync::Mutex::new(HashMap::new()),
             inbox: Mutex::new(Some(rx)),
@@ -142,15 +151,19 @@ impl TcpTransport {
         Ok(transport)
     }
 
-    /// The address this node listens on, after binding.
+    /// Every peer this node currently knows how to dial.
     #[must_use]
-    pub fn peers(&self) -> &HashMap<NodeId, SocketAddr> {
-        &self.peers
+    pub fn peers(&self) -> HashMap<NodeId, SocketAddr> {
+        self.peers.lock().clone()
     }
 
     /// The cached connection to `to`, dialling and handshaking if there is none.
     async fn peer(&self, to: NodeId) -> Result<Arc<Peer>, TransportError> {
-        let addr = *self.peers.get(&to).ok_or(TransportError::Unreachable(to))?;
+        let addr = *self
+            .peers
+            .lock()
+            .get(&to)
+            .ok_or(TransportError::Unreachable(to))?;
         let mut cache = self.outbound.lock().await;
         if let Some(existing) = cache.get(&to) {
             return Ok(existing.clone());
@@ -414,6 +427,27 @@ impl Transport for TcpTransport {
     fn local_id(&self) -> NodeId {
         self.local
     }
+
+    /// Record where `node` listens, so it can be dialled from now on.
+    ///
+    /// An address that will not parse is ignored with a log line rather than
+    /// evicting a working entry — the membership's copy may be for a transport
+    /// this node is not running. An existing cached connection is left alone:
+    /// if the peer really moved, the next failed write drops it and the redial
+    /// uses the address recorded here.
+    fn learn_peer(&self, node: NodeId, addr: &str) {
+        if addr.is_empty() {
+            return;
+        }
+        match addr.parse::<SocketAddr>() {
+            Ok(parsed) => {
+                self.peers.lock().insert(node, parsed);
+            }
+            Err(e) => {
+                tracing::debug!(%node, addr, error = %e, "ignoring an unusable peer address");
+            }
+        }
+    }
 }
 #[cfg(test)]
 #[allow(
@@ -515,6 +549,56 @@ mod tests {
         let (a, _b) = pair(b"shared", b"shared").await;
         let err = a.send(NodeId(99), env(b"x")).await.unwrap_err();
         assert!(matches!(err, TransportError::Unreachable(NodeId(99))));
+    }
+
+    /// A peer learned at runtime is dialable — the TCP half of growing a
+    /// cluster without a config rollout. Node 1 starts knowing nobody; the
+    /// address arrives the way membership delivers one, and the next send
+    /// dials it.
+    #[tokio::test]
+    async fn a_peer_learned_at_runtime_is_dialable() {
+        let addr_a = free_port().await;
+        let addr_b = free_port().await;
+        let a = TcpTransport::bind(TcpConfig {
+            local: NodeId(1),
+            bind: addr_a,
+            peers: HashMap::new(),
+            secret: b"shared".to_vec(),
+        })
+        .await
+        .unwrap();
+        let b = TcpTransport::bind(TcpConfig {
+            local: NodeId(2),
+            bind: addr_b,
+            peers: HashMap::new(),
+            secret: b"shared".to_vec(),
+        })
+        .await
+        .unwrap();
+        let mut inbox = b.incoming().unwrap();
+
+        assert!(
+            a.send(NodeId(2), env(b"early")).await.is_err(),
+            "an unlearned peer should be unreachable"
+        );
+
+        a.learn_peer(NodeId(2), &addr_b.to_string());
+        a.send(NodeId(2), env(b"hello")).await.unwrap();
+        assert_eq!(delivered(inbox.recv().await.unwrap()).payload, b"hello");
+    }
+
+    /// An unusable address is ignored rather than evicting a working entry —
+    /// the membership's copy may be for a transport this node is not running.
+    #[tokio::test]
+    async fn an_unusable_address_does_not_evict_a_working_peer() {
+        let (a, b) = pair(b"shared", b"shared").await;
+        let mut inbox = b.incoming().unwrap();
+
+        a.learn_peer(NodeId(2), "");
+        a.learn_peer(NodeId(2), "not-an-address");
+
+        a.send(NodeId(2), env(b"still")).await.unwrap();
+        assert_eq!(delivered(inbox.recv().await.unwrap()).payload, b"still");
     }
 
     /// Answer every request with the request bytes reversed, so a test can tell

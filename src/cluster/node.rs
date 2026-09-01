@@ -8,7 +8,7 @@ use crate::transport::{Transport, TransportError};
 use openraft::type_config::async_runtime::watch::WatchReceiver;
 use openraft::{Instant, Raft, ServerState};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -47,7 +47,21 @@ pub struct ClusterConfig {
     /// Used **once**, when the Raft store is empty. After that membership lives
     /// in the log, so this list stops being consulted and cannot drift away
     /// from reality — which is what a peer list maintained by hand does.
+    ///
+    /// **Empty means "join by invitation":** the node starts, answers
+    /// consensus, and forms nothing — it becomes part of a cluster when a
+    /// serving member calls [`ClusterNode::add_member`] naming it. This is how
+    /// a cluster grows at runtime without a config rollout.
     pub bootstrap: Vec<NodeId>,
+    /// Where each bootstrap member listens, for transports that dial by
+    /// address. Empty entries (and an empty map) are fine for transports that
+    /// need none, like the in-process switchboard.
+    ///
+    /// These ride into the membership itself — openraft's `BasicNode.addr` —
+    /// so every later member learns them from the log rather than from its own
+    /// configuration, and a node added at runtime is dialable because it is a
+    /// member.
+    pub addrs: HashMap<NodeId, String>,
     /// How long a peer may go unacknowledged before the leader stops counting
     /// it as live.
     ///
@@ -64,6 +78,7 @@ impl ClusterConfig {
         Self {
             local,
             bootstrap: members,
+            addrs: HashMap::new(),
             liveness_window: Duration::from_secs(3),
         }
     }
@@ -166,11 +181,19 @@ impl ClusterNode {
         // would propose a membership that contradicts its own log.
         if raft.is_initialized().await? {
             tracing::debug!("joining an existing cluster from the local raft store");
+        } else if config.bootstrap.is_empty() {
+            // Join by invitation: form nothing, answer consensus, and wait for
+            // a member to call `add_member` naming this node. Initialising an
+            // empty membership here would found a cluster of nobody.
+            tracing::debug!("no bootstrap members; waiting to be added to a cluster");
         } else {
             let members: BTreeMap<NodeIdx, openraft::impls::BasicNode> = config
                 .bootstrap
                 .iter()
-                .map(|n| (n.0, openraft::impls::BasicNode::default()))
+                .map(|n| {
+                    let addr = config.addrs.get(n).cloned().unwrap_or_default();
+                    (n.0, openraft::impls::BasicNode { addr })
+                })
                 .collect();
             // A losing race is normal, not an error: every node bootstraps the
             // same member set, and the first one through wins.
@@ -256,6 +279,44 @@ impl ClusterNode {
     #[must_use]
     pub fn raft(&self) -> &Raft<Membership, RaftStore> {
         &self.raft
+    }
+
+    /// Add `node` to the running cluster: learner first, then voter.
+    ///
+    /// The other half of elastic membership. Consensus could already grow at
+    /// runtime; what could not was reachability — an address lived in each
+    /// node's configuration, so adding a member meant a config rollout. The
+    /// address now rides in the membership itself, which is what `addr` is
+    /// for: every member learns it from the log. `addr` may be empty for
+    /// transports that do not dial by address.
+    ///
+    /// The new node should be started with an **empty bootstrap**, so it forms
+    /// nothing and waits for exactly this call. Learner first is what makes
+    /// the promotion safe: the node is caught up before its vote counts.
+    ///
+    /// Must be called on the leader — like every membership change. A caller
+    /// that does not know which node leads can try each serving node until one
+    /// accepts; the others refuse quickly.
+    ///
+    /// # Errors
+    /// If this node is not the leader, the new node cannot be reached to catch
+    /// up, or leadership is lost mid-change.
+    pub async fn add_member(
+        &self,
+        node: NodeId,
+        addr: impl Into<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let addr = addr.into();
+        // Dialable before anything is proposed: replication to the newcomer is
+        // what `add_learner` blocks on, and it cannot start unreachable.
+        self.transport.learn_peer(node, &addr);
+        self.raft
+            .add_learner(node.0, openraft::impls::BasicNode { addr }, true)
+            .await?;
+        self.raft
+            .change_membership(openraft::ChangeMembers::AddVoterIds([node.0].into()), false)
+            .await?;
+        Ok(())
     }
 
     /// Which node should host one shard of one type.
@@ -496,6 +557,15 @@ async fn watch_cluster(node: Arc<ClusterNode>, liveness_window: Duration) {
         }
 
         let current = WatchReceiver::borrow_watched(&metrics).clone();
+
+        // Addresses ride in the membership, so the membership is where every
+        // node — the newcomer included — learns how to dial everyone else.
+        // Idempotent and cheap: a handful of map inserts per metrics tick.
+        for (idx, member) in current.membership_config.membership().nodes() {
+            if *idx != node.local.0 {
+                node.transport.learn_peer(NodeId(*idx), &member.addr);
+            }
+        }
 
         // Serving means "a quorum still has me". A follower asks whether it can
         // see a leader; cut off from one it campaigns and never wins, so this

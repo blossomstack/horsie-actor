@@ -85,6 +85,17 @@ pub trait Transport: Send + Sync + 'static {
 
     /// This node's own identity.
     fn local_id(&self) -> NodeId;
+
+    /// Teach this transport where `node` listens.
+    ///
+    /// Called with the address the cluster's membership carries, whenever it
+    /// carries one — which is what lets a node be dialled because it is a
+    /// member, rather than because every other node's configuration named it.
+    /// Static peer configuration becomes a bootstrap seed, not the roster.
+    ///
+    /// The default ignores it, for transports whose reachability is not
+    /// address-based: the in-process switchboard routes by node id alone.
+    fn learn_peer(&self, _node: NodeId, _addr: &str) {}
 }
 
 /// Both inbound queues for one attached node.
