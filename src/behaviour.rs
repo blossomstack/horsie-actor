@@ -32,6 +32,32 @@ pub enum StartError {
     Recovery(#[from] JournalError),
 }
 
+/// One command as the mailbox carries it: the command, plus the message id it
+/// arrived under when it came from another node.
+///
+/// The id is what a durable dedup window is keyed by. It rides beside the
+/// command rather than inside it because commands are consumer types — a
+/// runtime concern smuggled into every consumer's enum would be the wrong
+/// altitude for it.
+pub struct Delivery<C> {
+    /// The envelope's deduplication key — present only for a command that
+    /// arrived through cross-node dispatch. A local send is never retried by
+    /// the runtime, so it has nothing to deduplicate.
+    pub message_id: Option<u128>,
+    /// The command itself.
+    pub cmd: C,
+}
+
+impl<C> Delivery<C> {
+    /// A local delivery: no message id, nothing to deduplicate.
+    pub fn local(cmd: C) -> Self {
+        Self {
+            message_id: None,
+            cmd,
+        }
+    }
+}
+
 /// The bare mailbox contract: a command type, and one command handled at a time.
 ///
 /// Deliberately says nothing about persistence. Event sourcing is *one*
@@ -49,6 +75,29 @@ pub trait Actor: Send + Sized + 'static {
 
     /// Handle one command, then say whether to keep going.
     async fn handle(&mut self, cmd: Self::Command, ctx: &mut ActorContext<Self::Command>) -> Flow;
+
+    /// Take one delivery off the mailbox.
+    ///
+    /// The runtime's entry point, and the seam durable deduplication hangs on:
+    /// [`Persistent`] overrides this to drop a command whose message id its
+    /// recovered state has already applied, which is what makes a retry that
+    /// crosses a restart or a move land once. The default ignores the id and
+    /// hands the command to [`handle`](Self::handle) — a plain actor's dedup
+    /// is the node-scoped window in dispatch, and that is the honest limit of
+    /// it: an actor that recovers no state has nowhere to remember more, so a
+    /// command it takes must still be one whose second application is
+    /// survivable.
+    ///
+    /// Not meant to be overridden outside the runtime.
+    ///
+    /// [`Persistent`]: crate::Persistent
+    async fn deliver(
+        &mut self,
+        delivery: Delivery<Self::Command>,
+        ctx: &mut ActorContext<Self::Command>,
+    ) -> Flow {
+        self.handle(delivery.cmd, ctx).await
+    }
 
     /// Runs once before the first command is handled.
     ///

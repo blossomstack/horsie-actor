@@ -1,5 +1,5 @@
 use crate::actor::EventSourcedActor;
-use crate::behaviour::{Actor, Flow};
+use crate::behaviour::{Actor, Delivery, Flow};
 use crate::error::TellError;
 use crate::journal::Journal;
 use crate::path::{ActorPath, is_valid_name};
@@ -19,8 +19,9 @@ pub(crate) const MAILBOX_CAPACITY: usize = 64;
 /// whatever is at it right now, and it is replaced rather than repaired when the
 /// instance behind it goes away.
 pub(crate) enum Link<C> {
-    /// The actor's mailbox, in this process.
-    Local(mpsc::Sender<C>),
+    /// The actor's mailbox, in this process. Carries whole deliveries, so a
+    /// message id can ride beside a command all the way to the actor.
+    Local(mpsc::Sender<Delivery<C>>),
     /// A closure that encodes the command and ships it to whichever node hosts
     /// the actor. Built where `C: Serialize` is known, which is what keeps that
     /// bound off `ActorRef` itself — and off every caller that merely holds one.
@@ -61,12 +62,23 @@ impl<C> Link<C> {
     where
         C: Send + 'static,
     {
+        self.deliver(Delivery::local(cmd)).await
+    }
+
+    /// [`send`](Self::send), carrying the delivery's message id too.
+    ///
+    /// A remote link drops the id: the command is re-encoded and travels under
+    /// a fresh envelope, whose own id is what the next hop deduplicates by.
+    pub(crate) async fn deliver(&self, delivery: Delivery<C>) -> Result<(), (TellError, Option<C>)>
+    where
+        C: Send + 'static,
+    {
         match self {
             Link::Local(tx) => tx
-                .send(cmd)
+                .send(delivery)
                 .await
-                .map_err(|e| (TellError::MailboxClosed, Some(e.0))),
-            Link::Remote(send) => send(cmd).await.map_err(|e| (e, None)),
+                .map_err(|e| (TellError::MailboxClosed, Some(e.0.cmd))),
+            Link::Remote(send) => send(delivery.cmd).await.map_err(|e| (e, None)),
         }
     }
 }
@@ -319,7 +331,7 @@ impl<C> Link<C> {
 /// [`Persistent`]: crate::Persistent
 pub struct ActorContext<C> {
     pub(crate) inner: Arc<SystemInner>,
-    pub(crate) self_tx: mpsc::Sender<C>,
+    pub(crate) self_tx: mpsc::Sender<Delivery<C>>,
     pub(crate) path: ActorPath,
 }
 
@@ -454,7 +466,7 @@ pub(crate) fn check_name(name: &str) -> Result<(), ActorOfError> {
 /// [`Persistent`]: crate::Persistent
 pub(crate) async fn run_actor<A: Actor>(
     mut actor: A,
-    mut rx: mpsc::Receiver<A::Command>,
+    mut rx: mpsc::Receiver<Delivery<A::Command>>,
     mut ctx: ActorContext<A::Command>,
     mut stop: tokio::sync::watch::Receiver<bool>,
     ended: tokio::sync::watch::Sender<()>,
@@ -483,15 +495,15 @@ pub(crate) async fn run_actor<A: Actor>(
 /// Handle commands until something says to stop.
 async fn serve<A: Actor>(
     actor: &mut A,
-    rx: &mut mpsc::Receiver<A::Command>,
+    rx: &mut mpsc::Receiver<Delivery<A::Command>>,
     ctx: &mut ActorContext<A::Command>,
     stand_down: &mut tokio::sync::watch::Receiver<bool>,
     stop: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        let cmd = tokio::select! {
-            cmd = rx.recv() => match cmd {
-                Some(cmd) => cmd,
+        let delivery = tokio::select! {
+            delivery = rx.recv() => match delivery {
+                Some(delivery) => delivery,
                 None => return,
             },
             () = stood_down(stand_down) => return,
@@ -505,7 +517,7 @@ async fn serve<A: Actor>(
         // completed against a history that has moved on. A stop is treated the
         // same way rather than given a rule of its own.
         let flow = tokio::select! {
-            flow = actor.handle(cmd, ctx) => flow,
+            flow = actor.deliver(delivery, ctx) => flow,
             () = stood_down(stand_down) => return,
             () = asked_to_stop(stop) => return,
         };
