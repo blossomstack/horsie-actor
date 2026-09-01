@@ -14,6 +14,7 @@ use horsie_actor::{
     ReplyTo, Shard,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -206,6 +207,7 @@ impl TestCluster {
                 ClusterConfig {
                     local: *id,
                     bootstrap: members.clone(),
+                    addrs: HashMap::new(),
                     liveness_window: Duration::from_millis(600),
                 },
                 Arc::new(net.node(*id)),
@@ -266,6 +268,56 @@ impl TestCluster {
             .iter()
             .position(|n| n.owns(TYPE, id))
             .expect("some node must host it")
+    }
+
+    /// Grow the cluster by one node, at runtime, and wait until everyone has
+    /// applied the same enlarged live set.
+    ///
+    /// The join path a deployment would use: the new node starts with an
+    /// **empty bootstrap** — so it forms nothing — and a serving member admits
+    /// it with [`ClusterNode::add_member`], learner first, voter second.
+    /// Nothing is restarted and no configuration changes on the existing
+    /// nodes. Returns the new node's index.
+    async fn grow(&mut self) -> usize {
+        let id = NodeId(self.nodes.len() as u64 + 1);
+        let node = ClusterNode::start(
+            ClusterConfig {
+                local: id,
+                bootstrap: Vec::new(),
+                addrs: HashMap::new(),
+                liveness_window: Duration::from_millis(600),
+            },
+            Arc::new(self.net.node(id)),
+            RaftStore::in_memory_unsafe(),
+        )
+        .await
+        .expect("the joining node should start");
+        let system = ActorSystem::clustered(self.journal.clone(), node.clone());
+        system
+            .shard::<Counter>()
+            .register(|sys, entity| sys.persistent(Counter::new(&entity.entity_id)))
+            .expect("counter should register");
+        spawn_dispatch_loop(&system, &node);
+
+        // Only the leader can change membership, and this harness does not
+        // track which node that is — so ask each in turn until one accepts,
+        // exactly as an operator's tooling would.
+        let mut admitted = false;
+        'admitting: for _ in 0..200 {
+            for existing in &self.nodes {
+                if existing.add_member(id, "").await.is_ok() {
+                    admitted = true;
+                    break 'admitting;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(admitted, "no node would admit {id}");
+
+        self.systems.push(system);
+        self.nodes.push(node);
+        self.await_settled(self.nodes.len()).await;
+        self.nodes.len() - 1
     }
 
     /// Take a node off the network and wait for the survivors to agree it is
@@ -1040,6 +1092,7 @@ async fn an_actor_spawned_before_the_first_election_survives() {
         ClusterConfig {
             local: NodeId(1),
             bootstrap: members,
+            addrs: HashMap::new(),
             liveness_window: Duration::from_millis(600),
         },
         Arc::new(net.node(NodeId(1))),
@@ -1174,4 +1227,89 @@ async fn await_not_serving(cluster: &TestCluster, index: usize) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("node {index} never stood down");
+}
+
+// ------------------------------------------------------------------- growth
+
+/// #39: the cluster grows at runtime, and every node applies the same enlarged
+/// live set — no restart, no config rollout on the existing members.
+///
+/// The strong half of the assertion is the *move*: an instance written before
+/// the join whose shard now hashes to the newcomer is served there afterwards,
+/// with its history intact. A join releases nothing on the old host (unlike
+/// the partition-and-heal this harness could already do), so this is the case
+/// nothing could exercise before.
+#[tokio::test]
+async fn the_cluster_grows_and_work_moves_to_the_new_node() {
+    let mut cluster = TestCluster::of_size(3).await;
+
+    // An id that lives somewhere among {1,2,3} today and will hash to node 4
+    // once it joins — computable up front because placement is a pure function
+    // of the live set and the ids.
+    let three: Vec<NodeId> = (1..=3).map(NodeId).collect();
+    let four: Vec<NodeId> = (1..=4).map(NodeId).collect();
+    let mover = an_id("grown", |id| {
+        table_over(&four).owner_of(TYPE, id) == Some(NodeId(4))
+    })
+    .expect("some id must hash to the new node");
+    assert_ne!(
+        table_over(&three).owner_of(TYPE, &mover),
+        Some(NodeId(4)),
+        "the id must start on an original member"
+    );
+
+    cluster
+        .system(0)
+        .shard_actor_of::<Counter>()
+        .tell(inc(&mover, 5))
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(value_at_host(&cluster, &mover).await, 5);
+
+    let added = cluster.grow().await;
+
+    // Placement moved with the live set, on every node identically.
+    assert_eq!(cluster.host_of(&mover), added, "the shard did not move");
+
+    // And the instance carries on from its journal on the new host: 5 + 3.
+    cluster
+        .system(0)
+        .shard_actor_of::<Counter>()
+        .tell(inc(&mover, 3))
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(
+        value_at_host(&cluster, &mover).await,
+        8,
+        "the moved instance lost its history"
+    );
+}
+
+/// Growing changes membership, not just liveness: the newcomer is a voter, so
+/// it counts towards quorum and can host like any founding member.
+#[tokio::test]
+async fn a_grown_member_serves_and_votes() {
+    let mut cluster = TestCluster::of_size(2).await;
+    let added = cluster.grow().await;
+
+    assert!(
+        cluster.nodes[added].serving(),
+        "the new member never served"
+    );
+    let voters: Vec<Vec<NodeId>> = cluster.nodes.iter().map(|n| n.live_members()).collect();
+    assert!(
+        voters.iter().all(|v| v.len() == 3),
+        "not every node counts three members: {voters:?}"
+    );
+
+    // With three voters, losing one of the founders leaves a quorum of two —
+    // which is only true because the newcomer genuinely votes.
+    cluster.kill(0).await;
+    let survivor = &cluster.nodes[added];
+    assert!(
+        survivor.serving(),
+        "the grown cluster lost quorum with one founder down"
+    );
 }

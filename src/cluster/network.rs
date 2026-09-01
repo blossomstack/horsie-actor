@@ -114,7 +114,11 @@ impl ConsensusNetwork {
 impl RaftNetworkFactory<Membership> for ConsensusNetwork {
     type Network = PeerLink;
 
-    async fn new_client(&mut self, target: NodeIdx, _node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: NodeIdx, node: &BasicNode) -> Self::Network {
+        // The membership entry names the target's address, and this is the
+        // earliest moment it matters: the leader is about to replicate to a
+        // node its own configuration may never have heard of.
+        self.transport.learn_peer(NodeId(target), &node.addr);
         PeerLink {
             transport: self.transport.clone(),
             target: NodeId(target),

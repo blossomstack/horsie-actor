@@ -19,6 +19,7 @@ use horsie_actor::{
     NodeId, RaftStore, ReplyTo, Shard,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -197,6 +198,7 @@ impl Cluster {
                 ClusterConfig {
                     local: *id,
                     bootstrap: members.clone(),
+                    addrs: HashMap::new(),
                     liveness_window: Duration::from_millis(600),
                 },
                 Arc::new(net.node(*id)),
