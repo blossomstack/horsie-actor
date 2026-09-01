@@ -319,3 +319,234 @@ async fn the_tree_is_the_paths_not_the_types() {
         "an actor on another branch was stopped too"
     );
 }
+
+// ---------------------------------------------------------------- death-watch
+
+/// Pin a watch and prove it has not fired yet — the half of every death-watch
+/// assertion that keeps it honest.
+macro_rules! still_watching {
+    ($fut:expr) => {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut $fut)
+                .await
+                .is_err(),
+            "the watch fired while the actor was alive"
+        )
+    };
+}
+
+async fn fires(fut: impl std::future::Future<Output = ()>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+        .await
+        .expect("the watch never fired");
+}
+
+/// The watch resolves when the actor ends — here, a stop from outside.
+#[tokio::test]
+async fn a_watcher_learns_when_an_actor_ends() {
+    let system = ActorSystem::in_memory();
+    let (root, _grandchild, _gone) = chain(&system).await;
+
+    let mut watch = std::pin::pin!(root.terminated());
+    still_watching!(watch);
+
+    root.stop().await;
+    fires(watch).await;
+}
+
+/// `Flow::Stop` resolves it identically: a holder cannot tell how an actor
+/// ended, so the watch must not differ either.
+#[tokio::test]
+async fn a_watcher_learns_when_an_actor_stops_itself() {
+    let system = ActorSystem::in_memory();
+    let (root, _grandchild, _gone) = chain(&system).await;
+
+    let mut watch = std::pin::pin!(root.terminated());
+    still_watching!(watch);
+
+    root.tell(Grow::Stop).await.unwrap();
+    fires(watch).await;
+}
+
+/// A path that holds nothing resolves at once — to a watcher, "never existed"
+/// and "already ended" are the same news.
+#[tokio::test]
+async fn watching_an_empty_path_resolves_immediately() {
+    let system = ActorSystem::in_memory();
+    let (root, _grandchild, _gone) = chain(&system).await;
+    root.stop().await;
+
+    fires(root.terminated()).await;
+}
+
+/// The watch is bound to the instance, not the path: one taken before a stop
+/// is resolved by that stop, however promptly something new takes the name.
+#[tokio::test]
+async fn a_watch_follows_the_instance_not_the_path() {
+    let system = ActorSystem::in_memory();
+    let gone = Arc::new(Mutex::new(Vec::new()));
+    let make = |name: &str| Link {
+        name: name.to_owned(),
+        gone: Arc::clone(&gone),
+    };
+
+    let first = system.actor_of("top", make("first")).unwrap();
+    let watch = first.terminated();
+    first.stop().await;
+    system.actor_of("top", make("second")).unwrap();
+
+    // The old instance's end already resolved it; the newcomer is a new life.
+    fires(watch).await;
+}
+
+/// **The case #40 called out.** An actor whose `on_start` fails used to just
+/// disappear — logged, mailbox closed, nobody told. It still stops without
+/// processing anything, but now the failure is *heard*: the watch fires, and a
+/// caller's `ask` fails rather than hangs.
+#[tokio::test]
+async fn a_failed_start_resolves_the_watch() {
+    struct Stillborn;
+    #[async_trait]
+    impl Actor for Stillborn {
+        type Command = ReplyTo<()>;
+        async fn handle(
+            &mut self,
+            _cmd: ReplyTo<()>,
+            _ctx: &mut ActorContext<ReplyTo<()>>,
+        ) -> Flow {
+            Flow::Continue
+        }
+        async fn on_start(
+            &mut self,
+            _ctx: &mut ActorContext<ReplyTo<()>>,
+        ) -> Result<(), horsie_actor::StartError> {
+            Err(horsie_actor::JournalError::Backend("no history to stand on".into()).into())
+        }
+    }
+
+    let system = ActorSystem::in_memory();
+    let doomed = system.actor_of("doomed", Stillborn).unwrap();
+
+    fires(doomed.terminated()).await;
+    assert!(
+        doomed.ask(|reply| reply).await.is_err(),
+        "an ask against a failed start should fail, not hang"
+    );
+}
+
+/// A handler that panics is still an end, and the watch still fires — the
+/// failure a supervisor least expects is the one it most needs to hear.
+#[tokio::test]
+async fn a_panicking_actor_resolves_the_watch() {
+    struct Bomb;
+    #[async_trait]
+    impl Actor for Bomb {
+        type Command = ();
+        async fn handle(&mut self, _cmd: (), _ctx: &mut ActorContext<()>) -> Flow {
+            panic!("boom");
+        }
+    }
+
+    let system = ActorSystem::in_memory();
+    let bomb = system.actor_of("bomb", Bomb).unwrap();
+    let mut watch = std::pin::pin!(bomb.terminated());
+    still_watching!(watch);
+
+    bomb.tell(()).await.unwrap();
+    fires(watch).await;
+}
+
+/// The supervision pattern the docs promise: restart and policy are a watcher
+/// with a counter, at the parent, as plain code. The parent re-creates its
+/// child when it ends, gives up after two lives, and a reference held across
+/// every restart keeps working — because a restart is a fresh instance at the
+/// same path.
+#[tokio::test]
+async fn a_parent_supervises_by_watching() {
+    /// Stops on any command — a child that keeps failing.
+    struct Quitter;
+    #[async_trait]
+    impl Actor for Quitter {
+        type Command = ();
+        async fn handle(&mut self, _cmd: (), _ctx: &mut ActorContext<()>) -> Flow {
+            Flow::Stop
+        }
+    }
+
+    struct Parent {
+        lives: u32,
+    }
+    enum Supervise {
+        Start(ReplyTo<ActorRef<()>>),
+        ChildDown,
+        Lives(ReplyTo<u32>),
+    }
+    #[async_trait]
+    impl Actor for Parent {
+        type Command = Supervise;
+        async fn handle(&mut self, cmd: Supervise, ctx: &mut ActorContext<Supervise>) -> Flow {
+            match cmd {
+                Supervise::Start(reply) => {
+                    let child = ctx.actor_of("worker", Quitter).unwrap();
+                    watch(&child, ctx);
+                    let _ = reply.send(child);
+                    Flow::Continue
+                }
+                Supervise::ChildDown => {
+                    self.lives += 1;
+                    // The policy: two lives, then let it lie.
+                    if self.lives < 2 {
+                        let child = ctx.actor_of("worker", Quitter).unwrap();
+                        watch(&child, ctx);
+                    }
+                    Flow::Continue
+                }
+                Supervise::Lives(reply) => {
+                    let _ = reply.send(self.lives);
+                    Flow::Continue
+                }
+            }
+        }
+    }
+
+    /// Death-watch, folded back into the parent's own mailbox.
+    fn watch(child: &ActorRef<()>, ctx: &ActorContext<Supervise>) {
+        let child = child.clone();
+        let parent = ctx.self_ref();
+        tokio::spawn(async move {
+            child.terminated().await;
+            let _ = parent.tell(Supervise::ChildDown).await;
+        });
+    }
+
+    let system = ActorSystem::in_memory();
+    let parent = system.actor_of("parent", Parent { lives: 0 }).unwrap();
+    let child = parent.ask(Supervise::Start).await.unwrap();
+
+    let wait_for_lives = |want: u32| {
+        let parent = parent.clone();
+        async move {
+            for _ in 0..200 {
+                let lives = parent.ask(Supervise::Lives).await.unwrap();
+                if lives >= want {
+                    return lives;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("the parent never counted {want} lives");
+        }
+    };
+
+    // First death: the policy restarts it, and the held reference reaches the
+    // replacement.
+    child.tell(()).await.unwrap();
+    assert_eq!(wait_for_lives(1).await, 1);
+    child.tell(()).await.unwrap();
+
+    // Second death: the policy gives up, and the path stays empty.
+    assert_eq!(wait_for_lives(2).await, 2);
+    assert!(
+        child.tell(()).await.is_err(),
+        "the parent's policy said two lives, but something answered a third"
+    );
+}

@@ -24,6 +24,11 @@ pub enum Flow {
 }
 
 /// Why an actor refused to start.
+///
+/// A failed start ends the instance before it processes anything: the mailbox
+/// closes, senders fail fast, and a watcher on
+/// [`ActorRef::terminated`](crate::ActorRef::terminated) hears it — which is
+/// how a parent learns without having sent anything.
 #[derive(Debug, Error)]
 pub enum StartError {
     /// Replaying the actor's history failed, so it has no trustworthy state to

@@ -259,6 +259,20 @@ impl SystemInner {
         self.live.lock().len()
     }
 
+    /// The end-of-life signal for whatever is at `path` right now.
+    ///
+    /// `None` when the path holds nothing — to a watcher, an actor that is not
+    /// there and one that has already ended are the same answer.
+    pub(crate) fn terminated_watch(
+        &self,
+        path: &ActorPath,
+    ) -> Option<tokio::sync::watch::Receiver<()>> {
+        self.live
+            .lock()
+            .get(path)
+            .map(|entry| entry.terminated.clone())
+    }
+
     /// Stop the actor at `path` and everything under it, and wait for it.
     ///
     /// Stopping the actor is enough on its own — its own shutdown takes its

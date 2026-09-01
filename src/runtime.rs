@@ -246,6 +246,57 @@ impl<C: Send + 'static> ActorRef<C> {
         system.stop_at(&self.path).await
     }
 
+    /// Resolves once the instance at this path has ended — however it ends.
+    ///
+    /// Death-watch. A stop from outside, [`Flow::Stop`], an `on_start` that
+    /// failed, a handler that panicked, a node standing down: every one of
+    /// them ends the instance, and every one resolves this. No reason is
+    /// carried, deliberately — a watcher acts on *that* the actor is gone, and
+    /// a taxonomy of ends would put the watcher in the business of
+    /// second-guessing them. Resolves immediately when the path holds nothing,
+    /// which to a watcher is the same news. It watches the instance that is
+    /// there when it is called: an actor created at the path afterwards is a
+    /// new life, not a continuation.
+    ///
+    /// This is the supervision surface for **failure**, and the rest of the
+    /// failure axis is patterns over it rather than machinery:
+    ///
+    /// - **Being told.** An actor whose `on_start` fails — a recovery that
+    ///   cannot rebuild its state — stops without processing anything. That
+    ///   used to be observable only by the next send failing; watching is how
+    ///   a parent hears about it without having something to say.
+    /// - **Restart.** A registered actor needs no restart machinery: its next
+    ///   command rebuilds it from the recipe, and an event-sourced one
+    ///   recovers from its journal — a restart *is* a fresh instance at the
+    ///   same path, and every held reference already survives that. For a
+    ///   child created from a value, the parent that wants it back watches and
+    ///   re-creates it: it is the one that had the value.
+    /// - **Escalation and policy.** "Three failures in a minute, then give
+    ///   up" is a watcher with a counter. It lives on the parent, as plain
+    ///   code — which is what makes it supervision rather than configuration —
+    ///   and a child escalates by stopping, which its parent hears here.
+    ///
+    /// A reference to a shard *type* resolves at once: the region path holds
+    /// no actor, and watching a whole type is not a question with one answer.
+    ///
+    /// [`Flow::Stop`]: crate::Flow::Stop
+    pub fn terminated(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        // Bound now, not at first poll — a plain fn returning a future rather
+        // than an `async fn`, because a lazy binding would let a watch taken
+        // before a stop attach to whatever replaced the actor afterwards.
+        let ended = self
+            .system
+            .upgrade()
+            .and_then(|system| system.terminated_watch(&self.path));
+        async move {
+            if let Some(mut ended) = ended {
+                // The signal is the sender being dropped by the actor's task —
+                // so `Err` here *is* the news, and a clean `Ok` never comes.
+                let _ = ended.changed().await;
+            }
+        }
+    }
+
     pub(crate) fn cached(&self) -> Option<Link<C>> {
         self.link.lock().clone()
     }
