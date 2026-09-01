@@ -347,6 +347,26 @@ pub mod conformance {
         );
     }
 
+    /// The checked read's foundation: an empty batch appends nothing and
+    /// checks everything. A backend that short-circuits empty input to `Ok`
+    /// turns every checked read into an unchecked one, silently.
+    pub async fn an_empty_persist_still_enforces_the_condition(j: &dyn Journal) {
+        j.persist(&pid("check"), &[vec![1]], 0).await.unwrap();
+
+        assert!(
+            j.persist(&pid("check"), &[], 0).await.is_err(),
+            "an empty persist at a stale expectation must be rejected"
+        );
+        j.persist(&pid("check"), &[], 1)
+            .await
+            .expect("an empty persist at the right expectation must pass");
+        assert_eq!(
+            j.last_seq(&pid("check")).await.unwrap(),
+            1,
+            "an empty persist must not advance the log"
+        );
+    }
+
     pub async fn persist_rejects_a_writer_ahead_of_the_log(j: &dyn Journal) {
         assert!(
             j.persist(&pid("ahead"), &[vec![1]], 5).await.is_err(),

@@ -65,21 +65,32 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
             events,
             snapshot,
             ack,
+            confirmed,
             stop,
         } = effect;
 
         // One persist step, then the post-persist actions in a fixed order:
-        // write -> publish -> snapshot -> ack -> stop. The write outcome is
-        // folded only on success, so a failed write leaves state consistent with
-        // what is actually durable and the ack reports the failure.
-        let (persisted, result) = persist_events::<A>(
-            &self.pid,
-            &self.journal,
-            events,
-            &mut self.state,
-            &mut self.seq_nr,
-        )
-        .await;
+        // write -> publish -> snapshot -> confirm -> ack -> stop. The write
+        // outcome is folded only on success, so a failed write leaves state
+        // consistent with what is actually durable and the ack reports the
+        // failure.
+        //
+        // An effect with nothing to write skips the journal entirely — a plain
+        // read costs no round trip — *unless* it asked to be confirmed, in
+        // which case the empty conditional append runs anyway: it appends
+        // nothing and checks everything, which is the checked read.
+        let (persisted, result) = if events.is_empty() && confirmed.is_none() {
+            (Vec::new(), Ok(()))
+        } else {
+            persist_events::<A>(
+                &self.pid,
+                &self.journal,
+                events,
+                &mut self.state,
+                &mut self.seq_nr,
+            )
+            .await
+        };
 
         // Publish what just became durable. Before the ack, so an `ask` caller
         // cannot observe the write landing ahead of the frames it produced; and
@@ -109,6 +120,12 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
                 pid = %self.pid,
                 "the log has moved past this instance; stopping rather than serving stale"
             );
+        }
+
+        // The checked read's answer: only now does the handler's deferred
+        // reply learn whether the log still ends where this instance believes.
+        if let Some(confirm) = confirmed {
+            confirm(&result);
         }
 
         // Reply only now, so an `ask` caller returns the journaled guarantee
@@ -266,6 +283,9 @@ mod tests {
         IncAck(i64, ReplyTo<Result<(), JournalError>>),
         Snapshot,
         Get(ReplyTo<i64>),
+        /// The checked read: answer only once the journal confirms the log has
+        /// not moved past this instance.
+        GetChecked(ReplyTo<i64>),
         Stop,
     }
 
@@ -324,6 +344,16 @@ mod tests {
                 CounterCmd::Get(reply) => {
                     let _ = reply.send(state.value);
                     CommandEffect::none()
+                }
+                CounterCmd::GetChecked(reply) => {
+                    let value = state.value;
+                    CommandEffect::none().and_confirm(move |check| {
+                        if check.is_ok() {
+                            let _ = reply.send(value);
+                        }
+                        // Dropped otherwise: the caller fails now rather than
+                        // reading a history that has moved on.
+                    })
                 }
                 CounterCmd::Stop => CommandEffect::stop(),
             }
@@ -426,6 +456,142 @@ mod tests {
         // Nothing was journaled, so nothing may be published — otherwise an
         // observer would announce history that does not exist.
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// #37, both halves of the trade. A plain read is answered from memory —
+    /// free, journal untouched, and stale by at most the liveness window when
+    /// the instance has been displaced. A checked read pays one journal round
+    /// trip and refuses instead.
+    #[tokio::test]
+    async fn a_checked_read_refuses_what_a_plain_read_answers_stale() {
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let system = ActorSystem::new(journal.clone());
+        let actor = system
+            .actor_of("reader", system.persistent(Counter::new("reader")))
+            .unwrap();
+        actor.tell(CounterCmd::Inc(5)).await.unwrap();
+        assert_eq!(current_value(&actor).await, 5);
+
+        // Somebody else appends — the instance is now a displaced reader, and
+        // nothing tells it.
+        let rival = serde_json::to_vec(&CounterEvent::Incremented(10)).unwrap();
+        journal
+            .persist(&PersistenceId::new("counter", "reader"), &[rival], 1)
+            .await
+            .unwrap();
+
+        // Plain reads keep answering from memory, and keep the instance alive:
+        // a read touches no journal, so the fence has nothing to catch. Twice,
+        // to prove the first one did not quietly stop the actor either.
+        assert_eq!(current_value(&actor).await, 5);
+        assert_eq!(current_value(&actor).await, 5);
+
+        // The checked read is where the displacement is caught: the empty
+        // conditional append conflicts, the reply handle is dropped, and the
+        // caller fails now instead of acting on history.
+        assert!(
+            actor.ask(CounterCmd::GetChecked).await.is_err(),
+            "a checked read on a displaced instance answered anyway"
+        );
+    }
+
+    /// A checked read on an instance nobody displaced answers normally — the
+    /// check is a fence, not a tax on being right.
+    #[tokio::test]
+    async fn a_checked_read_answers_when_the_log_has_not_moved() {
+        let system = ActorSystem::in_memory();
+        let actor = system
+            .actor_of("fine", system.persistent(Counter::new("fine")))
+            .unwrap();
+        actor.tell(CounterCmd::Inc(3)).await.unwrap();
+        assert_eq!(actor.ask(CounterCmd::GetChecked).await.unwrap(), 3);
+    }
+
+    /// Counts conditional appends, delegating everything to the journal it
+    /// wraps — what makes "a read costs no journal round trip" assertable.
+    struct CountingJournal {
+        inner: InMemoryJournal,
+        persists: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Journal for CountingJournal {
+        async fn persist(
+            &self,
+            pid: &PersistenceId,
+            events: &[Vec<u8>],
+            expected_last_seq: u64,
+        ) -> crate::journal::JournalResult<()> {
+            self.persists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.persist(pid, events, expected_last_seq).await
+        }
+        async fn replay(
+            &self,
+            pid: &PersistenceId,
+            after_seq: u64,
+        ) -> futures_util::stream::BoxStream<'_, crate::journal::JournalResult<(u64, Vec<u8>)>>
+        {
+            self.inner.replay(pid, after_seq).await
+        }
+        async fn save_snapshot(
+            &self,
+            pid: &PersistenceId,
+            state: Vec<u8>,
+            seq_nr: u64,
+        ) -> crate::journal::JournalResult<()> {
+            self.inner.save_snapshot(pid, state, seq_nr).await
+        }
+        async fn latest_snapshot(
+            &self,
+            pid: &PersistenceId,
+        ) -> crate::journal::JournalResult<Option<(Vec<u8>, u64)>> {
+            self.inner.latest_snapshot(pid).await
+        }
+        async fn delete_events_before(
+            &self,
+            pid: &PersistenceId,
+            seq_nr: u64,
+        ) -> crate::journal::JournalResult<()> {
+            self.inner.delete_events_before(pid, seq_nr).await
+        }
+        async fn copy_snapshot(
+            &self,
+            from: &PersistenceId,
+            to: &PersistenceId,
+        ) -> crate::journal::JournalResult<()> {
+            self.inner.copy_snapshot(from, to).await
+        }
+        async fn last_seq(&self, pid: &PersistenceId) -> crate::journal::JournalResult<u64> {
+            self.inner.last_seq(pid).await
+        }
+        async fn clear(&self, pid: &PersistenceId) -> crate::journal::JournalResult<()> {
+            self.inner.clear(pid).await
+        }
+    }
+
+    /// The cost model, pinned: a plain read makes zero journal calls, and a
+    /// checked read makes exactly the one it opted into.
+    #[tokio::test]
+    async fn a_plain_read_touches_no_journal_and_a_checked_read_touches_it_once() {
+        let journal = Arc::new(CountingJournal {
+            inner: InMemoryJournal::new(),
+            persists: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let counting = journal.clone();
+        let persists = move || counting.persists.load(std::sync::atomic::Ordering::Relaxed);
+
+        let system = ActorSystem::new(journal);
+        let actor = system
+            .actor_of("free", system.persistent(Counter::new("free")))
+            .unwrap();
+
+        assert_eq!(current_value(&actor).await, 0);
+        assert_eq!(current_value(&actor).await, 0);
+        assert_eq!(persists(), 0, "a plain read paid a journal round trip");
+
+        assert_eq!(actor.ask(CounterCmd::GetChecked).await.unwrap(), 0);
+        assert_eq!(persists(), 1, "a checked read is exactly one round trip");
     }
 
     #[tokio::test]

@@ -36,6 +36,12 @@ pub trait Journal: Send + Sync + 'static {
     /// `0` is the expectation for an empty log, so a fresh actor's first write
     /// passes only if nobody else got there first.
     ///
+    /// **An empty `events` still enforces the condition.** Appending nothing
+    /// and checking everything is the checked read — see
+    /// [`CommandEffect::and_confirm`](crate::CommandEffect::and_confirm) — so
+    /// a backend must not short-circuit an empty batch to `Ok`. The
+    /// conformance suite pins this.
+    ///
     /// A backend that cannot express the condition atomically must return an
     /// error rather than append unconditionally. Presenting a fence that does
     /// not fence is worse than having none.

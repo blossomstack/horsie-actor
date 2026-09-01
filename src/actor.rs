@@ -33,9 +33,16 @@ pub struct CommandEffect<E> {
     /// so an [`ActorRef::ask`] caller gets true post-persist backpressure and can
     /// abort on failure. Events are neither folded nor counted on a failed write.
     pub(crate) ack: Option<ReplyTo<Result<(), JournalError>>>,
+    /// Run after the conditional append with its outcome — see
+    /// [`and_confirm`](Self::and_confirm). Its presence is also what makes an
+    /// otherwise-empty effect touch the journal at all.
+    pub(crate) confirmed: Option<Confirm>,
     /// After the durable write, stop the actor.
     pub(crate) stop: bool,
 }
+
+/// What [`CommandEffect::and_confirm`] runs once the journal has spoken.
+pub(crate) type Confirm = Box<dyn FnOnce(&Result<(), JournalError>) + Send>;
 
 impl<E> CommandEffect<E> {
     /// Do nothing.
@@ -44,6 +51,7 @@ impl<E> CommandEffect<E> {
             events: Vec::new(),
             snapshot: false,
             ack: None,
+            confirmed: None,
             stop: false,
         }
     }
@@ -54,6 +62,7 @@ impl<E> CommandEffect<E> {
             events,
             snapshot: false,
             ack: None,
+            confirmed: None,
             stop: false,
         }
     }
@@ -92,6 +101,48 @@ impl<E> CommandEffect<E> {
     #[must_use]
     pub fn and_stop(mut self) -> Self {
         self.stop = true;
+        self
+    }
+
+    /// Run `confirm` once the conditional append has spoken — the **checked
+    /// read**.
+    ///
+    /// A read answered inside `handle_command` is answered from memory, and
+    /// memory is the one thing the write fence cannot check: a node displaced
+    /// a moment ago answers from a history that has moved on somewhere else,
+    /// and keeps doing so until it notices. Deferring the answer here closes
+    /// that: on an otherwise-empty effect the runtime still performs the
+    /// conditional append — appending nothing, checking everything — and
+    /// `confirm` sees `Ok` only if the log still ends where this instance
+    /// believes. On `Err` the honest move is to drop the reply handle, which
+    /// fails the caller now; the instance stops as it does for any conflict,
+    /// and the next send re-resolves to whoever is live.
+    ///
+    /// ```ignore
+    /// CounterCmd::GetChecked { reply, .. } => {
+    ///     let value = state.value;
+    ///     CommandEffect::none().and_confirm(move |check| {
+    ///         if check.is_ok() {
+    ///             let _ = reply.send(value);
+    ///         } // dropped otherwise: the caller fails rather than reads stale
+    ///     })
+    /// }
+    /// ```
+    ///
+    /// **Opt-in per call site, deliberately.** The check is a journal round
+    /// trip, and most reads in a session are not worth one — a blanket version
+    /// would make every read pay for the few that need it. A plain read
+    /// remains free and remains fenceless: stale by at most the liveness
+    /// window, which is the documented trade.
+    ///
+    /// On an effect that persists events, `confirm` simply sees the write's
+    /// outcome — the append is already the check.
+    #[must_use]
+    pub fn and_confirm(
+        mut self,
+        confirm: impl FnOnce(&Result<(), JournalError>) + Send + 'static,
+    ) -> Self {
+        self.confirmed = Some(Box::new(confirm));
         self
     }
 
