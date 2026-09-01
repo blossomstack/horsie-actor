@@ -8,10 +8,15 @@ use std::collections::{HashSet, VecDeque};
 /// effectively-once *processing*. Without this, a retry after a timeout applies
 /// the same command twice.
 ///
-/// Bounded on purpose. This set is carried in the receiving actor's own state
-/// and replayed on recovery, so an unbounded one would grow forever and make
-/// every snapshot bigger than the last. The bound is a window: a redelivery
-/// older than it is one the sender gave up on long ago.
+/// Worn twice: as the node's fast pre-decode window in dispatch, and as each
+/// event-sourced actor's own durable window, carried in its journal and
+/// recovered with everything else (see `Persistent`). The first cannot survive
+/// a restart or follow a move; the second is what closes that.
+///
+/// Bounded on purpose. The durable copy is replayed on recovery and rides in
+/// every snapshot, so an unbounded one would grow forever and make each
+/// snapshot bigger than the last. The bound is a window: a redelivery older
+/// than it is one the sender gave up on long ago.
 #[derive(Debug, Clone)]
 pub struct Dedup {
     seen: HashSet<u128>,
@@ -55,6 +60,25 @@ impl Dedup {
             self.seen.remove(&evicted);
         }
         true
+    }
+
+    /// Whether `message_id` is inside the window, without recording it.
+    ///
+    /// For the caller that wants to check now and record only once the
+    /// application has durably succeeded — recording on sight would make a
+    /// failed write look applied to the retry that could have repaired it.
+    #[must_use]
+    pub fn contains(&self, message_id: u128) -> bool {
+        self.seen.contains(&message_id)
+    }
+
+    /// The ids in the window, oldest first.
+    ///
+    /// Insertion order is the order that rebuilds this window exactly: feeding
+    /// these back through [`accept_id`](Self::accept_id) reproduces both the
+    /// contents and which id the next eviction takes.
+    pub fn ids(&self) -> impl Iterator<Item = u128> + '_ {
+        self.order.iter().copied()
     }
 
     /// How many ids the window currently holds.

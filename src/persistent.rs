@@ -1,12 +1,54 @@
 use crate::actor::{CommandEffect, EventSourcedActor};
-use crate::behaviour::{Actor, Flow, StartError};
+use crate::behaviour::{Actor, Delivery, Flow, StartError};
+use crate::cluster::Dedup;
 use crate::error::JournalError;
 use crate::journal::Journal;
 use crate::persistence_id::PersistenceId;
 use crate::runtime::ActorContext;
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// How many applied message ids one actor remembers durably.
+///
+/// Per instance, not per node, so it can be far smaller than the node window:
+/// it only has to outlast the retries aimed at this one actor. It rides in
+/// every snapshot and is rebuilt on every recovery, so the bound is what keeps
+/// both from growing with history. The trade is the same one every window
+/// makes: a redelivery older than the last `DURABLE_DEDUP_WINDOW` applied
+/// commands reads as new — durably bounded, not durably infinite.
+pub(crate) const DURABLE_DEDUP_WINDOW: usize = 256;
+
+/// One journaled event as [`Persistent`] encodes it.
+///
+/// The message id of the command that produced the event travels in the same
+/// conditional append as the event itself — that atomicity is the whole point,
+/// since an id recorded in a second write could land without its events or the
+/// other way round. Recovery folds the event and re-learns the id in one pass.
+#[derive(Serialize, Deserialize)]
+struct EventRecord<E> {
+    /// The producing command's dedup key, for a command that arrived from
+    /// another node. Repeated on every event of the batch so recovery need not
+    /// care where batches began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_id: Option<u128>,
+    event: E,
+}
+
+/// A snapshot as [`Persistent`] encodes it: the folded state, plus the dedup
+/// window at the moment it was taken.
+///
+/// The window has to ride here because snapshotting compacts the events —
+/// and with them the ids they carried. A snapshot without the window would
+/// make every compaction an amnesty for old retries.
+#[derive(Serialize, Deserialize)]
+struct SnapshotRecord<S> {
+    state: S,
+    /// Applied message ids, oldest first — the order that rebuilds the window
+    /// exactly.
+    seen: Vec<u128>,
+}
 
 /// Adapts an [`EventSourcedActor`] into a plain [`Actor`].
 ///
@@ -26,6 +68,17 @@ pub struct Persistent<A: EventSourcedActor> {
     /// or by its own earlier incarnation waking from a pause — is rejected on
     /// its first write rather than merging its history with the live one.
     seq_nr: u64,
+    /// Message ids this instance has applied, recovered with everything else.
+    ///
+    /// The durable half of deduplication: the node window in dispatch cannot
+    /// recognise a repeat that crossed a restart or a move, and this can,
+    /// because it travels with the instance rather than with the process. An
+    /// id joins it only once its events are durably written — recording on
+    /// sight would make a failed write look applied to the retry that could
+    /// have repaired it. Ids of commands that persisted nothing are held in
+    /// memory only, which matches what there is to protect: re-applying a
+    /// command with no events re-reads, it does not re-write.
+    seen: Dedup,
 }
 
 impl<A: EventSourcedActor> Persistent<A> {
@@ -40,6 +93,7 @@ impl<A: EventSourcedActor> Persistent<A> {
             // present by the time a command arrives.
             state: A::initial_state(),
             seq_nr: 0,
+            seen: Dedup::with_capacity(DURABLE_DEDUP_WINDOW),
         }
     }
 }
@@ -52,14 +106,54 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
     // parameterized by command types rather than by actor types.
 
     async fn on_start(&mut self, ctx: &mut ActorContext<Self::Command>) -> Result<(), StartError> {
-        let (state, seq_nr) = recover::<A>(&self.pid, &self.journal).await?;
+        let (state, seq_nr, seen) = recover::<A>(&self.pid, &self.journal).await?;
         self.state = state;
         self.seq_nr = seq_nr;
+        self.seen = seen;
         self.inner.on_recovery_complete(&self.state, ctx).await;
         Ok(())
     }
 
     async fn handle(&mut self, cmd: Self::Command, ctx: &mut ActorContext<Self::Command>) -> Flow {
+        self.process(None, cmd, ctx).await
+    }
+
+    /// The durable dedup check, in front of the handler.
+    ///
+    /// A command whose id this instance's recovered state already holds has
+    /// been applied — perhaps by an earlier incarnation on another host — so
+    /// it is dropped here. Dropping it also drops any reply handle inside,
+    /// which tells a still-waiting caller that no fresh answer is coming: the
+    /// first application's answer either arrived or is not reconstructible,
+    /// and pretending otherwise would mean applying the command again.
+    async fn deliver(
+        &mut self,
+        delivery: Delivery<Self::Command>,
+        ctx: &mut ActorContext<Self::Command>,
+    ) -> Flow {
+        if let Some(id) = delivery.message_id
+            && self.seen.contains(id)
+        {
+            tracing::debug!(
+                pid = %self.pid,
+                message_id = id,
+                "dropped a redelivery this instance has already applied"
+            );
+            return Flow::Continue;
+        }
+        self.process(delivery.message_id, delivery.cmd, ctx).await
+    }
+}
+
+impl<A: EventSourcedActor> Persistent<A> {
+    /// Handle one command, carrying the message id it arrived under so a
+    /// successful persist can record it durably.
+    async fn process(
+        &mut self,
+        message_id: Option<u128>,
+        cmd: A::Command,
+        ctx: &mut ActorContext<A::Command>,
+    ) -> Flow {
         let effect = self.inner.handle_command(&self.state, cmd, ctx).await;
         let CommandEffect {
             events,
@@ -76,10 +170,22 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
             &self.pid,
             &self.journal,
             events,
+            message_id,
             &mut self.state,
             &mut self.seq_nr,
         )
         .await;
+
+        // The id becomes "seen" only now, on success. For a batch that wrote,
+        // the events carry it durably; for a command that persisted nothing,
+        // this in-memory record is all there is — and all there needs to be,
+        // since re-applying it would re-read rather than re-write. A failed
+        // write records nothing, so the retry it provokes is let through.
+        if result.is_ok()
+            && let Some(id) = message_id
+        {
+            self.seen.accept_id(id);
+        }
 
         // Publish what just became durable. Before the ack, so an `ask` caller
         // cannot observe the write landing ahead of the frames it produced; and
@@ -94,7 +200,14 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
         // the journal would be unsound. Skipped when stopping — the state is
         // discarded next anyway.
         if snapshot && result.is_ok() && !stop {
-            snapshot_state::<A>(&self.pid, &self.journal, &self.state, self.seq_nr).await;
+            snapshot_state::<A>(
+                &self.pid,
+                &self.journal,
+                &self.state,
+                &self.seen,
+                self.seq_nr,
+            )
+            .await;
         }
 
         // A conflict is terminal, not a retryable hiccup: somebody else has
@@ -126,16 +239,22 @@ impl<A: EventSourcedActor> Actor for Persistent<A> {
 }
 
 /// Rebuild an actor's state from its latest snapshot plus subsequent events.
-/// Returns the recovered state and the sequence number of the last applied event.
+/// Returns the recovered state, the sequence number of the last applied event,
+/// and the dedup window as history left it — snapshot first, then the ids off
+/// the replayed events, which is the same order they were applied in.
 async fn recover<A: EventSourcedActor>(
     pid: &PersistenceId,
     journal: &Arc<dyn Journal>,
-) -> Result<(A::State, u64), JournalError> {
+) -> Result<(A::State, u64, Dedup), JournalError> {
+    let mut seen = Dedup::with_capacity(DURABLE_DEDUP_WINDOW);
     let (mut state, mut seq_nr) = match journal.latest_snapshot(pid).await? {
         Some((bytes, seq)) => {
-            let state = serde_json::from_slice::<A::State>(&bytes)
+            let snapshot = serde_json::from_slice::<SnapshotRecord<A::State>>(&bytes)
                 .map_err(|e| JournalError::Serialization(e.to_string()))?;
-            (state, seq)
+            for id in snapshot.seen {
+                seen.accept_id(id);
+            }
+            (snapshot.state, seq)
         }
         None => (A::initial_state(), 0),
     };
@@ -146,12 +265,17 @@ async fn recover<A: EventSourcedActor>(
         // survivors keep their original numbers, and this is the number a later
         // snapshot is recorded at.
         let (seq, bytes) = item?;
-        let event = serde_json::from_slice::<A::Event>(&bytes)
+        let record = serde_json::from_slice::<EventRecord<A::Event>>(&bytes)
             .map_err(|e| JournalError::Serialization(e.to_string()))?;
-        state = A::apply_event(state, event);
+        if let Some(id) = record.message_id {
+            // A batch repeats its id on every event; `accept_id` records the
+            // first and shrugs at the rest.
+            seen.accept_id(id);
+        }
+        state = A::apply_event(state, record.event);
         seq_nr = seq;
     }
-    Ok((state, seq_nr))
+    Ok((state, seq_nr, seen))
 }
 
 /// Persist `events`, then fold them into `state`, advancing `seq_nr`. On failure
@@ -163,12 +287,16 @@ async fn persist_events<A: EventSourcedActor>(
     pid: &PersistenceId,
     journal: &Arc<dyn Journal>,
     events: Vec<A::Event>,
+    message_id: Option<u128>,
     state: &mut A::State,
     seq_nr: &mut u64,
 ) -> (Vec<A::Event>, Result<(), JournalError>) {
     let mut encoded = Vec::with_capacity(events.len());
     for event in &events {
-        match serde_json::to_vec(event) {
+        // The producing command's id rides in the same append as the event, so
+        // the two are durable together or not at all.
+        let record = EventRecord { message_id, event };
+        match serde_json::to_vec(&record) {
             Ok(bytes) => encoded.push(bytes),
             Err(e) => {
                 tracing::error!(%pid, error = %e, "failed to serialize event; skipping persist");
@@ -199,9 +327,16 @@ async fn snapshot_state<A: EventSourcedActor>(
     pid: &PersistenceId,
     journal: &Arc<dyn Journal>,
     state: &A::State,
+    seen: &Dedup,
     seq_nr: u64,
 ) {
-    let bytes = match serde_json::to_vec(state) {
+    // The window rides in the snapshot because compaction is about to delete
+    // the events that carried its ids.
+    let record = SnapshotRecord {
+        state,
+        seen: seen.ids().collect(),
+    };
+    let bytes = match serde_json::to_vec(&record) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(%pid, error = %e, "failed to serialize snapshot; skipping");

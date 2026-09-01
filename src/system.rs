@@ -189,12 +189,16 @@ pub(crate) struct SystemInner {
     cluster: Option<Arc<ClusterNode>>,
     /// Message ids this node has already handled.
     ///
-    /// Retries make delivery at-least-once; this is what makes *processing*
-    /// once. Node-scoped rather than per-actor, which is the honest limit of it:
-    /// a repeat arriving after this host restarted is not recognised, so a
-    /// command must still be one whose second application is survivable. Moving
-    /// this into each actor's own event-sourced state is what would close that,
-    /// and it is not done yet.
+    /// Retries make delivery at-least-once; deduplication is what makes
+    /// *processing* effectively once, and it is layered. This window is the
+    /// node's: fast, ahead of the decode, and what stops a repeat from
+    /// registering a second reply handle for one caller. It is also
+    /// process-scoped, so a repeat that crosses a restart or a move slips past
+    /// it — which is why each event-sourced actor carries a second window in
+    /// its own recovered state (see `Persistent`), as durable as the log it
+    /// protects. A plain actor has no recovered state, so for it this window
+    /// is the whole guarantee, and its commands must still survive a second
+    /// application.
     seen: Mutex<Dedup>,
     /// Every actor on this node, keyed by its path.
     ///
@@ -855,9 +859,16 @@ impl<S: Shard> ShardOf<'_, S> {
                             .inner
                             .resolve::<S::Command>(&at)
                             .ok_or(DispatchError::NoActor(at))?;
-                        link.send(cmd)
-                            .await
-                            .map_err(|_| DispatchError::MailboxClosed)
+                        // The id travels to the actor, whose own durable window
+                        // is the second dedup layer: the node window above
+                        // cannot recognise a repeat that crossed a restart or a
+                        // move, and the actor's recovered state can.
+                        link.deliver(crate::behaviour::Delivery {
+                            message_id: Some(message_id),
+                            cmd,
+                        })
+                        .await
+                        .map_err(|_| DispatchError::MailboxClosed)
                     })
                 },
             )
@@ -921,12 +932,15 @@ mod tests {
     enum CounterCmd {
         Inc { id: String, by: i64 },
         Get { id: String, reply: ReplyTo<i64> },
+        Snap { id: String },
     }
 
     impl CounterCmd {
         fn id(&self) -> &str {
             match self {
-                CounterCmd::Inc { id, .. } | CounterCmd::Get { id, .. } => id,
+                CounterCmd::Inc { id, .. }
+                | CounterCmd::Get { id, .. }
+                | CounterCmd::Snap { id } => id,
             }
         }
     }
@@ -971,6 +985,7 @@ mod tests {
                     let _ = reply.send(state.value);
                     CommandEffect::none()
                 }
+                CounterCmd::Snap { .. } => CommandEffect::snapshot(),
             }
         }
     }
@@ -992,7 +1007,14 @@ mod tests {
     }
 
     fn counters() -> ActorSystem {
-        let system = ActorSystem::in_memory();
+        counters_over(Arc::new(InMemoryJournal::new()))
+    }
+
+    /// A single-node system of counters over `journal` — so a test can stand a
+    /// second incarnation over the same history, which is what a restart or a
+    /// move looks like to a journal.
+    fn counters_over(journal: Arc<dyn Journal>) -> ActorSystem {
+        let system = ActorSystem::new(journal);
         system
             .shard::<Counter>()
             // Identity comes from the context, which is the address already
@@ -1064,6 +1086,141 @@ mod tests {
             .unwrap();
         assert_eq!(value_of(&system, "a").await, 2);
         assert_eq!(value_of(&system, "b").await, 3);
+    }
+
+    fn inc_payload(id: &str, by: i64) -> Vec<u8> {
+        serde_json::to_vec(&CounterCmd::Inc {
+            id: id.to_owned(),
+            by,
+        })
+        .unwrap()
+    }
+
+    /// **The durable half of #38.** A retry that arrives after the host
+    /// restarted is recognised anyway, because the applied ids were recovered
+    /// with the state. The node window is empty in the second incarnation —
+    /// only the journal remembers.
+    #[tokio::test]
+    async fn a_retry_that_crosses_a_restart_is_applied_once() {
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let payload = inc_payload("r1", 5);
+
+        let first = counters_over(journal.clone());
+        first
+            .dispatch(envelope("counter", payload.clone(), 99))
+            .await
+            .unwrap();
+        assert_eq!(value_of(&first, "r1").await, 5);
+
+        // The host comes back: fresh process, fresh node window, same journal.
+        // The sender could not tell "lost" from "slow", so it retries.
+        let second = counters_over(journal);
+        second
+            .dispatch(envelope("counter", payload, 99))
+            .await
+            .unwrap();
+        assert_eq!(
+            value_of(&second, "r1").await,
+            5,
+            "a retry across a restart was applied a second time"
+        );
+    }
+
+    /// The same repeat arriving at a *different* node — the shard moved, and
+    /// the retry followed it. The new host has never seen the id, but the
+    /// instance it recovers has.
+    #[tokio::test]
+    async fn a_retry_that_lands_on_another_node_is_applied_once() {
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let payload = inc_payload("m1", 5);
+
+        let old_host = counters_over(journal.clone());
+        old_host
+            .dispatch(envelope("counter", payload.clone(), 7))
+            .await
+            .unwrap();
+        assert_eq!(value_of(&old_host, "m1").await, 5);
+
+        let new_host = counters_over(journal);
+        new_host
+            .dispatch(envelope("counter", payload, 7))
+            .await
+            .unwrap();
+        assert_eq!(
+            value_of(&new_host, "m1").await,
+            5,
+            "a retry that followed a moved shard was applied a second time"
+        );
+    }
+
+    /// Snapshotting compacts the events that carried the ids, so the window
+    /// rides in the snapshot — otherwise every compaction would be an amnesty
+    /// for old retries.
+    #[tokio::test]
+    async fn the_window_survives_snapshot_and_compaction() {
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let payload = inc_payload("s1", 5);
+
+        let first = counters_over(journal.clone());
+        first
+            .dispatch(envelope("counter", payload.clone(), 42))
+            .await
+            .unwrap();
+        first
+            .shard_actor_of::<Counter>()
+            .tell(CounterCmd::Snap { id: "s1".into() })
+            .await
+            .unwrap();
+        // The ask serialises behind the snapshot in the mailbox, so returning
+        // means the snapshot (and its compaction) has happened.
+        assert_eq!(value_of(&first, "s1").await, 5);
+
+        let second = counters_over(journal);
+        second
+            .dispatch(envelope("counter", payload, 42))
+            .await
+            .unwrap();
+        assert_eq!(
+            value_of(&second, "s1").await,
+            5,
+            "compaction forgot the applied ids"
+        );
+    }
+
+    /// The bound, pinned honestly: an id older than the last
+    /// `DURABLE_DEDUP_WINDOW` applied commands has been evicted, so a
+    /// redelivery that old reads as new. That is the deliberate trade — the
+    /// window is what keeps snapshots from growing with history.
+    #[tokio::test]
+    async fn an_id_older_than_the_window_is_forgotten() {
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let payload = inc_payload("w1", 5);
+
+        let first = counters_over(journal.clone());
+        first
+            .dispatch(envelope("counter", payload.clone(), 1))
+            .await
+            .unwrap();
+        for i in 0..crate::persistent::DURABLE_DEDUP_WINDOW {
+            first
+                .dispatch(envelope("counter", inc_payload("w1", 1), 1000 + i as u128))
+                .await
+                .unwrap();
+        }
+        let filled = 5 + crate::persistent::DURABLE_DEDUP_WINDOW as i64;
+        assert_eq!(value_of(&first, "w1").await, filled);
+
+        // Across a restart, so the node window cannot mask the eviction.
+        let second = counters_over(journal);
+        second
+            .dispatch(envelope("counter", payload, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            value_of(&second, "w1").await,
+            filled + 5,
+            "an id past the window should have been forgotten; the bound has changed"
+        );
     }
 
     /// A shard address carries the type, the shard and the entity — so a node

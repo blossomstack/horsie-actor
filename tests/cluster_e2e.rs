@@ -177,6 +177,12 @@ fn get(id: &str) -> impl FnOnce(ReplyTo<i64>) -> CounterCmd {
 /// address.
 const TYPE: &str = "counter";
 
+/// An event encoded the way `Persistent` journals one, for tests that write to
+/// the journal directly to simulate a rival writer.
+fn raw_event<E: Serialize>(event: &E) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "event": event })).unwrap()
+}
+
 // ---------------------------------------------------------------- the harness
 
 /// N nodes sharing one journal — which is what a real cluster has, since the
@@ -487,7 +493,7 @@ async fn a_displaced_host_stops_writing() {
 
     // Somebody else appends — what a peer that took the instance over does. The
     // stale actor is not told, and has no way to be.
-    let seven = serde_json::to_vec(&Incremented(7)).unwrap();
+    let seven = raw_event(&Incremented(7));
     cluster.journal.persist(&pid, &[seven], 1).await.unwrap();
 
     stale.tell(inc(id, 100)).await.unwrap();
@@ -530,7 +536,7 @@ async fn a_displaced_host_stops_instead_of_serving_stale() {
 
     // Somebody else appends, so this host's next write is from a state that no
     // longer exists — and the value it holds in memory is now history.
-    let ten = serde_json::to_vec(&Incremented(10)).unwrap();
+    let ten = raw_event(&Incremented(10));
     cluster.journal.persist(&pid, &[ten], 1).await.unwrap();
 
     // The next write is where it finds out, and standing down is the last thing

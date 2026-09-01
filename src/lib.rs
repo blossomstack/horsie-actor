@@ -57,7 +57,7 @@ mod transport;
 mod transport_tcp;
 
 pub use actor::{CommandEffect, EventSourcedActor};
-pub use behaviour::{Actor, Flow, StartError};
+pub use behaviour::{Actor, Delivery, Flow, StartError};
 pub use cluster::{
     ClusterConfig, ClusterNode, Dedup, LiveSet, Membership, NodeIdx, PlacementTable, RaftStore,
     serve_consensus,
